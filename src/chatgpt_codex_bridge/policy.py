@@ -7,7 +7,9 @@ allow-list inside Codex's autonomous sandbox.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -51,6 +53,10 @@ class DirtyWorkingTreeError(GitPreflightError):
         super().__init__(message)
 
 
+class ContinuationBaselineError(GitPreflightError):
+    """Raised when a dirty worktree is not the last durable baseline."""
+
+
 class GitPostflightError(PolicyError):
     """Raised when postflight evidence cannot be collected safely."""
 
@@ -80,6 +86,8 @@ class GitCheckpoint:
     staged_paths: tuple[str, ...]
     unstaged_paths: tuple[str, ...]
     untracked_paths: tuple[str, ...]
+    baseline_kind: str = "clean"
+    previous_task_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,8 @@ class GitPostflight:
     changed_files: tuple[str, ...]
     untracked_files: tuple[str, ...]
     policy_violation: bool
+    untracked_fingerprints: tuple[tuple[str, str], ...] = ()
+    content_fingerprints: tuple[tuple[str, str, str], ...] = ()
 
 
 AUTONOMOUS_WRITE_CONTRACT = """[Bridge autonomous-write contract]
@@ -139,6 +149,33 @@ def _bounded_paths(paths: Iterable[str]) -> tuple[str, ...]:
     if len(values) <= _MAX_EVIDENCE_PATHS:
         return values
     return values[:_MAX_EVIDENCE_PATHS] + ("[TRUNCATED]",)
+
+
+def _bounded_fingerprints(
+    fingerprints: Iterable[tuple[str, str, str]],
+) -> tuple[tuple[str, str, str], ...]:
+    values = tuple(fingerprints)
+    if len(values) <= _MAX_EVIDENCE_PATHS:
+        return values
+    return values[:_MAX_EVIDENCE_PATHS] + (("[TRUNCATED]", "", ""),)
+
+
+def _evidence_is_complete(value: Any) -> bool:
+    """Return whether bounded evidence contains no truncation sentinel."""
+
+    if isinstance(value, str):
+        return not value.endswith("[TRUNCATED]")
+    if isinstance(value, (list, tuple)):
+        return not any(
+            item == "[TRUNCATED]"
+            or (
+                isinstance(item, (list, tuple))
+                and item
+                and item[0] == "[TRUNCATED]"
+            )
+            for item in value
+        )
+    return True
 
 
 def _resolved_path(value: str | os.PathLike[str], *, require_exists: bool) -> Path:
@@ -240,6 +277,25 @@ def _git(repo: Path, *args: str, allow_failure: bool = False) -> str:
     return completed.stdout
 
 
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    """Run Git without decoding stdout, for binary-safe index reads."""
+
+    command = ("git", "-C", str(repo), *args)
+    try:
+        completed = subprocess.run(
+            list(command),
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GitPreflightError("unable to execute Git") from exc
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        raise _GitCommandFailure(command, stderr)
+    return completed.stdout
+
+
 def _git_branch(repo: Path, *, allow_detached: bool = False) -> str:
     try:
         return _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").strip()
@@ -268,21 +324,147 @@ def _parse_status(status: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[
     return _bounded_paths(staged), _bounded_paths(unstaged), _bounded_paths(untracked)
 
 
-def git_preflight(repo_path: str | os.PathLike[str]) -> GitCheckpoint:
-    """Require a clean Git worktree and capture its durable baseline."""
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
-    repo = _resolved_path(repo_path, require_exists=True)
+
+def _filesystem_digest(path: Path) -> str | None:
+    """Hash one Git-reported worktree file, without walking other paths."""
+
+    try:
+        if path.is_symlink():
+            return _sha256_bytes(
+                os.readlink(path).encode("utf-8", "surrogateescape")
+            )
+        if path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        if path.exists():
+            raise GitPreflightError(
+                "Git reported a dirty path that is not a regular file"
+            )
+        return None
+    except (OSError, ValueError) as exc:
+        raise GitPreflightError("unable to fingerprint dirty file") from exc
+
+
+def _index_digest(repo: Path, path: str) -> str | None:
+    """Read a staged blob from the index without decoding binary content."""
+
+    try:
+        content = _git_bytes(repo, "cat-file", "blob", f":{path}")
+    except _GitCommandFailure as error:
+        # A staged deletion has no index entry and therefore no content to
+        # hash.  Other failures remain fatal instead of silently weakening the
+        # continuation check.  Gitlinks are commit objects, not file content.
+        entries = _git(repo, "ls-files", "--stage", "--", path)
+        if not entries.strip() or any(
+            line.split(maxsplit=1)[0] == "160000"
+            for line in entries.splitlines()
+            if line.strip()
+        ):
+            return None
+        raise error
+    return _sha256_bytes(content)
+
+
+def _content_fingerprints(
+    repo: Path,
+    staged: Iterable[str],
+    unstaged: Iterable[str],
+    untracked: Iterable[str],
+) -> tuple[tuple[str, str, str], ...]:
+    """Capture bounded SHA-256 evidence for every dirty file with content."""
+
+    entries: list[tuple[str, str, str]] = []
+    for path in staged:
+        digest = _index_digest(repo, path)
+        if digest is not None:
+            entries.append((path, "staged", digest))
+    for path in unstaged:
+        digest = _filesystem_digest(repo / Path(path))
+        if digest is not None:
+            entries.append((path, "unstaged", digest))
+    for path in untracked:
+        digest = _filesystem_digest(repo / Path(path))
+        if digest is not None:
+            entries.append((path, "untracked", digest))
+    entries.sort(key=lambda value: (value[0], value[1]))
+    return _bounded_fingerprints(entries)
+
+
+def _legacy_untracked_fingerprints(
+    fingerprints: Iterable[tuple[str, str, str]],
+) -> tuple[tuple[str, str], ...]:
+    """Keep the pre-R1 untracked-only field for payload compatibility."""
+
+    return tuple(
+        (path, digest)
+        for path, state, digest in fingerprints
+        if state == "untracked"
+    )
+
+
+def _validate_worktree_root(repo: Path) -> None:
     top_level = _resolved_path(
         _git(repo, "rev-parse", "--show-toplevel").strip(), require_exists=True
     )
     if _path_key(top_level) != _path_key(repo):
         raise GitPreflightError("repo_path is not the Git worktree root")
-    branch = _git_branch(repo)
+
+
+def _git_state(
+    repo: Path,
+    *,
+    allow_detached: bool = False,
+    include_diff: bool = False,
+    include_fingerprints: bool = False,
+) -> tuple[
+    str,
+    str,
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    str,
+    str,
+    tuple[tuple[str, str, str], ...],
+]:
+    _validate_worktree_root(repo)
+    branch = _git_branch(repo, allow_detached=allow_detached)
     head = _git(repo, "rev-parse", "HEAD").strip()
     if not head:
         raise GitPreflightError("Git HEAD is empty")
-    status = _git(repo, "status", "--porcelain")
+    status = _git(repo, "status", "--porcelain", "--untracked-files=all")
     staged, unstaged, untracked = _parse_status(status)
+    diff = _git(repo, "diff") if include_diff else ""
+    cached_diff = _git(repo, "diff", "--cached") if include_diff else ""
+    fingerprints = (
+        _content_fingerprints(repo, staged, unstaged, untracked)
+        if include_fingerprints
+        else ()
+    )
+    return (
+        branch,
+        head,
+        status,
+        staged,
+        unstaged,
+        untracked,
+        diff,
+        cached_diff,
+        fingerprints,
+    )
+
+
+def git_preflight(repo_path: str | os.PathLike[str]) -> GitCheckpoint:
+    """Require a clean Git worktree and capture its durable baseline."""
+
+    repo = _resolved_path(repo_path, require_exists=True)
+    branch, head, status, staged, unstaged, untracked, _, _, _ = _git_state(repo)
     if status.strip():
         raise DirtyWorkingTreeError(
             "autonomous-write requires a clean Git working tree",
@@ -299,6 +481,156 @@ def git_preflight(repo_path: str | os.PathLike[str]) -> GitCheckpoint:
         staged_paths=staged,
         unstaged_paths=unstaged,
         untracked_paths=untracked,
+        baseline_kind="clean",
+    )
+
+
+def git_continuation_preflight(
+    repo_path: str | os.PathLike[str],
+    *,
+    previous_task_id: str,
+    previous_postflight: Mapping[str, Any],
+) -> GitCheckpoint:
+    """Accept a dirty worktree only when it matches durable postflight evidence."""
+
+    repo = _resolved_path(repo_path, require_exists=True)
+    if not isinstance(previous_task_id, str) or not previous_task_id.strip():
+        raise ContinuationBaselineError("previous task identity is invalid")
+    if not isinstance(previous_postflight, Mapping):
+        raise ContinuationBaselineError("previous postflight payload is invalid")
+    if previous_postflight.get("policy_violation") is not False:
+        raise ContinuationBaselineError("previous postflight has a policy violation")
+
+    expected_repo = previous_postflight.get("repo_path")
+    expected_branch = previous_postflight.get("final_branch")
+    expected_head = previous_postflight.get("final_head")
+    expected_status = previous_postflight.get("status_porcelain")
+    expected_diff = previous_postflight.get("diff")
+    expected_cached_diff = previous_postflight.get("cached_diff")
+    expected_changed = previous_postflight.get("changed_files")
+    expected_untracked = previous_postflight.get("untracked_files")
+    expected_fingerprints = previous_postflight.get("content_fingerprints")
+    required_text = (
+        expected_repo,
+        expected_branch,
+        expected_head,
+        expected_status,
+        expected_diff,
+        expected_cached_diff,
+    )
+    if not all(isinstance(value, str) and value for value in required_text[:3]):
+        raise ContinuationBaselineError("previous postflight identity is incomplete")
+    if not all(isinstance(value, str) for value in required_text[3:]):
+        raise ContinuationBaselineError("previous postflight Git evidence is incomplete")
+    if not _evidence_is_complete(expected_status) or not _evidence_is_complete(
+        expected_diff
+    ) or not _evidence_is_complete(expected_cached_diff):
+        raise ContinuationBaselineError("previous postflight Git evidence was truncated")
+    try:
+        expected_root = _resolved_path(expected_repo, require_exists=True)
+    except (GitPreflightError, ValueError) as exc:
+        raise ContinuationBaselineError("previous postflight repo path is invalid") from exc
+    if _path_key(expected_root) != _path_key(repo):
+        raise ContinuationBaselineError("previous postflight repo path differs")
+    if not isinstance(expected_changed, list) or not all(
+        isinstance(value, str) for value in expected_changed
+    ):
+        raise ContinuationBaselineError("previous postflight changed paths are incomplete")
+    if not isinstance(expected_untracked, list) or not all(
+        isinstance(value, str) for value in expected_untracked
+    ):
+        raise ContinuationBaselineError("previous postflight untracked paths are incomplete")
+    if not _evidence_is_complete(expected_changed) or not _evidence_is_complete(
+        expected_untracked
+    ):
+        raise ContinuationBaselineError("previous postflight paths were truncated")
+    if not isinstance(expected_fingerprints, list):
+        raise ContinuationBaselineError(
+            "previous postflight lacks complete dirty content evidence"
+        )
+    normalized: list[tuple[str, str, str]] = []
+    for value in expected_fingerprints:
+        if not isinstance(value, dict):
+            raise ContinuationBaselineError(
+                "previous dirty content evidence is invalid"
+            )
+        path = value.get("path")
+        state = value.get("state")
+        digest = value.get("sha256")
+        if path == "[TRUNCATED]":
+            raise ContinuationBaselineError(
+                "previous dirty content evidence was truncated"
+            )
+        if (
+            not isinstance(path, str)
+            or not path
+            or state not in {"staged", "unstaged", "untracked"}
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ContinuationBaselineError(
+                "previous dirty content evidence is incomplete"
+            )
+        normalized.append((path, state, digest))
+    normalized_fingerprints = tuple(normalized)
+    if not _evidence_is_complete(normalized_fingerprints):
+        raise ContinuationBaselineError(
+            "previous dirty content evidence was truncated"
+        )
+
+    (
+        branch,
+        head,
+        status,
+        staged,
+        unstaged,
+        untracked,
+        diff,
+        cached_diff,
+        fingerprints,
+    ) = _git_state(repo, include_diff=True, include_fingerprints=True)
+    current_status = _bounded_text(status)
+    current_diff = _bounded_text(diff)
+    current_cached_diff = _bounded_text(cached_diff)
+    current_changed = _bounded_paths((*staged, *unstaged))
+    if not _evidence_is_complete(current_status) or not _evidence_is_complete(
+        current_diff
+    ) or not _evidence_is_complete(current_cached_diff):
+        raise ContinuationBaselineError("current Git evidence is too large to compare")
+    if not _evidence_is_complete(current_changed) or not _evidence_is_complete(
+        untracked
+    ) or not _evidence_is_complete(fingerprints):
+        raise ContinuationBaselineError("current Git paths are too numerous to compare")
+    expected_staged, expected_unstaged, expected_untracked_paths = _parse_status(
+        expected_status
+    )
+    if (
+        branch != expected_branch
+        or head != expected_head
+        or current_status != expected_status
+        or staged != expected_staged
+        or unstaged != expected_unstaged
+        or untracked != expected_untracked_paths
+        or list(current_changed) != expected_changed
+        or list(untracked) != expected_untracked
+        or current_diff != expected_diff
+        or current_cached_diff != expected_cached_diff
+        or tuple(fingerprints) != normalized_fingerprints
+    ):
+        raise ContinuationBaselineError(
+            "current Git state does not match the previous autonomous postflight"
+        )
+    return GitCheckpoint(
+        repo_path=str(repo),
+        baseline_branch=branch,
+        baseline_head=head,
+        status_porcelain=current_status,
+        staged_paths=staged,
+        unstaged_paths=unstaged,
+        untracked_paths=untracked,
+        baseline_kind="continuation",
+        previous_task_id=previous_task_id,
     )
 
 
@@ -306,12 +638,22 @@ def git_postflight(checkpoint: GitCheckpoint) -> GitPostflight:
     """Collect bounded Git evidence and classify branch/HEAD changes."""
 
     repo = Path(checkpoint.repo_path)
-    final_branch = _git_branch(repo, allow_detached=True)
-    final_head = _git(repo, "rev-parse", "HEAD").strip()
-    status = _git(repo, "status", "--porcelain")
-    diff = _git(repo, "diff")
-    cached_diff = _git(repo, "diff", "--cached")
-    staged, unstaged, untracked = _parse_status(status)
+    (
+        final_branch,
+        final_head,
+        status,
+        staged,
+        unstaged,
+        untracked,
+        diff,
+        cached_diff,
+        fingerprints,
+    ) = _git_state(
+        repo,
+        allow_detached=True,
+        include_diff=True,
+        include_fingerprints=True,
+    )
     changed = _bounded_paths((*staged, *unstaged))
     return GitPostflight(
         repo_path=checkpoint.repo_path,
@@ -328,6 +670,8 @@ def git_postflight(checkpoint: GitCheckpoint) -> GitPostflight:
             final_branch != checkpoint.baseline_branch
             or final_head != checkpoint.baseline_head
         ),
+        untracked_fingerprints=_legacy_untracked_fingerprints(fingerprints),
+        content_fingerprints=fingerprints,
     )
 
 
@@ -340,6 +684,8 @@ def checkpoint_payload(checkpoint: GitCheckpoint) -> dict[str, Any]:
         "staged_paths": list(checkpoint.staged_paths),
         "unstaged_paths": list(checkpoint.unstaged_paths),
         "untracked_paths": list(checkpoint.untracked_paths),
+        "baseline_kind": checkpoint.baseline_kind,
+        "previous_task_id": checkpoint.previous_task_id,
     }
 
 
@@ -356,12 +702,21 @@ def postflight_payload(postflight: GitPostflight) -> dict[str, Any]:
         "changed_files": list(postflight.changed_files),
         "untracked_files": list(postflight.untracked_files),
         "policy_violation": postflight.policy_violation,
+        "untracked_fingerprints": [
+            {"path": path, "sha256": digest}
+            for path, digest in postflight.untracked_fingerprints
+        ],
+        "content_fingerprints": [
+            {"path": path, "state": state, "sha256": digest}
+            for path, state, digest in postflight.content_fingerprints
+        ],
     }
 
 
 __all__ = [
     "AUTONOMOUS_WRITE_CONTRACT",
     "DirtyWorkingTreeError",
+    "ContinuationBaselineError",
     "GitCheckpoint",
     "GitPostflight",
     "GitPostflightError",
@@ -373,6 +728,7 @@ __all__ = [
     "checkpoint_payload",
     "ensure_autonomous_workspace",
     "git_postflight",
+    "git_continuation_preflight",
     "git_preflight",
     "postflight_payload",
     "protected_roots",

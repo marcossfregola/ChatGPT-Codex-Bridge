@@ -217,3 +217,21 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
 - **Origen:** Etapa 1F-B
 - **Decisión:** No se crea ni registra todavía ningún complemento ChatGPT. La etapa 1F-C comienza sólo después de validar manualmente doctor, túnel, health/readiness, MCP y aislamiento.
 - **Motivo:** La frontera local debe quedar comprobada antes de introducir interacción externa o configuración de ChatGPT.
+
+## D-028 — Continuación AUTONOMOUS_WRITE por baseline Git durable
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1F-D2-CONT
+- **Decisión:** Una tarea `AUTONOMOUS_WRITE` sólo puede continuar sobre un worktree
+  dirty cuando el último postflight durable del mismo Project pertenece a una
+  tarea `FINISHED` sin `policy_violation`, y branch, HEAD, estado staged/unstaged,
+  paths untracked, diffs y huellas SHA-256 de contenido para todos los paths
+  dirty con contenido coinciden exactamente.
+  Un baseline limpio conserva el comportamiento existente.
+- **Limitación:** `audit_status` continúa en `PENDING`: no existe una tool de
+  auditoría ChatGPT. La autorización práctica para crear la siguiente Task
+  sigue siendo la decisión de ChatGPT; el Bridge sólo verifica que el estado
+  Git no haya cambiado desde el postflight conocido.
+- **Motivo:** Permite encadenar Tasks sin commit, stash, reset, clean ni snapshots
+  generales, rechazando cualquier divergencia antes de invocar el executor.

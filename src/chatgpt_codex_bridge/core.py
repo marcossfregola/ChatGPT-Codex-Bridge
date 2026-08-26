@@ -18,6 +18,7 @@ from .domain.models import (
 )
 from .executors.base import ExecutionRequest, ExecutionResult, Executor
 from .policy import (
+    ContinuationBaselineError,
     GitCheckpoint,
     GitPostflight,
     GitPostflightError,
@@ -26,6 +27,7 @@ from .policy import (
     augment_objective,
     checkpoint_payload,
     ensure_autonomous_workspace,
+    git_continuation_preflight,
     git_postflight,
     git_preflight,
     postflight_payload,
@@ -218,7 +220,47 @@ class BridgeCore:
                 staged_paths=paths("staged_paths"),
                 unstaged_paths=paths("unstaged_paths"),
                 untracked_paths=paths("untracked_paths"),
+                baseline_kind=(
+                    payload.get("baseline_kind")
+                    if isinstance(payload.get("baseline_kind"), str)
+                    else "clean"
+                ),
+                previous_task_id=(
+                    payload.get("previous_task_id")
+                    if isinstance(payload.get("previous_task_id"), str)
+                    else None
+                ),
             )
+        return None
+
+    def _previous_continuation_baseline(
+        self, task: Task
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Return the latest prior task only when it is an eligible baseline."""
+
+        latest: tuple[int, Task, list[Any]] | None = None
+        for candidate in self.store.list_tasks(task.project_id):
+            if candidate.task_id == task.task_id:
+                continue
+            events = self.store.list_task_events(candidate.task_id)
+            event_id = max((event.event_id or 0 for event in events), default=0)
+            if latest is None or event_id > latest[0]:
+                latest = (event_id, candidate, events)
+        if latest is None:
+            return None
+        _, candidate, events = latest
+        if (
+            candidate.mode is not TaskMode.AUTONOMOUS_WRITE
+            or candidate.execution_status is not ExecutionStatus.FINISHED
+        ):
+            return None
+        for event in reversed(events):
+            if event.source != "bridge" or event.kind != "policy.postflight":
+                continue
+            payload = event.payload
+            if isinstance(payload, dict) and payload.get("policy_violation") is False:
+                return candidate.task_id, payload
+            return None
         return None
 
     async def _cancel_active_execution(self) -> None:
@@ -246,7 +288,31 @@ class BridgeCore:
         if task.mode is TaskMode.AUTONOMOUS_WRITE:
             try:
                 safe_repo = ensure_autonomous_workspace(project.repo_path)
-                checkpoint = git_preflight(safe_repo)
+                try:
+                    checkpoint = git_preflight(safe_repo)
+                    previous = self._previous_continuation_baseline(task)
+                    if previous is not None:
+                        _, previous_postflight = previous
+                        previous_status = previous_postflight.get("status_porcelain")
+                        previous_changed = previous_postflight.get("changed_files")
+                        previous_untracked = previous_postflight.get("untracked_files")
+                        if (
+                            isinstance(previous_status, str)
+                            and previous_status.strip()
+                        ) or previous_changed or previous_untracked:
+                            raise ContinuationBaselineError(
+                                "previous autonomous postflight changes disappeared"
+                            )
+                except DirtyWorkingTreeError:
+                    previous = self._previous_continuation_baseline(task)
+                    if previous is None:
+                        raise
+                    previous_task_id, previous_postflight = previous
+                    checkpoint = git_continuation_preflight(
+                        safe_repo,
+                        previous_task_id=previous_task_id,
+                        previous_postflight=previous_postflight,
+                    )
             except Exception as error:
                 # A preflight rejection intentionally leaves the task queued:
                 # the caller may repair the project and retry it.  The reason
@@ -266,6 +332,8 @@ class BridgeCore:
                             "untracked_paths": list(error.untracked_paths),
                         }
                     )
+                elif isinstance(error, ContinuationBaselineError):
+                    violation_payload["baseline_kind"] = "continuation"
                 try:
                     self.store.append_task_event(
                         task_id,
