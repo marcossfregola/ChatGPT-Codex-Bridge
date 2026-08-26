@@ -1,10 +1,10 @@
 # Roadmap — ChatGPT–Codex Bridge
 
-## Etapa 1A
+## Etapa 1A — COMPLETADA / SELLADA
 
 Bootstrap formal y documentación.
 
-## Etapa 1B
+## Etapa 1B — ACTUAL / PENDIENTE DE AUDITORÍA
 
 Spike mínimo del CodexExecutor.
 

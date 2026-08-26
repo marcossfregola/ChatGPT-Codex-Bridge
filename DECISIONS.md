@@ -1,6 +1,6 @@
 # Decisions — ChatGPT–Codex Bridge
 
-Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseline de la Etapa 1A.
+Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseline vigente del proyecto.
 
 ## D-001 — Codex como executor inicial
 
@@ -97,3 +97,20 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
 - **Origen:** decisión de arquitectura
 - **Decisión:** El MVP prioriza arquitectura preparada para crecer, con implementación mínima para desarrollar el Orquestador ComfyUI.
 - **Motivo:** Mantiene el primer consumidor concreto sin adelantar complejidad de versiones posteriores.
+
+
+## D-013 — Python 3.13 como lenguaje inicial
+
+- **Fecha:** 2026-08-25
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1B
+- **Decisión:** Python 3.13 es el lenguaje inicial del Bridge v0.1.
+- **Motivo:** Está disponible localmente y cubre subprocess, stdio JSON, SQLite y testing con biblioteca estándar.
+
+## D-014 — stdlib-first para app-server
+
+- **Fecha:** 2026-08-25
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1B
+- **Decisión:** La integración inicial con `app-server` utilizará biblioteca estándar de Python.
+- **Motivo:** El spike no demostró una necesidad de dependencias runtime externas.
