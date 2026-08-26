@@ -1,11 +1,14 @@
-"""Small transactional SQLite store for Project and Task state."""
+"""Small transactional SQLite store for Project, Task, and event state."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+import json
 import sqlite3
 from typing import Any
 
+from ..domain.events import TaskEvent
 from ..domain.models import (
     AuditStatus,
     ExecutionStatus,
@@ -17,7 +20,7 @@ from ..domain.models import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaVersionError(RuntimeError):
@@ -55,6 +58,18 @@ CREATE TABLE tasks (
 )
 """
 
+_CREATE_TASK_EVENTS_SQL = """
+CREATE TABLE task_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (length(trim(source)) > 0),
+    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+)
+"""
+
 
 def _normalize_schema_sql(sql: str) -> str:
     """Normalize only case, whitespace, and a trailing semicolon."""
@@ -62,7 +77,7 @@ def _normalize_schema_sql(sql: str) -> str:
     return "".join(sql.split()).rstrip(";").upper()
 
 
-_EXPECTED_COLUMNS = {
+_EXPECTED_COLUMNS_V1 = {
     "projects": (
         ("project_id", "TEXT", 1, 1),
         ("name", "TEXT", 1, 0),
@@ -85,12 +100,44 @@ _EXPECTED_COLUMNS = {
     ),
 }
 
-_EXPECTED_FOREIGN_KEYS = {
+_EXPECTED_COLUMNS_V2 = {
+    **_EXPECTED_COLUMNS_V1,
+    "task_events": (
+        ("event_id", "INTEGER", 0, 1),
+        ("task_id", "TEXT", 1, 0),
+        ("source", "TEXT", 1, 0),
+        ("kind", "TEXT", 1, 0),
+        ("payload_json", "TEXT", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+    ),
+}
+
+_EXPECTED_COLUMNS_BY_VERSION = {
+    1: _EXPECTED_COLUMNS_V1,
+    2: _EXPECTED_COLUMNS_V2,
+}
+
+_EXPECTED_TABLES_BY_VERSION = {
+    1: frozenset(_EXPECTED_COLUMNS_V1),
+    2: frozenset(_EXPECTED_COLUMNS_V2),
+}
+
+_EXPECTED_FOREIGN_KEYS_V1 = {
     "projects": (),
     "tasks": (("projects", "project_id", "project_id"),),
 }
 
-_EXPECTED_CHECKS = {
+_EXPECTED_FOREIGN_KEYS_V2 = {
+    **_EXPECTED_FOREIGN_KEYS_V1,
+    "task_events": (("tasks", "task_id", "task_id"),),
+}
+
+_EXPECTED_FOREIGN_KEYS_BY_VERSION = {
+    1: _EXPECTED_FOREIGN_KEYS_V1,
+    2: _EXPECTED_FOREIGN_KEYS_V2,
+}
+
+_EXPECTED_CHECKS_V1 = {
     "projects": (
         _normalize_schema_sql("CHECK (length(trim(name)) > 0)"),
         _normalize_schema_sql("CHECK (length(trim(repo_path)) > 0)"),
@@ -106,16 +153,39 @@ _EXPECTED_CHECKS = {
     ),
 }
 
-_EXPECTED_SCHEMA_SQL = {
+_EXPECTED_CHECKS_V2 = {
+    **_EXPECTED_CHECKS_V1,
+    "task_events": (
+        _normalize_schema_sql("CHECK (length(trim(source)) > 0)"),
+        _normalize_schema_sql("CHECK (length(trim(kind)) > 0)"),
+    ),
+}
+
+_EXPECTED_CHECKS_BY_VERSION = {
+    1: _EXPECTED_CHECKS_V1,
+    2: _EXPECTED_CHECKS_V2,
+}
+
+_EXPECTED_SCHEMA_SQL_V1 = {
     "projects": _normalize_schema_sql(_CREATE_PROJECTS_SQL),
     "tasks": _normalize_schema_sql(_CREATE_TASKS_SQL),
+}
+
+_EXPECTED_SCHEMA_SQL_V2 = {
+    **_EXPECTED_SCHEMA_SQL_V1,
+    "task_events": _normalize_schema_sql(_CREATE_TASK_EVENTS_SQL),
+}
+
+_EXPECTED_SCHEMA_SQL_BY_VERSION = {
+    1: _EXPECTED_SCHEMA_SQL_V1,
+    2: _EXPECTED_SCHEMA_SQL_V2,
 }
 
 _UNSET = object()
 
 
 class SQLiteBridgeStore:
-    """Synchronous, single-connection persistence for the 1C domain model."""
+    """Synchronous, single-connection persistence for the 1D domain model."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -149,9 +219,10 @@ class SQLiteBridgeStore:
     def _ensure_schema(self) -> None:
         connection = self._require_connection()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > SCHEMA_VERSION:
+        if version < 0 or version > SCHEMA_VERSION:
             raise SchemaVersionError(
-                f"database schema version {version} is newer than supported {SCHEMA_VERSION}"
+                f"database schema version {version} is not supported "
+                f"(maximum supported is {SCHEMA_VERSION})"
             )
         if version == 0:
             existing_objects = connection.execute(
@@ -163,31 +234,62 @@ class SQLiteBridgeStore:
                     "database schema version 0 is not empty; "
                     f"refusing implicit initialization: {names}"
                 )
-            with connection:
+            try:
+                connection.execute("BEGIN")
                 connection.execute(_CREATE_PROJECTS_SQL)
                 connection.execute(_CREATE_TASKS_SQL)
+                connection.execute(_CREATE_TASK_EVENTS_SQL)
+                self._verify_schema(SCHEMA_VERSION)
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                connection.execute("PRAGMA user_version = 0")
+                connection.commit()
+                raise
             return
-        self._verify_schema()
+        if version == 1:
+            self._migrate_v1_to_v2()
+            return
+        self._verify_schema(SCHEMA_VERSION)
 
-    def _verify_schema(self) -> None:
+    def _migrate_v1_to_v2(self) -> None:
+        """Validate v1, then atomically add the event journal table."""
+
+        self._verify_schema(1)
+        connection = self._require_connection()
+        try:
+            connection.execute("BEGIN")
+            connection.execute(_CREATE_TASK_EVENTS_SQL)
+            self._verify_schema(SCHEMA_VERSION)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+            raise
+
+    def _verify_schema(self, version: int) -> None:
+        if version not in _EXPECTED_TABLES_BY_VERSION:
+            raise SchemaVersionError(f"schema v{version} is not supported")
         connection = self._require_connection()
         rows = connection.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
         tables = {str(row[0]) for row in rows}
-        expected_tables = {"projects", "tasks"}
+        expected_tables = _EXPECTED_TABLES_BY_VERSION[version]
         missing = expected_tables - tables
         if missing:
             names = ", ".join(sorted(missing))
-            raise SchemaVersionError(f"schema v{SCHEMA_VERSION} is missing tables: {names}")
+            raise SchemaVersionError(f"schema v{version} is missing tables: {names}")
         unexpected = tables - expected_tables
         if unexpected:
             names = ", ".join(sorted(unexpected))
-            raise SchemaVersionError(f"schema v{SCHEMA_VERSION} has unexpected tables: {names}")
+            raise SchemaVersionError(f"schema v{version} has unexpected tables: {names}")
 
-        for table, expected_columns in _EXPECTED_COLUMNS.items():
+        for table, expected_columns in _EXPECTED_COLUMNS_BY_VERSION[version].items():
             info_rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
             actual_columns = tuple(
                 (
@@ -200,11 +302,11 @@ class SQLiteBridgeStore:
             )
             if actual_columns != expected_columns:
                 raise SchemaVersionError(
-                    f"schema v{SCHEMA_VERSION} table {table} has unexpected column metadata: "
+                    f"schema v{version} table {table} has unexpected column metadata: "
                     f"{actual_columns!r}"
                 )
 
-        for table, expected_foreign_keys in _EXPECTED_FOREIGN_KEYS.items():
+        for table, expected_foreign_keys in _EXPECTED_FOREIGN_KEYS_BY_VERSION[version].items():
             foreign_keys = connection.execute(
                 f"PRAGMA foreign_key_list({table})"
             ).fetchall()
@@ -220,7 +322,7 @@ class SQLiteBridgeStore:
             )
             if actual_foreign_keys != tuple(sorted(expected_foreign_keys)):
                 raise SchemaVersionError(
-                    f"schema v{SCHEMA_VERSION} table {table} has unexpected foreign keys: "
+                    f"schema v{version} table {table} has unexpected foreign keys: "
                     f"{actual_foreign_keys!r}"
                 )
 
@@ -231,26 +333,26 @@ class SQLiteBridgeStore:
         sql_by_table = {
             str(row["name"]): str(row["sql"] or "") for row in table_rows
         }
-        for table, expected_sql in _EXPECTED_SCHEMA_SQL.items():
+        for table, expected_sql in _EXPECTED_SCHEMA_SQL_BY_VERSION[version].items():
             normalized_sql = _normalize_schema_sql(sql_by_table[table])
-            expected_checks = _EXPECTED_CHECKS[table]
+            expected_checks = _EXPECTED_CHECKS_BY_VERSION[version][table]
             if (
                 normalized_sql.count("CHECK(") != len(expected_checks)
                 or any(check not in normalized_sql for check in expected_checks)
             ):
                 raise SchemaVersionError(
-                    f"schema v{SCHEMA_VERSION} table {table} has incorrect CHECK constraints"
+                    f"schema v{version} table {table} has incorrect CHECK constraints"
                 )
             if normalized_sql != expected_sql:
                 raise SchemaVersionError(
-                    f"schema v{SCHEMA_VERSION} table {table} has an unexpected SQL definition"
+                    f"schema v{version} table {table} has an unexpected SQL definition"
                 )
         triggers = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger'"
         ).fetchall()
         if triggers:
             names = ", ".join(str(row[0]) for row in triggers)
-            raise SchemaVersionError(f"schema v{SCHEMA_VERSION} has unexpected triggers: {names}")
+            raise SchemaVersionError(f"schema v{version} has unexpected triggers: {names}")
 
     def close(self) -> None:
         if self._connection is not None:
@@ -452,6 +554,129 @@ class SQLiteBridgeStore:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field_name} must be non-empty text or None")
         return value
+
+    @staticmethod
+    def _serialize_payload(payload: Any) -> str:
+        try:
+            return json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("payload must be JSON-serializable") from exc
+
+    @staticmethod
+    def _reject_json_constant(value: str) -> None:
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    @classmethod
+    def _deserialize_payload(cls, payload_json: str) -> Any:
+        if not isinstance(payload_json, str) or not payload_json:
+            raise ValueError("stored event payload must be non-empty JSON text")
+        try:
+            return json.loads(payload_json, parse_constant=cls._reject_json_constant)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored event payload is invalid JSON") from exc
+
+    @classmethod
+    def _event_from_row(cls, row: sqlite3.Row) -> TaskEvent:
+        try:
+            return TaskEvent(
+                event_id=row["event_id"],
+                task_id=row["task_id"],
+                source=row["source"],
+                kind=row["kind"],
+                payload=cls._deserialize_payload(row["payload_json"]),
+                created_at=timestamp_from_text(row["created_at"]),
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("invalid task event state in database") from exc
+
+    def append_task_event(
+        self,
+        task_id: str,
+        source: str,
+        kind: str,
+        payload: Any,
+        *,
+        created_at: datetime | None = None,
+    ) -> TaskEvent:
+        event = TaskEvent(
+            event_id=None,
+            task_id=task_id,
+            source=source,
+            kind=kind,
+            payload=payload,
+            created_at=created_at if created_at is not None else utc_now(),
+        )
+        payload_json = self._serialize_payload(event.payload)
+        connection = self._require_connection()
+        with connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO task_events
+                    (task_id, source, kind, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event.task_id,
+                    event.source,
+                    event.kind,
+                    payload_json,
+                    timestamp_to_text(event.created_at),
+                ),
+            )
+            event_id = cursor.lastrowid
+            if event_id is None:
+                raise RuntimeError("SQLite did not return an event_id")
+        row = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events WHERE event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("event disappeared after insert")
+        return self._event_from_row(row)
+
+    def list_task_events(self, task_id: str) -> list[TaskEvent]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ?
+            ORDER BY event_id ASC
+            """,
+            (task_id,),
+        ).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    def get_last_task_event(self, task_id: str) -> TaskEvent | None:
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ?
+            ORDER BY event_id DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        return self._event_from_row(row) if row is not None else None
+
+    def count_task_events(self, task_id: str) -> int:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return int(row[0])
 
 
 __all__ = ["SCHEMA_VERSION", "SQLiteBridgeStore", "SchemaVersionError"]

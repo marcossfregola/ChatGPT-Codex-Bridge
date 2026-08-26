@@ -145,3 +145,11 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
 - **Origen:** Etapa 1C
 - **Decisión:** Task pertenece al dominio Bridge. Thread/Turn pertenecen a Codex y se almacenan sólo como referencias/correlaciones. No se duplican rollouts Codex.
 - **Motivo:** Evita confundir el estado propio del Bridge con la identidad y el historial interno del executor.
+
+## D-019 — Journal durable append-only
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1D
+- **Decisión:** Los eventos observables propios del Bridge se almacenan inicialmente en un journal SQLite append-only asociado a Task.
+- **Motivo:** El journal preserva evidencia estructurada y orden de inserción sin inferir progreso ni duplicar rollouts Codex.

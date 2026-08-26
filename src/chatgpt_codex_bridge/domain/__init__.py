@@ -1,5 +1,6 @@
 """Domain models owned by the ChatGPT–Codex Bridge."""
 
+from .events import TaskEvent
 from .models import (
     AuditStatus,
     ExecutionStatus,
@@ -16,6 +17,7 @@ __all__ = [
     "ExecutionStatus",
     "Project",
     "Task",
+    "TaskEvent",
     "ensure_utc",
     "timestamp_from_text",
     "timestamp_to_text",

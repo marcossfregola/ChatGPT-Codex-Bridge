@@ -35,7 +35,13 @@ Encapsula completamente la interacción con `codex app-server` detrás del Execu
 
 ### Persistence
 
-Contiene únicamente estado propio del Bridge: proyectos, tareas, correlaciones, timeline, autorizaciones y evidencia. No replica `CODEX_HOME`, sesiones ni rollouts de Codex.
+Contiene únicamente estado propio del Bridge: proyectos, tareas, correlaciones, timeline, autorizaciones, evidencia y journal de eventos. No replica `CODEX_HOME`, sesiones ni rollouts de Codex.
+
+### Event Journal v0.1
+
+El Bridge mantiene un journal SQLite append-only asociado a cada Task. Cada evento conserva únicamente evidencia que el Bridge decide registrar: source, kind, payload JSON, timestamp UTC y un `event_id` que fija el orden de inserción.
+
+Codex sigue siendo dueño de autenticación, sesiones y rollouts. El journal no copia rollouts, sesiones, `CODEX_HOME` ni credenciales.
 
 ### Observability
 
@@ -85,7 +91,7 @@ Este documento fija responsabilidades y contratos de alto nivel. No diseña clas
 
 ## Persistence v0.1
 
-El estado propio inicial del Bridge se persiste localmente con SQLite mediante Python stdlib. La persistencia contiene únicamente Project, Task, estados y correlaciones; no replica sesiones, rollouts ni historial de Codex.
+El estado propio inicial del Bridge se persiste localmente con SQLite mediante Python stdlib. La persistencia contiene únicamente Project, Task, estados, correlaciones y journal de eventos; no replica sesiones, rollouts ni historial de Codex.
 
 ### Correlación de identidades
 

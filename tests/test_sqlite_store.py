@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 
 _VALID_PROJECTS_SQL = """
@@ -44,16 +45,31 @@ CREATE TABLE tasks (
 )
 """
 
+_VALID_TASK_EVENTS_SQL = """
+CREATE TABLE task_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (length(trim(source)) > 0),
+    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+)
+"""
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from chatgpt_codex_bridge.domain.events import TaskEvent  # noqa: E402
 from chatgpt_codex_bridge.domain.models import (  # noqa: E402
     AuditStatus,
     ExecutionStatus,
     Project,
     Task,
+    timestamp_to_text,
 )
+from chatgpt_codex_bridge.persistence import sqlite_store as sqlite_store_module  # noqa: E402
 from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
     SCHEMA_VERSION,
     SQLiteBridgeStore,
@@ -89,7 +105,8 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
         *,
         projects_sql: str | None = _VALID_PROJECTS_SQL,
         tasks_sql: str | None = _VALID_TASKS_SQL,
-        user_version: int = SCHEMA_VERSION,
+        task_events_sql: str | None = None,
+        user_version: int = 1,
     ) -> None:
         connection = sqlite3.connect(db_path)
         try:
@@ -97,22 +114,42 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
                 connection.execute(projects_sql)
             if tasks_sql is not None:
                 connection.execute(tasks_sql)
+            if task_events_sql is not None:
+                connection.execute(task_events_sql)
             connection.execute(f"PRAGMA user_version = {user_version}")
             connection.commit()
         finally:
             connection.close()
+
+    def create_store_with_task(self, db_path: Path) -> SQLiteBridgeStore:
+        store = SQLiteBridgeStore(db_path)
+        store.create_project(self.make_project())
+        store.create_task(self.make_task())
+        return store
 
     def test_create_reopen_schema_and_foreign_keys(self) -> None:
         with TemporaryDirectory() as directory:
             db_path = Path(directory) / "bridge.sqlite3"
             store = SQLiteBridgeStore(db_path)
             self.assertEqual(store.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
-            self.assertEqual(store.connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+            self.assertEqual(
+                store.connection.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_VERSION,
+            )
+            tables = {
+                row[0]
+                for row in store.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+                if not str(row[0]).startswith("sqlite_")
+            }
+            self.assertEqual(tables, {"projects", "tasks", "task_events"})
             store.close()
 
             reopened = SQLiteBridgeStore(db_path)
             self.assertEqual(reopened.list_projects(), [])
             self.assertEqual(reopened.list_tasks("project-1"), [])
+            self.assertEqual(reopened.list_task_events("task-1"), [])
             reopened.close()
 
     def test_project_roundtrip_across_new_connection(self) -> None:
@@ -146,9 +183,7 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
     def test_runtime_update_persists_statuses_and_codex_correlation(self) -> None:
         with TemporaryDirectory() as directory:
             db_path = Path(directory) / "bridge.sqlite3"
-            store = SQLiteBridgeStore(db_path)
-            store.create_project(self.make_project())
-            store.create_task(self.make_task())
+            store = self.create_store_with_task(db_path)
             updated = store.update_task_runtime(
                 "task-1",
                 execution_status=ExecutionStatus.FINISHED,
@@ -175,9 +210,7 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
     def test_runtime_update_distinguishes_omitted_and_none(self) -> None:
         with TemporaryDirectory() as directory:
             db_path = Path(directory) / "bridge.sqlite3"
-            store = SQLiteBridgeStore(db_path)
-            store.create_project(self.make_project())
-            store.create_task(self.make_task())
+            store = self.create_store_with_task(db_path)
             initial = store.get_task("task-1")
             self.assertIsNotNone(initial)
             assert initial is not None
@@ -239,18 +272,6 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             with self.assertRaises(SchemaVersionError):
                 SQLiteBridgeStore(db_path)
 
-    def test_v1_incomplete_schema_is_rejected(self) -> None:
-        with TemporaryDirectory() as directory:
-            db_path = Path(directory) / "incomplete.sqlite3"
-            connection = sqlite3.connect(db_path)
-            connection.execute("CREATE TABLE projects (project_id TEXT PRIMARY KEY)")
-            connection.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY)")
-            connection.execute("PRAGMA user_version = 1")
-            connection.commit()
-            connection.close()
-            with self.assertRaises(SchemaVersionError):
-                SQLiteBridgeStore(db_path)
-
     def test_composite_primary_key_is_rejected(self) -> None:
         with TemporaryDirectory() as directory:
             db_path = Path(directory) / "composite-key.sqlite3"
@@ -300,11 +321,252 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             with self.assertRaises(SchemaVersionError):
                 SQLiteBridgeStore(db_path)
 
-    def test_invalid_runtime_state_is_rejected_before_write(self) -> None:
+    def test_v1_incomplete_schema_is_rejected_without_migration(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "incomplete.sqlite3"
+            self.write_schema_database(
+                db_path,
+                projects_sql="CREATE TABLE projects (project_id TEXT PRIMARY KEY)",
+                tasks_sql="CREATE TABLE tasks (task_id TEXT PRIMARY KEY)",
+                user_version=1,
+            )
+            with self.assertRaises(SchemaVersionError):
+                SQLiteBridgeStore(db_path)
+
+            connection = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    1,
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT name FROM sqlite_master WHERE name = 'task_events'"
+                    ).fetchone()
+                )
+            finally:
+                connection.close()
+
+    def test_v1_valid_migrates_to_v2_and_preserves_data(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "v1.sqlite3"
+            project = self.make_project()
+            task = self.make_task()
+            self.write_schema_database(db_path, user_version=1)
+
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO projects
+                        (project_id, name, repo_path, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project.project_id,
+                        project.name,
+                        project.repo_path,
+                        timestamp_to_text(project.created_at),
+                        timestamp_to_text(project.updated_at),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO tasks
+                        (task_id, project_id, objective, executor, model,
+                         execution_status, audit_status, thread_id, turn_id,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task.task_id,
+                        task.project_id,
+                        task.objective,
+                        task.executor,
+                        task.model,
+                        task.execution_status.value,
+                        task.audit_status.value,
+                        task.thread_id,
+                        task.turn_id,
+                        timestamp_to_text(task.created_at),
+                        timestamp_to_text(task.updated_at),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = SQLiteBridgeStore(db_path)
+            self.assertEqual(
+                store.connection.execute("PRAGMA user_version").fetchone()[0],
+                2,
+            )
+            self.assertEqual(store.get_project(project.project_id), project)
+            self.assertEqual(store.get_task(task.task_id), task)
+            self.assertEqual(store.list_task_events(task.task_id), [])
+            store.close()
+
+            reopened = SQLiteBridgeStore(db_path)
+            self.assertEqual(reopened.get_project(project.project_id), project)
+            self.assertEqual(reopened.get_task(task.task_id), task)
+            self.assertEqual(reopened.count_task_events(task.task_id), 0)
+            reopened.close()
+
+    def test_failed_v1_to_v2_migration_rolls_back(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "migration-rollback.sqlite3"
+            self.write_schema_database(db_path, user_version=1)
+            invalid_events_sql = """
+            CREATE TABLE task_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT
+            )
+            """
+            with patch.object(
+                sqlite_store_module,
+                "_CREATE_TASK_EVENTS_SQL",
+                invalid_events_sql,
+            ):
+                with self.assertRaises(SchemaVersionError):
+                    SQLiteBridgeStore(db_path)
+
+            connection = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    1,
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT name FROM sqlite_master WHERE name = 'task_events'"
+                    ).fetchone()
+                )
+            finally:
+                connection.close()
+
+    def test_append_task_events_roundtrip_order_last_count_and_reopen(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "events.sqlite3"
+            store = self.create_store_with_task(db_path)
+            first = store.append_task_event(
+                "task-1",
+                "bridge",
+                "task.created",
+                {"objective": "ejemplo ñ 🚀", "nested": {"items": [1, True, None]}},
+            )
+            second = store.append_task_event(
+                "task-1",
+                "codex",
+                "item.commandExecution.started",
+                {"command": "python -m unittest"},
+            )
+            third = store.append_task_event(
+                "task-1",
+                "codex",
+                "turn.diff.updated",
+                {"files": ["example.py"]},
+            )
+
+            self.assertIsInstance(first, TaskEvent)
+            self.assertIsNotNone(first.event_id)
+            self.assertLess(first.event_id, second.event_id)
+            self.assertLess(second.event_id, third.event_id)
+            self.assertEqual(first.payload["nested"]["items"], [1, True, None])
+            self.assertEqual(first.payload["objective"], "ejemplo ñ 🚀")
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT payload_json FROM task_events WHERE event_id = ?",
+                    (first.event_id,),
+                ).fetchone()[0],
+                '{"nested":{"items":[1,true,null]},"objective":"ejemplo ñ 🚀"}',
+            )
+
+            events = store.list_task_events("task-1")
+            self.assertEqual([event.event_id for event in events], [
+                first.event_id,
+                second.event_id,
+                third.event_id,
+            ])
+            self.assertEqual(
+                [event.kind for event in events],
+                [
+                    "task.created",
+                    "item.commandExecution.started",
+                    "turn.diff.updated",
+                ],
+            )
+            self.assertEqual(store.get_last_task_event("task-1"), third)
+            self.assertEqual(store.count_task_events("task-1"), 3)
+            self.assertIsNotNone(first.created_at.tzinfo)
+            store.close()
+
+            reopened = SQLiteBridgeStore(db_path)
+            self.assertEqual(reopened.list_task_events("task-1"), events)
+            self.assertEqual(reopened.get_last_task_event("task-1"), third)
+            self.assertEqual(reopened.count_task_events("task-1"), 3)
+            reopened.close()
+
+    def test_append_event_foreign_key_rejects_missing_task(self) -> None:
         with TemporaryDirectory() as directory:
             store = SQLiteBridgeStore(Path(directory) / "bridge.sqlite3")
-            store.create_project(self.make_project())
-            store.create_task(self.make_task())
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.append_task_event(
+                    "missing-task",
+                    "bridge",
+                    "task.created",
+                    {"objective": "example"},
+                )
+            self.assertEqual(store.count_task_events("missing-task"), 0)
+            store.close()
+
+    def test_non_serializable_payload_rejected_before_persist(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "bridge.sqlite3")
+            with self.assertRaises(ValueError):
+                store.append_task_event(
+                    "task-1",
+                    "bridge",
+                    "task.created",
+                    object(),
+                )
+            self.assertEqual(store.count_task_events("task-1"), 0)
+            store.close()
+
+    def test_corrupt_payload_is_rejected_on_read(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "bridge.sqlite3")
+            event = store.append_task_event(
+                "task-1",
+                "bridge",
+                "task.created",
+                {"objective": "example"},
+            )
+            store.connection.execute(
+                "UPDATE task_events SET payload_json = ? WHERE event_id = ?",
+                ("{not-json", event.event_id),
+            )
+            store.connection.commit()
+            with self.assertRaises(ValueError):
+                store.get_last_task_event("task-1")
+            store.close()
+
+    def test_v2_altered_schema_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_path = Path(directory) / "altered-v2.sqlite3"
+            altered_events_sql = _VALID_TASK_EVENTS_SQL.replace(
+                "payload_json TEXT NOT NULL",
+                "payload_json INTEGER NOT NULL",
+            )
+            self.write_schema_database(
+                db_path,
+                task_events_sql=altered_events_sql,
+                user_version=2,
+            )
+            with self.assertRaises(SchemaVersionError):
+                SQLiteBridgeStore(db_path)
+
+    def test_invalid_runtime_state_is_rejected_before_write(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "bridge.sqlite3")
             with self.assertRaises(ValueError):
                 store.update_task_runtime("task-1", execution_status="NOT_A_STATUS")
             recovered = store.get_task("task-1")
@@ -320,6 +582,8 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             store.close()
             with self.assertRaises(RuntimeError):
                 store.list_projects()
+            with self.assertRaises(RuntimeError):
+                store.list_task_events("task-1")
 
 
 if __name__ == "__main__":

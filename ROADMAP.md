@@ -21,11 +21,11 @@ proceso Python/Node
 → cierre
 ```
 
-## Etapa 1C — ACTUAL / PENDIENTE DE AUDITORÍA
+## Etapa 1C — COMPLETADA / SELLADA
 
 Persistencia mínima y modelo Project/Task.
 
-## Etapa 1D
+## Etapa 1D — ACTUAL / PENDIENTE DE AUDITORÍA
 
 Observabilidad y event journal.
 
