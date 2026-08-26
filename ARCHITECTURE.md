@@ -3,25 +3,42 @@
 ## Arquitectura aprobada
 
 ```text
-MCP
+Official MCP Python SDK v2 (MCPServer / stdio)
+    ↓
+MCPAdapter
     ↓
 Bridge Core
     ↓
 Executor Contract
     ↓
 CodexExecutor
-    ↓
-CodexAppServerClient
 ```
 
-MCP todavía no está implementado. El flujo 1E-A se invoca directamente sobre
-Bridge Core y mantiene el transporte Codex aislado detrás del Executor Contract.
+El MCP de 1E-B-R1 usa el SDK oficial MCP Python v2 como dueño del protocolo,
+del ciclo de vida, la negociación de versión, JSON-RPC, schemas, framing y
+transporte. `MCPAdapter` se conserva como frontera de aplicación sobre Bridge
+Core y no conoce el wire protocol de MCP ni el de Codex.
 
 ## Responsabilidades
 
 ### MCP Adapter
 
-Expone el punto de integración del Bridge. No conoce el protocolo Codex ni contiene reglas específicas del executor.
+Expone `get_status`, `create_project`, `create_task`, `run_task`, `get_task`,
+`get_task_events` y `get_result`. Llama únicamente a Bridge Core y a la
+persistencia para lecturas durables. No conoce el protocolo Codex ni contiene
+reglas específicas del executor.
+
+### MCP process
+
+`chatgpt-codex-bridge-mcp` construye un único `MCPServer` oficial y lo ejecuta
+con transporte local stdio. El SDK escribe exclusivamente el protocolo en
+stdout, mantiene los diagnósticos en stderr y gestiona initialize,
+notifications, tools, errores, framing y cierre. El wiring del proceso crea
+`SQLiteBridgeStore → BridgeCore(SQLiteBridgeStore, CodexExecutor) → MCPAdapter`
+→ `MCPServer`. La base por defecto queda en
+`%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`, independiente del
+directorio de trabajo; `--db-path` permite seleccionar una base explícita para
+tests y laboratorios.
 
 ### Bridge Core
 
@@ -47,7 +64,7 @@ Registra eventos operativos y evidencia reproducible con secretos redactados.
 
 ## Contratos iniciales
 
-- **Transporte v0.1:** `stdio://`.
+- **Transporte v0.1:** MCP oficial sobre stdio, provisto por MCP Python SDK v2.
 - **Executor v0.1:** Codex exclusivamente.
 - **Autenticación:** Codex administra su propia sesión ChatGPT y `CODEX_HOME`.
 
@@ -90,6 +107,10 @@ Este documento fija responsabilidades y contratos de alto nivel. No diseña clas
 ## Persistence v0.1
 
 El estado propio inicial del Bridge se persiste localmente con SQLite mediante Python stdlib. La persistencia contiene únicamente Project, Task, estados, correlaciones y journal de eventos; no replica sesiones, rollouts ni historial de Codex.
+
+La resolución de ruta default es explícita y estable: cambia el cwd no cambia
+`%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`. Las pruebas y los
+laboratorios pasan `--db-path` para no escribir estado dentro del repositorio.
 
 ### Correlación de identidades
 

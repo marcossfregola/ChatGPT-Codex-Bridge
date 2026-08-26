@@ -3,7 +3,12 @@ name = "chatgpt-codex-bridge"
 version = "0.1.0"
 description = "Local coordination bridge between ChatGPT and Codex."
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "mcp>=2,<3",
+]
+
+[project.scripts]
+chatgpt-codex-bridge-mcp = "chatgpt_codex_bridge.mcp_server:main"
 
 [tool.chatgpt_codex_bridge]
 source_root = "src"

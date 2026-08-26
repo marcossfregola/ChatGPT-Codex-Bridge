@@ -169,3 +169,19 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
 - **Origen:** Etapa 1E-A
 - **Decisión:** Las notificaciones Codex y la correlación thread/turn se persisten mientras la ejecución está en curso.
 - **Motivo:** La evidencia durable debe existir antes de la finalización del turn y permitir auditar el orden real.
+
+## D-022 — Official MCP Python SDK owns the MCP protocol layer
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1E-B-R1
+- **Decisión:** El MCP inicial utilizará el MCP Python SDK oficial v2. `MCPServer` será dueño del protocolo MCP, lifecycle, negociación de versión, JSON-RPC, schemas, framing y transporte stdio. `MCPAdapter` seguirá siendo la frontera de aplicación y todas las operaciones de dominio pasarán por Bridge Core.
+- **Motivo:** Evita reimplementar wire protocol y conserva el desacoplamiento entre el protocolo MCP, el dominio Bridge y `codex app-server`.
+
+## D-023 — Bridge persistent state uses a stable application-local path
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1E-B-R1
+- **Decisión:** La base default del Bridge se resolverá en `%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`, independientemente del cwd. `--db-path` quedará disponible para tests y laboratorios.
+- **Motivo:** Evita que cambiar el directorio de trabajo cree otra base y mantiene el estado del Bridge separado de `VisorVideosDevBridge`, `ChatGPTOpenCodeBridge` y el repositorio.
