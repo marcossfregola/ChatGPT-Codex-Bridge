@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,9 +76,146 @@ class ProtocolHelpersTests(unittest.TestCase):
         }
         self.assertEqual(extract_final_agent_message(completion), "BRIDGE_1B_OK")
 
+    def test_notification_observer_receives_real_method_and_params(self) -> None:
+        seen: list[tuple[str, dict[str, object]]] = []
+        client = CodexAppServerClient(
+            "codex",
+            ROOT,
+            notification_observer=lambda method, params: seen.append((method, params)),
+        )
+
+        client._record_notification(
+            {
+                "method": "turn/started",
+                "params": {"threadId": "thread", "turnId": "turn"},
+            }
+        )
+
+        self.assertEqual(
+            seen,
+            [("turn/started", {"threadId": "thread", "turnId": "turn"})],
+        )
+        self.assertEqual(client.events[-1]["method"], "turn/started")
+
+    def test_notification_observer_failure_propagates(self) -> None:
+        client = CodexAppServerClient(
+            "codex",
+            ROOT,
+            observer=lambda _method, _params: (_ for _ in ()).throw(
+                RuntimeError("observer failed")
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "observer failed"):
+            client._record_notification({"method": "turn/started", "params": {}})
+
 
 
 class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _feed(reader: asyncio.StreamReader, message: dict[str, object]) -> None:
+        reader.feed_data((json.dumps(message) + "\n").encode())
+
+    async def test_direct_turn_completed_reaches_observer_once(self) -> None:
+        reader = asyncio.StreamReader()
+        seen: list[tuple[str, dict[str, object]]] = []
+        client = CodexAppServerClient(
+            "codex",
+            ROOT,
+            turn_timeout=0.1,
+            notification_observer=lambda method, params: seen.append((method, params)),
+        )
+        client.process = SimpleNamespace(stdout=reader, returncode=None)
+        self._feed(
+            reader,
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turn": {"id": "turn", "status": "completed"},
+                },
+            },
+        )
+
+        result = await client.wait_for_turn_completed("thread", "turn")
+
+        self.assertEqual(result["method"], "turn/completed")
+        self.assertEqual(seen, [("turn/completed", result["params"])])
+
+    async def test_early_turn_completed_is_observed_once_and_consumed_later(self) -> None:
+        reader = asyncio.StreamReader()
+        seen: list[str] = []
+        client = CodexAppServerClient(
+            "codex",
+            ROOT,
+            request_timeout=0.1,
+            turn_timeout=0.1,
+            notification_observer=lambda method, _params: seen.append(method),
+        )
+        client.process = SimpleNamespace(stdout=reader, returncode=None)
+
+        async def fake_write(_method: str, _params: dict[str, object]) -> int:
+            return 1
+
+        client._write_request = fake_write  # type: ignore[method-assign]
+        early = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread",
+                "turn": {"id": "turn", "status": "completed"},
+            },
+        }
+        self._feed(reader, early)
+        self._feed(reader, {"jsonrpc": "2.0", "id": 1, "result": {}})
+
+        await client.request("example/request", {})
+        self.assertEqual(seen, ["turn/completed"])
+        self.assertEqual(len(client._pending_notifications), 1)
+
+        result = await client.wait_for_turn_completed("thread", "turn")
+
+        self.assertEqual(result, early)
+        self.assertEqual(seen, ["turn/completed"])
+        self.assertFalse(client._pending_notifications)
+
+    async def test_two_identical_notifications_are_both_observed(self) -> None:
+        reader = asyncio.StreamReader()
+        seen: list[str] = []
+        client = CodexAppServerClient(
+            "codex",
+            ROOT,
+            request_timeout=0.1,
+            notification_observer=lambda method, _params: seen.append(method),
+        )
+        client.process = SimpleNamespace(stdout=reader, returncode=None)
+
+        async def fake_write(_method: str, _params: dict[str, object]) -> int:
+            return 1
+
+        client._write_request = fake_write  # type: ignore[method-assign]
+        identical = {"method": "thread/status/changed", "params": {"status": "active"}}
+        self._feed(reader, identical)
+        self._feed(reader, identical)
+        self._feed(reader, {"jsonrpc": "2.0", "id": 1, "result": {}})
+
+        await client.request("example/request", {})
+
+        self.assertEqual(seen, ["thread/status/changed", "thread/status/changed"])
+
+    async def test_response_is_never_added_to_pending_notifications(self) -> None:
+        reader = asyncio.StreamReader()
+        client = CodexAppServerClient("codex", ROOT, request_timeout=0.1)
+        client.process = SimpleNamespace(stdout=reader, returncode=None)
+
+        async def fake_write(_method: str, _params: dict[str, object]) -> int:
+            return 1
+
+        client._write_request = fake_write  # type: ignore[method-assign]
+        self._feed(reader, {"jsonrpc": "2.0", "id": 1, "result": {}})
+
+        await client.request("example/request", {})
+
+        self.assertFalse(client._pending_notifications)
+
     async def test_eof_is_explicit_error(self) -> None:
         reader = asyncio.StreamReader()
         reader.feed_eof()

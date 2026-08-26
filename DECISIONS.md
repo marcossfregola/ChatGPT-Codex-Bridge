@@ -153,3 +153,19 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
 - **Origen:** Etapa 1D
 - **Decisión:** Los eventos observables propios del Bridge se almacenan inicialmente en un journal SQLite append-only asociado a Task.
 - **Motivo:** El journal preserva evidencia estructurada y orden de inserción sin inferir progreso ni duplicar rollouts Codex.
+
+## D-020 — Bridge Core depende del Executor Contract
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1E-A
+- **Decisión:** Bridge Core depende únicamente de SQLiteBridgeStore y del Executor Contract, no del wire protocol de Codex.
+- **Motivo:** Mantiene el dominio y la orquestación independientes del transporte Codex.
+
+## D-021 — Evidencia Codex se persiste durante ejecución
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1E-A
+- **Decisión:** Las notificaciones Codex y la correlación thread/turn se persisten mientras la ejecución está en curso.
+- **Motivo:** La evidencia durable debe existir antes de la finalización del turn y permitir auditar el orden real.

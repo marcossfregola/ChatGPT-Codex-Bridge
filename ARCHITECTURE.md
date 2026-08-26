@@ -3,21 +3,19 @@
 ## Arquitectura aprobada
 
 ```text
-MCP Adapter
+MCP
     ↓
 Bridge Core
-    ├─ Projects
-    ├─ Tasks
-    ├─ Policy / Authorizations
-    ├─ Audit state
-    └─ Observability
     ↓
 Executor Contract
     ↓
 CodexExecutor
     ↓
-codex app-server
+CodexAppServerClient
 ```
+
+MCP todavía no está implementado. El flujo 1E-A se invoca directamente sobre
+Bridge Core y mantiene el transporte Codex aislado detrás del Executor Contract.
 
 ## Responsabilidades
 

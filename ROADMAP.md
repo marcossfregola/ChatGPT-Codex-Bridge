@@ -25,20 +25,17 @@ proceso Python/Node
 
 Persistencia mínima y modelo Project/Task.
 
-## Etapa 1D — ACTUAL / PENDIENTE DE AUDITORÍA
+## Etapa 1D — COMPLETADA / SELLADA
 
 Observabilidad y event journal.
 
-## Etapa 1E
+## Etapa 1E-A — ACTUAL / PENDIENTE DE AUDITORÍA
+
+Bridge Core, Executor Contract async, CodexExecutor y ejecución real con
+journal durable.
+
+## Etapa 1E-B — MCP mínimo — pendiente
 
 MCP mínimo.
-
-## Etapa 1F
-
-E2E.
-
-## Etapa 1G
-
-Primera tarea real controlada.
 
 No se planifican todavía versiones 0.2/0.3.

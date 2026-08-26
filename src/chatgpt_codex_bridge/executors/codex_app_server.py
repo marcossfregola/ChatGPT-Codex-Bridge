@@ -9,10 +9,11 @@ import json
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Deque
+from typing import Any, Callable, Deque
 
 
 JsonObject = dict[str, Any]
+NotificationObserver = Callable[[str, JsonObject], None]
 
 
 class AppServerError(RuntimeError):
@@ -168,13 +169,18 @@ class CodexAppServerClient:
         turn_timeout: float = 300.0,
         close_timeout: float = 5.0,
         env: dict[str, str] | None = None,
+        notification_observer: NotificationObserver | None = None,
+        observer: NotificationObserver | None = None,
     ) -> None:
+        if notification_observer is not None and observer is not None:
+            raise ValueError("pass only one notification observer")
         self.executable = str(executable)
         self.cwd = str(Path(cwd).resolve())
         self.request_timeout = request_timeout
         self.turn_timeout = turn_timeout
         self.close_timeout = close_timeout
         self.env = env
+        self.notification_observer = notification_observer or observer
         self.process: asyncio.subprocess.Process | None = None
         self.events: list[JsonObject] = []
         self.server_requests: list[JsonObject] = []
@@ -183,8 +189,17 @@ class CodexAppServerClient:
         # Only early notifications that must be consumed by
         # wait_for_turn_completed() are retained. Responses are never queued:
         # this client deliberately permits one active request at a time.
-        self._pending_notifications: Deque[JsonObject] = deque(maxlen=16)
+        # Each queued notification carries an explicit marker indicating that
+        # it was already observed when it first arrived in request().
+        self._pending_notifications: Deque[tuple[JsonObject, bool]] = deque(maxlen=16)
         self._stderr_task: asyncio.Task[None] | None = None
+
+    def set_notification_observer(
+        self, observer: NotificationObserver | None
+    ) -> None:
+        """Replace the synchronous observer used for future notifications."""
+
+        self.notification_observer = observer
 
     @property
     def pid(self) -> int | None:
@@ -273,6 +288,16 @@ class CodexAppServerClient:
     def _record_notification(self, message: JsonObject) -> None:
         metadata = event_metadata(message)
         self.events.append(metadata)
+        observer = self.notification_observer
+        if observer is None:
+            return
+        method = message.get("method")
+        if not isinstance(method, str):
+            raise ProtocolError("notification method must be text")
+        params = message.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        observer(method, dict(params))
 
     def _reject_server_request(self, message: JsonObject) -> None:
         metadata = event_metadata(message)
@@ -311,7 +336,7 @@ class CodexAppServerClient:
                 self._reject_server_request(message)
             self._record_notification(message)
             if message.get("method") == "turn/completed":
-                self._pending_notifications.append(message)
+                self._pending_notifications.append((message, True))
 
     async def initialize(self) -> JsonObject:
         return await self.request(
@@ -355,6 +380,7 @@ class CodexAppServerClient:
         cwd: str | os.PathLike[str],
         model: str,
         prompt: str,
+        on_turn_started: Callable[[str], None] | None = None,
     ) -> tuple[JsonObject, JsonObject]:
         response = await self.request(
             "turn/start",
@@ -374,6 +400,8 @@ class CodexAppServerClient:
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if not isinstance(turn_id, str):
             raise ProtocolError("turn/start response did not contain a turn ID")
+        if on_turn_started is not None:
+            on_turn_started(turn_id)
         completed = await self.wait_for_turn_completed(thread_id, turn_id)
         return response, completed
 
@@ -392,15 +420,14 @@ class CodexAppServerClient:
         """
 
         while True:
-            message = (
-                self._pending_notifications.popleft()
-                if self._pending_notifications
-                else None
-            )
-            if message is None:
+            pending = self._pending_notifications.popleft() if self._pending_notifications else None
+            if pending is None:
                 message = await self._read_message(
                     timeout=self.turn_timeout if timeout is None else timeout
                 )
+                message_already_observed = False
+            else:
+                message, message_already_observed = pending
             kind = classify_message(message)
             if kind == "response":
                 raise ProtocolError(
@@ -409,7 +436,7 @@ class CodexAppServerClient:
                 )
             if kind == "server_request":
                 self._reject_server_request(message)
-            if not self.events or self.events[-1] != event_metadata(message):
+            if not message_already_observed:
                 self._record_notification(message)
             if message.get("method") != "turn/completed":
                 continue
