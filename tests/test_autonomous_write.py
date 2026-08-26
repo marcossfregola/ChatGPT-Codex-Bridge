@@ -17,6 +17,7 @@ from chatgpt_codex_bridge.core import BridgeCore  # noqa: E402
 from chatgpt_codex_bridge.domain.models import (  # noqa: E402
     ExecutionStatus,
     TaskMode,
+    TaskStateError,
 )
 from chatgpt_codex_bridge.executors.base import ExecutionResult  # noqa: E402
 from chatgpt_codex_bridge.executors.codex_app_server import (  # noqa: E402
@@ -94,6 +95,22 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
             mode=mode,
         )
 
+    def _assert_preflight_failed(self, task) -> None:
+        updated = self.store.get_task(task.task_id)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.execution_status, ExecutionStatus.FAILED)
+        events = self.store.list_task_events(task.task_id)
+        self.assertEqual(
+            [event.kind for event in events],
+            ["task.created", "policy.violation", "task.failed"],
+        )
+        self.assertEqual(events[1].payload["phase"], "preflight")
+        self.assertEqual(
+            [event.kind for event in events if event.kind == "task.failed"],
+            ["task.failed"],
+        )
+
     def test_read_only_default_preserves_existing_behavior(self) -> None:
         executor = ControlledExecutor()
         repo = self.root / "not-a-git-repo"
@@ -140,10 +157,7 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(context.exception, GitPreflightError)
         self.assertEqual(executor.requests, [])
-        self.assertEqual(self.store.get_task(task.task_id).execution_status, ExecutionStatus.QUEUED)
-        violation = self.store.get_last_task_event(task.task_id)
-        self.assertEqual(violation.kind, "policy.violation")
-        self.assertEqual(violation.payload["phase"], "preflight")
+        self._assert_preflight_failed(task)
 
     async def test_dirty_worktree_is_rejected_before_executor(self) -> None:
         repo = make_git_repo(self.root)
@@ -155,7 +169,7 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
             await core.run_task(task.task_id)
 
         self.assertEqual(executor.requests, [])
-        self.assertEqual(self.store.get_task(task.task_id).execution_status, ExecutionStatus.QUEUED)
+        self._assert_preflight_failed(task)
 
     async def test_protected_bridge_repo_is_rejected_before_executor(self) -> None:
         executor = ControlledExecutor()
@@ -165,6 +179,24 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
             await core.run_task(task.task_id)
 
         self.assertEqual(executor.requests, [])
+        self._assert_preflight_failed(task)
+
+    async def test_preflight_failure_is_terminal_and_cannot_be_rerun(self) -> None:
+        repo = self.root / "not-a-git-repo"
+        repo.mkdir()
+        executor = ControlledExecutor()
+        core, task = self._task(executor, repo)
+
+        with self.assertRaises(GitPreflightError):
+            await core.run_task(task.task_id)
+        events_before = self.store.list_task_events(task.task_id)
+
+        with self.assertRaises(TaskStateError):
+            await core.run_task(task.task_id)
+
+        self.assertEqual(executor.requests, [])
+        self.assertEqual(self.store.list_task_events(task.task_id), events_before)
+        self._assert_preflight_failed(task)
 
     async def test_local_appdata_bridge_roots_and_overlaps_are_rejected(self) -> None:
         local_app_data = self.root / "LocalAppData"
@@ -192,6 +224,9 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
                     await core.run_task(task_id)
 
             self.assertEqual(executor.requests, [])
+            self.assertEqual(
+                self.store.get_task(task_id).execution_status, ExecutionStatus.FAILED
+            )
 
             descendant = protected / "descendant"
             descendant.mkdir()
@@ -212,6 +247,10 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ProtectedRootError):
                     await descendant_core.run_task(descendant_task_id)
             self.assertEqual(executor.requests, [])
+            self.assertEqual(
+                self.store.get_task(descendant_task_id).execution_status,
+                ExecutionStatus.FAILED,
+            )
 
     async def test_clean_repo_checkpoint_records_branch_and_head(self) -> None:
         repo = make_git_repo(self.root)

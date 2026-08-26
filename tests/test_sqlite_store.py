@@ -67,6 +67,7 @@ from chatgpt_codex_bridge.domain.models import (  # noqa: E402
     ExecutionStatus,
     Project,
     Task,
+    TaskStateError,
     timestamp_to_text,
 )
 from chatgpt_codex_bridge.persistence import sqlite_store as sqlite_store_module  # noqa: E402
@@ -83,6 +84,22 @@ class FailingTerminalStore(SQLiteBridgeStore):
     ):
         if kind == "task.finished":
             raise RuntimeError("terminal event insert failed")
+        return super()._insert_task_event_in_transaction(
+            connection,
+            task_id,
+            source,
+            kind,
+            payload,
+            created_at=created_at,
+        )
+
+
+class FailingPreflightStore(SQLiteBridgeStore):
+    def _insert_task_event_in_transaction(
+        self, connection, task_id, source, kind, payload, *, created_at=None
+    ):
+        if kind == "task.failed":
+            raise RuntimeError("preflight terminal event insert failed")
         return super()._insert_task_event_in_transaction(
             connection,
             task_id,
@@ -288,6 +305,64 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
                 if event.kind in {"task.finished", "task.failed", "task.cancelled"}
             ]
             self.assertEqual(terminal, [])
+            store.close()
+
+    def test_preflight_failure_transition_is_atomic_and_terminal(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "bridge.sqlite3")
+            store.append_task_event(
+                "task-1",
+                "bridge",
+                "task.created",
+                {"project_id": "project-1"},
+            )
+
+            failed = store.transition_task_preflight_failed(
+                "task-1",
+                policy_payload={"phase": "preflight", "policy_violation": True},
+                failed_payload={"error_type": "DirtyWorkingTreeError"},
+            )
+            self.assertEqual(failed.execution_status, ExecutionStatus.FAILED)
+            self.assertEqual(
+                [event.kind for event in store.list_task_events("task-1")],
+                ["task.created", "policy.violation", "task.failed"],
+            )
+            with self.assertRaises(TaskStateError):
+                store.transition_task_preflight_failed(
+                    "task-1",
+                    policy_payload={"phase": "preflight"},
+                    failed_payload={"error_type": "Duplicate"},
+                )
+            store.close()
+
+    def test_preflight_failure_transition_rolls_back_on_event_insert_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = FailingPreflightStore(Path(directory) / "bridge.sqlite3")
+            store.create_project(self.make_project())
+            store.create_task(self.make_task())
+            store.append_task_event(
+                "task-1",
+                "bridge",
+                "task.created",
+                {"project_id": "project-1"},
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "preflight terminal event insert failed"
+            ):
+                store.transition_task_preflight_failed(
+                    "task-1",
+                    policy_payload={"phase": "preflight"},
+                    failed_payload={"error_type": "DirtyWorkingTreeError"},
+                )
+
+            task = store.get_task("task-1")
+            assert task is not None
+            self.assertEqual(task.execution_status, ExecutionStatus.QUEUED)
+            self.assertEqual(
+                [event.kind for event in store.list_task_events("task-1")],
+                ["task.created"],
+            )
             store.close()
 
     def test_foreign_key_rejects_task_without_project(self) -> None:

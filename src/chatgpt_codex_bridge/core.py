@@ -23,6 +23,7 @@ from .policy import (
     GitPostflight,
     GitPostflightError,
     DirtyWorkingTreeError,
+    PolicyError,
     PolicyViolationError,
     augment_objective,
     checkpoint_payload,
@@ -290,19 +291,6 @@ class BridgeCore:
                 safe_repo = ensure_autonomous_workspace(project.repo_path)
                 try:
                     checkpoint = git_preflight(safe_repo)
-                    previous = self._previous_continuation_baseline(task)
-                    if previous is not None:
-                        _, previous_postflight = previous
-                        previous_status = previous_postflight.get("status_porcelain")
-                        previous_changed = previous_postflight.get("changed_files")
-                        previous_untracked = previous_postflight.get("untracked_files")
-                        if (
-                            isinstance(previous_status, str)
-                            and previous_status.strip()
-                        ) or previous_changed or previous_untracked:
-                            raise ContinuationBaselineError(
-                                "previous autonomous postflight changes disappeared"
-                            )
                 except DirtyWorkingTreeError:
                     previous = self._previous_continuation_baseline(task)
                     if previous is None:
@@ -314,9 +302,11 @@ class BridgeCore:
                         previous_postflight=previous_postflight,
                     )
             except Exception as error:
-                # A preflight rejection intentionally leaves the task queued:
-                # the caller may repair the project and retry it.  The reason
-                # is still durable for audit without invoking the executor.
+                if not isinstance(error, PolicyError):
+                    raise
+                # A definitive policy/preflight rejection is a failed Task,
+                # not a retryable queued Task.  Persist the violation and the
+                # single terminal event atomically without invoking Codex.
                 violation_payload: dict[str, Any] = {
                     "phase": "preflight",
                     "error_type": type(error).__name__,
@@ -334,15 +324,14 @@ class BridgeCore:
                     )
                 elif isinstance(error, ContinuationBaselineError):
                     violation_payload["baseline_kind"] = "continuation"
-                try:
-                    self.store.append_task_event(
-                        task_id,
-                        "bridge",
-                        "policy.violation",
-                        violation_payload,
-                    )
-                except Exception:
-                    pass
+                self.store.transition_task_preflight_failed(
+                    task_id,
+                    policy_payload=violation_payload,
+                    failed_payload={
+                        "error_type": type(error).__name__,
+                        "message": _bounded_error_message(error),
+                    },
+                )
                 raise
             self.store.append_task_event(
                 task_id,

@@ -658,6 +658,77 @@ class SQLiteBridgeStore:
             raise RuntimeError("task disappeared after transition")
         return updated
 
+    def transition_task_preflight_failed(
+        self,
+        task_id: str,
+        *,
+        policy_payload: Any,
+        failed_payload: Any,
+    ) -> Task:
+        """Atomically fail a QUEUED task rejected by autonomous preflight."""
+
+        connection = self._require_connection()
+        failed_at = utc_now()
+        with connection:
+            row = connection.execute(
+                "SELECT execution_status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            try:
+                current = ExecutionStatus(row["execution_status"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid task state in database") from exc
+            if current is not ExecutionStatus.QUEUED:
+                if current in _TERMINAL_EVENT_BY_STATUS:
+                    raise TaskStateError(
+                        f"task {task_id} is already terminal ({current.value})"
+                    )
+                raise TaskStateError(
+                    f"task {task_id} cannot transition from {current.value} "
+                    "to FAILED; expected QUEUED"
+                )
+            self._assert_no_terminal_event(connection, task_id)
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET execution_status = ?, audit_status = ?, updated_at = ?
+                WHERE task_id = ? AND execution_status = ?
+                """,
+                (
+                    ExecutionStatus.FAILED.value,
+                    AuditStatus.PENDING.value,
+                    timestamp_to_text(failed_at),
+                    task_id,
+                    ExecutionStatus.QUEUED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TaskStateError(
+                    f"task {task_id} could not transition to FAILED"
+                )
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                "policy.violation",
+                policy_payload,
+                created_at=failed_at,
+            )
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                "task.failed",
+                failed_payload,
+                created_at=failed_at,
+            )
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise RuntimeError("task disappeared after preflight failure")
+        return updated
+
     def transition_task_terminal(
         self,
         task_id: str,

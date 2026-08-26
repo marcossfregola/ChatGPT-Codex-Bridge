@@ -14,7 +14,11 @@ import sys
 sys.path.insert(0, str(ROOT / "src"))
 
 from chatgpt_codex_bridge.core import BridgeCore  # noqa: E402
-from chatgpt_codex_bridge.domain.models import ExecutionStatus, TaskMode  # noqa: E402
+from chatgpt_codex_bridge.domain.models import (  # noqa: E402
+    ExecutionStatus,
+    TaskMode,
+    TaskStateError,
+)
 from chatgpt_codex_bridge.executors.base import ExecutionResult  # noqa: E402
 from chatgpt_codex_bridge.persistence.sqlite_store import SQLiteBridgeStore  # noqa: E402
 from chatgpt_codex_bridge.policy import (  # noqa: E402
@@ -100,6 +104,18 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         current = self.create_task(core, "task-current")
         return repo, executor, core, previous, current
 
+    def assert_preflight_terminal(self, task_id: str) -> None:
+        task = self.store.get_task(task_id)
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task.execution_status, ExecutionStatus.FAILED)
+        events = self.store.list_task_events(task_id)
+        self.assertEqual(
+            [event.kind for event in events],
+            ["task.created", "policy.violation", "task.failed"],
+        )
+        self.assertEqual(events[1].payload["phase"], "preflight")
+
     async def assert_dirty_rejected(
         self, repo: Path, core: BridgeCore, executor, *, expected_requests: int = 0
     ):
@@ -107,6 +123,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(DirtyWorkingTreeError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), expected_requests)
+        self.assert_preflight_terminal(current.task_id)
         return current
 
     async def test_clean_baseline_remains_allowed(self) -> None:
@@ -172,6 +189,40 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
             ["M app.txt", " M keep.txt", "?? first.untracked", "?? third.untracked"],
         )
 
+    async def test_clean_baseline_wins_over_prior_dirty_task_after_external_restore(
+        self,
+    ) -> None:
+        def mutate(path: Path) -> None:
+            (path / "app.txt").write_text("DIRTY_PRIOR\n", encoding="utf-8")
+            (path / "prior.untracked").write_text("DIRTY_PRIOR\n", encoding="utf-8")
+
+        repo = make_repo(self.root)
+        previous_executor = SequenceExecutor(mutate)
+        core = self.new_core(repo, previous_executor)
+        previous = self.create_task(core, "task-previous")
+        previous_result = await core.run_task(previous.task_id)
+        self.assertEqual(previous_result.execution_status, ExecutionStatus.FINISHED)
+        self.assertNotEqual(git(repo, "status", "--porcelain"), "")
+
+        git(repo, "reset", "--hard", "HEAD")
+        git(repo, "clean", "-fd")
+        self.assertEqual(git(repo, "status", "--porcelain"), "")
+
+        current_executor = SequenceExecutor()
+        current_core = BridgeCore(self.store, current_executor)
+        current = self.create_task(current_core, "task-current")
+        result = await current_core.run_task(current.task_id)
+
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(current_executor.requests), 1)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "clean")
+        self.assertIsNone(checkpoint.payload["previous_task_id"])
+
     async def test_dirty_without_prior_task_is_rejected(self) -> None:
         repo = make_repo(self.root)
         (repo / "app.txt").write_text("EXTERNAL\n", encoding="utf-8")
@@ -179,6 +230,24 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         core = self.new_core(repo, executor)
 
         await self.assert_dirty_rejected(repo, core, executor)
+
+    async def test_preflight_failure_is_terminal_and_not_retryable(self) -> None:
+        repo = make_repo(self.root)
+        (repo / "app.txt").write_text("EXTERNAL\n", encoding="utf-8")
+        executor = SequenceExecutor()
+        core = self.new_core(repo, executor)
+        current = self.create_task(core, "task-current")
+
+        with self.assertRaises(DirtyWorkingTreeError):
+            await core.run_task(current.task_id)
+        events_before = self.store.list_task_events(current.task_id)
+
+        with self.assertRaises(TaskStateError):
+            await core.run_task(current.task_id)
+
+        self.assertEqual(executor.requests, [])
+        self.assertEqual(self.store.list_task_events(current.task_id), events_before)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_failed_prior_task_is_not_a_continuation_baseline(self) -> None:
         repo = make_repo(self.root)
@@ -289,6 +358,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_head_change_rejects_continuation(self) -> None:
         def mutate(path: Path) -> None:
@@ -300,6 +370,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_tracked_content_change_rejects_continuation(self) -> None:
         def mutate(path: Path) -> None:
@@ -311,6 +382,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_tracked_binary_content_change_rejects_with_same_git_diff_summary(
         self,
@@ -331,6 +403,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_staged_binary_content_change_rejects_with_same_git_diff_summary(
         self,
@@ -353,6 +426,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_deleted_dirty_paths_are_not_fingerprinted(self) -> None:
         def mutate(path: Path) -> None:
@@ -384,6 +458,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_untracked_directory_files_are_fingerprinted_individually(self) -> None:
         def mutate(path: Path) -> None:
@@ -412,6 +487,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_extra_untracked_path_rejects_continuation(self) -> None:
         def mutate(path: Path) -> None:
@@ -423,8 +499,9 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
-    async def test_missing_untracked_path_rejects_even_when_worktree_becomes_clean(
+    async def test_missing_untracked_path_allows_new_clean_baseline(
         self,
     ) -> None:
         def mutate(path: Path) -> None:
@@ -433,9 +510,17 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         repo, executor, core, _, current = await self.seed_finished_auto(mutate)
         (repo / "untracked.txt").unlink()
 
-        with self.assertRaises(ContinuationBaselineError):
-            await core.run_task(current.task_id)
-        self.assertEqual(len(executor.requests), 1)
+        result = await core.run_task(current.task_id)
+
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(executor.requests), 2)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "clean")
+        self.assertIsNone(checkpoint.payload["previous_task_id"])
 
     async def test_staged_and_unstaged_state_is_compared(self) -> None:
         def mutate(path: Path) -> None:
@@ -477,6 +562,7 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContinuationBaselineError):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_old_clean_postflight_without_content_evidence_remains_allowed(self) -> None:
         repo = make_repo(self.root)
