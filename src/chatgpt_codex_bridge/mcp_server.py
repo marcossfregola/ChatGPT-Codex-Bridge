@@ -98,6 +98,7 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
         objective: str,
         model: str | None = None,
         task_id: str | None = None,
+        mode: str | None = None,
     ) -> dict[str, Any]:
         return await _call_adapter(
             adapter,
@@ -107,6 +108,7 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
                 "objective": objective,
                 "model": model,
                 "task_id": task_id,
+                "mode": mode,
             },
         )
 

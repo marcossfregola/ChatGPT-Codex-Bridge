@@ -27,6 +27,13 @@ class AuditStatus(str, Enum):
     CORRECTION_REQUIRED = "CORRECTION_REQUIRED"
 
 
+class TaskMode(str, Enum):
+    """Execution policy selected for one Bridge task."""
+
+    READ_ONLY = "READ_ONLY"
+    AUTONOMOUS_WRITE = "AUTONOMOUS_WRITE"
+
+
 class TaskStateError(RuntimeError):
     """Raised when a task lifecycle transition is not allowed."""
 
@@ -117,6 +124,7 @@ class Task:
     objective: str
     executor: str = "codex"
     model: str = "gpt-5.6-luna"
+    mode: TaskMode = field(default=TaskMode.READ_ONLY, kw_only=True)
     execution_status: ExecutionStatus = ExecutionStatus.QUEUED
     audit_status: AuditStatus = AuditStatus.PENDING
     thread_id: str | None = None
@@ -130,6 +138,7 @@ class Task:
         self.objective = _required_text(self.objective, "objective")
         self.executor = _required_text(self.executor, "executor")
         self.model = _required_text(self.model, "model")
+        self.mode = _coerce_enum(self.mode, TaskMode, "mode")
         self.execution_status = _coerce_enum(
             self.execution_status, ExecutionStatus, "execution_status"
         )
@@ -144,6 +153,7 @@ __all__ = [
     "AuditStatus",
     "ExecutionStatus",
     "Project",
+    "TaskMode",
     "TaskStateError",
     "Task",
     "ensure_utc",

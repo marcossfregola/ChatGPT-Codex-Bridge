@@ -12,6 +12,7 @@ import shutil
 from typing import Any, Callable, Deque
 
 from .. import THREAD_SOURCE
+from ..domain.models import TaskMode
 
 
 JsonObject = dict[str, Any]
@@ -361,15 +362,30 @@ class CodexAppServerClient:
         model: str,
         cwd: str | os.PathLike[str],
         ephemeral: bool = True,
+        mode: TaskMode | str = TaskMode.READ_ONLY,
     ) -> JsonObject:
+        try:
+            selected_mode = mode if isinstance(mode, TaskMode) else TaskMode(mode)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid mode: {mode!r}") from exc
+        policy = (
+            {
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            }
+            if selected_mode is TaskMode.AUTONOMOUS_WRITE
+            else {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": "read-only",
+            }
+        )
         return await self.request(
             "thread/start",
             {
                 "model": model,
                 "cwd": str(Path(cwd).resolve()),
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandbox": "read-only",
+                **policy,
                 "ephemeral": ephemeral,
                 "threadSource": THREAD_SOURCE,
             },
@@ -383,16 +399,31 @@ class CodexAppServerClient:
         model: str,
         prompt: str,
         on_turn_started: Callable[[str], None] | None = None,
+        mode: TaskMode | str = TaskMode.READ_ONLY,
     ) -> tuple[JsonObject, JsonObject]:
+        try:
+            selected_mode = mode if isinstance(mode, TaskMode) else TaskMode(mode)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid mode: {mode!r}") from exc
+        policy = (
+            {
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            }
+            if selected_mode is TaskMode.AUTONOMOUS_WRITE
+            else {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+            }
+        )
         response = await self.request(
             "turn/start",
             {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": prompt, "text_elements": []}],
                 "cwd": str(Path(cwd).resolve()),
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+                **policy,
                 "model": model,
                 "effort": "low",
             },

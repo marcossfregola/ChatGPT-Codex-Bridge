@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, runtime_checkable
 
-from ..domain.models import ExecutionStatus
+from ..domain.models import ExecutionStatus, TaskMode
 
 
 CorrelationCallback = Callable[[str | None, str | None], None]
@@ -26,12 +26,20 @@ class ExecutionRequest:
     cwd: str
     objective: str
     model: str
+    mode: TaskMode = field(default=TaskMode.READ_ONLY, kw_only=True)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", _required_text(self.task_id, "task_id"))
         object.__setattr__(self, "cwd", _required_text(self.cwd, "cwd"))
         object.__setattr__(self, "objective", _required_text(self.objective, "objective"))
         object.__setattr__(self, "model", _required_text(self.model, "model"))
+        try:
+            selected_mode = (
+                self.mode if isinstance(self.mode, TaskMode) else TaskMode(self.mode)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid mode: {self.mode!r}") from exc
+        object.__setattr__(self, "mode", selected_mode)
 
 
 @dataclass

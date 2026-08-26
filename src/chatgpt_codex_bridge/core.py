@@ -8,8 +8,28 @@ import inspect
 import uuid
 from typing import Any
 
-from .domain.models import AuditStatus, ExecutionStatus, Project, Task, TaskStateError
+from .domain.models import (
+    AuditStatus,
+    ExecutionStatus,
+    Project,
+    Task,
+    TaskMode,
+    TaskStateError,
+)
 from .executors.base import ExecutionRequest, ExecutionResult, Executor
+from .policy import (
+    GitCheckpoint,
+    GitPostflight,
+    GitPostflightError,
+    DirtyWorkingTreeError,
+    PolicyViolationError,
+    augment_objective,
+    checkpoint_payload,
+    ensure_autonomous_workspace,
+    git_postflight,
+    git_preflight,
+    postflight_payload,
+)
 from .persistence.sqlite_store import SQLiteBridgeStore
 
 
@@ -101,6 +121,7 @@ class BridgeCore:
         *,
         task_id: str | None = None,
         executor: str = "codex",
+        mode: TaskMode | str = TaskMode.READ_ONLY,
     ) -> Task:
         project = self.store.get_project(project_id)
         if project is None:
@@ -111,6 +132,7 @@ class BridgeCore:
             objective=objective,
             executor=executor,
             model=model,
+            mode=mode,
             execution_status=ExecutionStatus.QUEUED,
             audit_status=AuditStatus.PENDING,
         )
@@ -124,6 +146,7 @@ class BridgeCore:
                 "objective": task.objective,
                 "model": task.model,
                 "executor": task.executor,
+                "mode": task.mode.value,
             },
         )
         return created
@@ -133,6 +156,14 @@ class BridgeCore:
 
         recovered: list[Task] = []
         for task in self.store.list_tasks_by_execution_status(ExecutionStatus.RUNNING):
+            checkpoint = self._checkpoint_for_task(task.task_id)
+            if checkpoint is not None:
+                try:
+                    self._persist_postflight(task.task_id, checkpoint)
+                except BaseException:
+                    # Recovery must remain deterministic even when the project
+                    # was removed or Git evidence is no longer available.
+                    pass
             recovered.append(
                 self.store.transition_task_terminal(
                     task.task_id,
@@ -150,6 +181,45 @@ class BridgeCore:
                 )
             )
         return recovered
+
+    def _checkpoint_for_task(self, task_id: str) -> GitCheckpoint | None:
+        """Rehydrate the last autonomous checkpoint for orphan recovery."""
+
+        events = self.store.list_task_events(task_id)
+        for event in reversed(events):
+            if event.source != "bridge" or event.kind != "policy.git_checkpoint":
+                continue
+            payload = event.payload
+            if not isinstance(payload, dict):
+                return None
+            required = (
+                payload.get("repo_path"),
+                payload.get("baseline_branch"),
+                payload.get("baseline_head"),
+            )
+            if not all(isinstance(value, str) and value for value in required):
+                return None
+
+            def paths(name: str) -> tuple[str, ...]:
+                value = payload.get(name, [])
+                if not isinstance(value, list):
+                    return ()
+                return tuple(item for item in value if isinstance(item, str))
+
+            return GitCheckpoint(
+                repo_path=required[0],
+                baseline_branch=required[1],
+                baseline_head=required[2],
+                status_porcelain=(
+                    payload.get("status_porcelain")
+                    if isinstance(payload.get("status_porcelain"), str)
+                    else ""
+                ),
+                staged_paths=paths("staged_paths"),
+                unstaged_paths=paths("unstaged_paths"),
+                untracked_paths=paths("untracked_paths"),
+            )
+        return None
 
     async def _cancel_active_execution(self) -> None:
         cancel_active = getattr(self.executor, "cancel_active", None)
@@ -172,6 +242,47 @@ class BridgeCore:
         if project is None:
             raise RuntimeError(f"project does not exist: {task.project_id}")
 
+        checkpoint: GitCheckpoint | None = None
+        if task.mode is TaskMode.AUTONOMOUS_WRITE:
+            try:
+                safe_repo = ensure_autonomous_workspace(project.repo_path)
+                checkpoint = git_preflight(safe_repo)
+            except Exception as error:
+                # A preflight rejection intentionally leaves the task queued:
+                # the caller may repair the project and retry it.  The reason
+                # is still durable for audit without invoking the executor.
+                violation_payload: dict[str, Any] = {
+                    "phase": "preflight",
+                    "error_type": type(error).__name__,
+                    "message": _bounded_error_message(error),
+                    "policy_violation": True,
+                }
+                if isinstance(error, DirtyWorkingTreeError):
+                    violation_payload.update(
+                        {
+                            "status_porcelain": error.status_porcelain,
+                            "staged_paths": list(error.staged_paths),
+                            "unstaged_paths": list(error.unstaged_paths),
+                            "untracked_paths": list(error.untracked_paths),
+                        }
+                    )
+                try:
+                    self.store.append_task_event(
+                        task_id,
+                        "bridge",
+                        "policy.violation",
+                        violation_payload,
+                    )
+                except Exception:
+                    pass
+                raise
+            self.store.append_task_event(
+                task_id,
+                "bridge",
+                "policy.git_checkpoint",
+                {"mode": task.mode.value, **checkpoint_payload(checkpoint)},
+            )
+
         self.store.transition_task_running(task_id, project_id=project.project_id)
 
         def on_correlation(thread_id: str | None, turn_id: str | None) -> None:
@@ -193,13 +304,18 @@ class BridgeCore:
                 _bounded_notification_value(params),
             )
 
-        request = ExecutionRequest(
-            task_id=task.task_id,
-            cwd=project.repo_path,
-            objective=task.objective,
-            model=task.model,
-        )
+        postflight_recorded = False
         try:
+            execution_cwd = (
+                checkpoint.repo_path if checkpoint is not None else project.repo_path
+            )
+            request = ExecutionRequest(
+                task_id=task.task_id,
+                cwd=execution_cwd,
+                objective=augment_objective(task.objective, task.mode),
+                model=task.model,
+                mode=task.mode,
+            )
             result = await self.executor.run(
                 request,
                 on_correlation=on_correlation,
@@ -216,6 +332,15 @@ class BridgeCore:
                 correlation_updates["turn_id"] = result.turn_id
             if correlation_updates:
                 self.store.update_task_runtime(task_id, **correlation_updates)
+            if checkpoint is not None:
+                try:
+                    postflight = self._persist_postflight(task_id, checkpoint)
+                except GitPostflightError:
+                    postflight_recorded = True
+                    raise
+                postflight_recorded = True
+                if postflight.policy_violation:
+                    raise PolicyViolationError(postflight)
             finished = self.store.transition_task_terminal(
                 task_id,
                 execution_status=ExecutionStatus.FINISHED,
@@ -235,6 +360,11 @@ class BridgeCore:
                 # Preserve cancellation semantics; terminal persistence below
                 # is the Bridge's fail-closed obligation.
                 pass
+            if checkpoint is not None and not postflight_recorded:
+                try:
+                    self._persist_postflight(task_id, checkpoint)
+                except BaseException:
+                    pass
             self.store.transition_task_terminal(
                 task_id,
                 execution_status=ExecutionStatus.CANCELLED,
@@ -243,6 +373,11 @@ class BridgeCore:
             )
             raise
         except Exception as error:
+            if checkpoint is not None and not postflight_recorded:
+                try:
+                    self._persist_postflight(task_id, checkpoint)
+                except BaseException:
+                    pass
             self.store.transition_task_terminal(
                 task_id,
                 execution_status=ExecutionStatus.FAILED,
@@ -253,6 +388,47 @@ class BridgeCore:
                 },
             )
             raise
+
+    def _persist_postflight(
+        self, task_id: str, checkpoint: GitCheckpoint
+    ) -> GitPostflight:
+        """Persist bounded postflight evidence and return its classification."""
+
+        try:
+            postflight = git_postflight(checkpoint)
+        except Exception as error:
+            failure_payload = {
+                "mode": TaskMode.AUTONOMOUS_WRITE.value,
+                "repo_path": checkpoint.repo_path,
+                "ok": False,
+                "policy_violation": True,
+                "error_type": type(error).__name__,
+                "message": _bounded_error_message(error),
+            }
+            try:
+                self.store.append_task_event(
+                    task_id, "bridge", "policy.postflight", failure_payload
+                )
+                self.store.append_task_event(
+                    task_id,
+                    "bridge",
+                    "policy.violation",
+                    {"phase": "postflight", **failure_payload},
+                )
+            except Exception:
+                pass
+            raise GitPostflightError("Git postflight evidence could not be collected") from error
+
+        payload = {"mode": TaskMode.AUTONOMOUS_WRITE.value, **postflight_payload(postflight)}
+        self.store.append_task_event(task_id, "bridge", "policy.postflight", payload)
+        if postflight.policy_violation:
+            self.store.append_task_event(
+                task_id,
+                "bridge",
+                "policy.violation",
+                {"phase": "postflight", **payload},
+            )
+        return postflight
 
 
 __all__ = ["BridgeCore", "TaskStateError"]

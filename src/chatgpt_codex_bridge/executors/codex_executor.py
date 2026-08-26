@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import inspect
 import os
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,21 @@ class CodexExecutor:
         if not isinstance(result, dict):
             raise AppServerError(f"{operation} response did not contain a result")
         return result
+
+    @staticmethod
+    def _mode_kwargs(callable_object: Any, mode: Any) -> dict[str, Any]:
+        """Keep injected legacy test clients compatible with the mode extension."""
+
+        try:
+            parameters = inspect.signature(callable_object).parameters
+        except (TypeError, ValueError):
+            return {"mode": mode}
+        if "mode" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return {"mode": mode}
+        return {}
 
     @classmethod
     def _thread_id(cls, response: dict[str, Any]) -> str:
@@ -118,11 +134,13 @@ class CodexExecutor:
             await client.initialize()
             self.last_account_type = self._account_type(await client.account_read())
 
+            thread_start_kwargs = self._mode_kwargs(client.thread_start, request.mode)
             thread_id = self._thread_id(
                 await client.thread_start(
                     model=request.model,
                     cwd=request.cwd,
                     ephemeral=True,
+                    **thread_start_kwargs,
                 )
             )
             self._active_thread_id = thread_id
@@ -134,12 +152,14 @@ class CodexExecutor:
                 if on_correlation is not None:
                     on_correlation(thread_id, turn_id)
 
+            turn_start_kwargs = self._mode_kwargs(client.turn_start, request.mode)
             _turn_started, completed = await client.turn_start(
                 thread_id=thread_id,
                 cwd=request.cwd,
                 model=request.model,
                 prompt=request.objective,
                 on_turn_started=on_turn_started,
+                **turn_start_kwargs,
             )
             completed_turn = self._completed_turn(completed, client_turn_id(completed))
             turn_id = completed_turn["id"]

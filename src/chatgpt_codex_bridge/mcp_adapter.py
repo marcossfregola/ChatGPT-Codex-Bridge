@@ -9,8 +9,9 @@ from typing import Any
 from . import BRIDGE_STAGE, __version__
 from .core import BridgeCore, TaskStateError
 from .domain.events import TaskEvent
-from .domain.models import Project, Task, timestamp_to_text
+from .domain.models import Project, Task, TaskMode, timestamp_to_text
 from .persistence.sqlite_store import SQLiteBridgeStore
+from .policy import PolicyError
 
 
 DEFAULT_MODEL = "gpt-5.6-luna"
@@ -59,6 +60,7 @@ def _task_dict(task: Task) -> dict[str, Any]:
         "objective": task.objective,
         "executor": task.executor,
         "model": task.model,
+        "mode": task.mode.value,
         "execution_status": task.execution_status.value,
         "audit_status": task.audit_status.value,
         "thread_id": task.thread_id,
@@ -116,8 +118,31 @@ class MCPAdapter:
         payload = finished_events[-1].payload if finished_events else {}
         if not isinstance(payload, dict):
             payload = {}
+        events = self.store.list_task_events(task.task_id)
+        checkpoint_events = [
+            event
+            for event in events
+            if event.source == "bridge" and event.kind == "policy.git_checkpoint"
+        ]
+        postflight_events = [
+            event
+            for event in events
+            if event.source == "bridge" and event.kind == "policy.postflight"
+        ]
+        violation_events = [
+            event
+            for event in events
+            if event.source == "bridge" and event.kind == "policy.violation"
+        ]
+        checkpoint = checkpoint_events[-1].payload if checkpoint_events else {}
+        postflight = postflight_events[-1].payload if postflight_events else {}
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+        if not isinstance(postflight, dict):
+            postflight = {}
         return {
             "task_id": task.task_id,
+            "mode": task.mode.value,
             "execution_status": task.execution_status.value,
             "audit_status": task.audit_status.value,
             "thread_id": task.thread_id,
@@ -125,6 +150,16 @@ class MCPAdapter:
             "available": bool(finished_events),
             "final_response": payload.get("final_response"),
             "event_id": finished_events[-1].event_id if finished_events else None,
+            "baseline_branch": checkpoint.get("baseline_branch"),
+            "baseline_head": checkpoint.get("baseline_head"),
+            "final_branch": postflight.get("final_branch"),
+            "final_head": postflight.get("final_head"),
+            "changed_files": postflight.get("changed_files", []),
+            "untracked_files": postflight.get("untracked_files", []),
+            "policy_violation": bool(
+                violation_events
+                or postflight.get("policy_violation", False)
+            ),
         }
 
     @staticmethod
@@ -136,6 +171,9 @@ class MCPAdapter:
             "task.failed",
             "task.cancelled",
             "task.recovered",
+            "policy.git_checkpoint",
+            "policy.postflight",
+            "policy.violation",
             "thread/started",
             "turn/started",
             "turn/completed",
@@ -181,6 +219,8 @@ class MCPAdapter:
             return await self._call_tool(name, arguments)
         except TaskStateError as exc:
             raise MCPToolError(str(exc)) from exc
+        except PolicyError as exc:
+            raise MCPToolError(str(exc)) from exc
         except MCPToolError:
             raise
         except Exception as exc:
@@ -208,11 +248,24 @@ class MCPAdapter:
             )
             return _project_dict(project)
         if name == "create_task":
+            mode_value = args.get("mode")
+            if mode_value is None:
+                mode = TaskMode.READ_ONLY
+            elif not isinstance(mode_value, str):
+                raise MCPToolError("argument 'mode' must be READ_ONLY or AUTONOMOUS_WRITE")
+            else:
+                try:
+                    mode = TaskMode(mode_value)
+                except ValueError as exc:
+                    raise MCPToolError(
+                        "argument 'mode' must be READ_ONLY or AUTONOMOUS_WRITE"
+                    ) from exc
             task = self.core.create_task(
                 _required_text(args, "project_id"),
                 _required_text(args, "objective"),
                 model=_optional_text(args, "model") or DEFAULT_MODEL,
                 task_id=_optional_text(args, "task_id"),
+                mode=mode,
             )
             return _task_dict(task)
         if name == "get_task":

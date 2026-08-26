@@ -14,6 +14,7 @@ from ..domain.models import (
     ExecutionStatus,
     Project,
     Task,
+    TaskMode,
     TaskStateError,
     timestamp_from_text,
     timestamp_to_text,
@@ -21,7 +22,7 @@ from ..domain.models import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaVersionError(RuntimeError):
@@ -30,6 +31,7 @@ class SchemaVersionError(RuntimeError):
 
 _EXECUTION_VALUES = ", ".join(f"'{status.value}'" for status in ExecutionStatus)
 _AUDIT_VALUES = ", ".join(f"'{status.value}'" for status in AuditStatus)
+_TASK_MODE_VALUES = ", ".join(f"'{mode.value}'" for mode in TaskMode)
 
 
 _CREATE_PROJECTS_SQL = """
@@ -39,6 +41,23 @@ CREATE TABLE projects (
     repo_path TEXT NOT NULL CHECK (length(trim(repo_path)) > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+)
+"""
+
+_CREATE_TASKS_V1_SQL = f"""
+CREATE TABLE tasks (
+    task_id TEXT PRIMARY KEY NOT NULL,
+    project_id TEXT NOT NULL,
+    objective TEXT NOT NULL CHECK (length(trim(objective)) > 0),
+    executor TEXT NOT NULL CHECK (length(trim(executor)) > 0),
+    model TEXT NOT NULL CHECK (length(trim(model)) > 0),
+    execution_status TEXT NOT NULL CHECK (execution_status IN ({_EXECUTION_VALUES})),
+    audit_status TEXT NOT NULL CHECK (audit_status IN ({_AUDIT_VALUES})),
+    thread_id TEXT,
+    turn_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(project_id)
 )
 """
 
@@ -55,6 +74,7 @@ CREATE TABLE tasks (
     turn_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'READ_ONLY' CHECK (mode IN ({_TASK_MODE_VALUES})),
     FOREIGN KEY (project_id) REFERENCES projects(project_id)
 )
 """
@@ -113,14 +133,34 @@ _EXPECTED_COLUMNS_V2 = {
     ),
 }
 
+_EXPECTED_COLUMNS_V3 = {
+    **_EXPECTED_COLUMNS_V2,
+    "tasks": (
+        ("task_id", "TEXT", 1, 1),
+        ("project_id", "TEXT", 1, 0),
+        ("objective", "TEXT", 1, 0),
+        ("executor", "TEXT", 1, 0),
+        ("model", "TEXT", 1, 0),
+        ("execution_status", "TEXT", 1, 0),
+        ("audit_status", "TEXT", 1, 0),
+        ("thread_id", "TEXT", 0, 0),
+        ("turn_id", "TEXT", 0, 0),
+        ("created_at", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+        ("mode", "TEXT", 1, 0),
+    ),
+}
+
 _EXPECTED_COLUMNS_BY_VERSION = {
     1: _EXPECTED_COLUMNS_V1,
     2: _EXPECTED_COLUMNS_V2,
+    3: _EXPECTED_COLUMNS_V3,
 }
 
 _EXPECTED_TABLES_BY_VERSION = {
     1: frozenset(_EXPECTED_COLUMNS_V1),
     2: frozenset(_EXPECTED_COLUMNS_V2),
+    3: frozenset(_EXPECTED_COLUMNS_V3),
 }
 
 _EXPECTED_FOREIGN_KEYS_V1 = {
@@ -136,6 +176,7 @@ _EXPECTED_FOREIGN_KEYS_V2 = {
 _EXPECTED_FOREIGN_KEYS_BY_VERSION = {
     1: _EXPECTED_FOREIGN_KEYS_V1,
     2: _EXPECTED_FOREIGN_KEYS_V2,
+    3: _EXPECTED_FOREIGN_KEYS_V2,
 }
 
 _EXPECTED_CHECKS_V1 = {
@@ -162,14 +203,23 @@ _EXPECTED_CHECKS_V2 = {
     ),
 }
 
+_EXPECTED_CHECKS_V3 = {
+    **_EXPECTED_CHECKS_V2,
+    "tasks": (
+        *_EXPECTED_CHECKS_V1["tasks"],
+        _normalize_schema_sql(f"CHECK (mode IN ({_TASK_MODE_VALUES}))"),
+    ),
+}
+
 _EXPECTED_CHECKS_BY_VERSION = {
     1: _EXPECTED_CHECKS_V1,
     2: _EXPECTED_CHECKS_V2,
+    3: _EXPECTED_CHECKS_V3,
 }
 
 _EXPECTED_SCHEMA_SQL_V1 = {
     "projects": _normalize_schema_sql(_CREATE_PROJECTS_SQL),
-    "tasks": _normalize_schema_sql(_CREATE_TASKS_SQL),
+    "tasks": _normalize_schema_sql(_CREATE_TASKS_V1_SQL),
 }
 
 _EXPECTED_SCHEMA_SQL_V2 = {
@@ -177,9 +227,16 @@ _EXPECTED_SCHEMA_SQL_V2 = {
     "task_events": _normalize_schema_sql(_CREATE_TASK_EVENTS_SQL),
 }
 
+_EXPECTED_SCHEMA_SQL_V3 = {
+    "projects": _normalize_schema_sql(_CREATE_PROJECTS_SQL),
+    "tasks": _normalize_schema_sql(_CREATE_TASKS_SQL),
+    "task_events": _normalize_schema_sql(_CREATE_TASK_EVENTS_SQL),
+}
+
 _EXPECTED_SCHEMA_SQL_BY_VERSION = {
     1: _EXPECTED_SCHEMA_SQL_V1,
     2: _EXPECTED_SCHEMA_SQL_V2,
+    3: _EXPECTED_SCHEMA_SQL_V3,
 }
 
 _UNSET = object()
@@ -257,6 +314,9 @@ class SQLiteBridgeStore:
             return
         if version == 1:
             self._migrate_v1_to_v2()
+            version = 2
+        if version == 2:
+            self._migrate_v2_to_v3()
             return
         self._verify_schema(SCHEMA_VERSION)
 
@@ -268,12 +328,33 @@ class SQLiteBridgeStore:
         try:
             connection.execute("BEGIN")
             connection.execute(_CREATE_TASK_EVENTS_SQL)
-            self._verify_schema(SCHEMA_VERSION)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._verify_schema(2)
+            connection.execute("PRAGMA user_version = 2")
             connection.commit()
         except Exception:
             connection.rollback()
             connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+            raise
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Validate v2, then atomically add the durable task mode."""
+
+        self._verify_schema(2)
+        connection = self._require_connection()
+        try:
+            connection.execute("BEGIN")
+            connection.execute(
+                "ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL "
+                "DEFAULT 'READ_ONLY' "
+                "CHECK (mode IN ('READ_ONLY', 'AUTONOMOUS_WRITE'))"
+            )
+            self._verify_schema(3)
+            connection.execute("PRAGMA user_version = 3")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            connection.execute("PRAGMA user_version = 2")
             connection.commit()
             raise
 
@@ -428,10 +509,10 @@ class SQLiteBridgeStore:
             connection.execute(
                 """
                 INSERT INTO tasks
-                    (task_id, project_id, objective, executor, model,
+                    (task_id, project_id, objective, executor, model, mode,
                      execution_status, audit_status, thread_id, turn_id,
                      created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -439,6 +520,7 @@ class SQLiteBridgeStore:
                     task.objective,
                     task.executor,
                     task.model,
+                    task.mode.value,
                     task.execution_status.value,
                     task.audit_status.value,
                     task.thread_id,
@@ -454,6 +536,7 @@ class SQLiteBridgeStore:
         row = connection.execute(
             """
             SELECT task_id, project_id, objective, executor, model,
+                   mode,
                    execution_status, audit_status, thread_id, turn_id,
                    created_at, updated_at
             FROM tasks WHERE task_id = ?
@@ -467,6 +550,7 @@ class SQLiteBridgeStore:
         rows = connection.execute(
             """
             SELECT task_id, project_id, objective, executor, model,
+                   mode,
                    execution_status, audit_status, thread_id, turn_id,
                    created_at, updated_at
             FROM tasks WHERE project_id = ? ORDER BY task_id
@@ -492,6 +576,7 @@ class SQLiteBridgeStore:
         rows = connection.execute(
             """
             SELECT task_id, project_id, objective, executor, model,
+                   mode,
                    execution_status, audit_status, thread_id, turn_id,
                    created_at, updated_at
             FROM tasks WHERE execution_status = ? ORDER BY task_id
@@ -670,6 +755,7 @@ class SQLiteBridgeStore:
                 objective=row["objective"],
                 executor=row["executor"],
                 model=row["model"],
+                mode=row["mode"],
                 execution_status=row["execution_status"],
                 audit_status=row["audit_status"],
                 thread_id=row["thread_id"],

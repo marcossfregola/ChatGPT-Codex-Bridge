@@ -397,7 +397,7 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             finally:
                 connection.close()
 
-    def test_v1_valid_migrates_to_v2_and_preserves_data(self) -> None:
+    def test_v1_valid_migrates_to_v3_and_preserves_data(self) -> None:
         with TemporaryDirectory() as directory:
             db_path = Path(directory) / "v1.sqlite3"
             project = self.make_project()
@@ -449,8 +449,9 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             store = SQLiteBridgeStore(db_path)
             self.assertEqual(
                 store.connection.execute("PRAGMA user_version").fetchone()[0],
-                2,
+                SCHEMA_VERSION,
             )
+            self.assertEqual(store.get_task(task.task_id).mode.value, "READ_ONLY")
             self.assertEqual(store.get_project(project.project_id), project)
             self.assertEqual(store.get_task(task.task_id), task)
             self.assertEqual(store.list_task_events(task.task_id), [])
