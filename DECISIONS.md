@@ -185,3 +185,35 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
 - **Origen:** Etapa 1E-B-R1
 - **Decisión:** La base default del Bridge se resolverá en `%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`, independientemente del cwd. `--db-path` quedará disponible para tests y laboratorios.
 - **Motivo:** Evita que cambiar el directorio de trabajo cree otra base y mantiene el estado del Bridge separado de `VisorVideosDevBridge`, `ChatGPTOpenCodeBridge` y el repositorio.
+
+## D-024 — Secure MCP Tunnel independiente para ChatGPT–Codex Bridge
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1F-B
+- **Decisión:** El runtime del ChatGPT–Codex Bridge vive bajo `%LOCALAPPDATA%\ChatGPTCodexBridge`, con perfil, logs, PID, health y binarios propios. Usa exclusivamente el tunnel ID autorizado `tunnel_6a8ef626bf008191a6294996145747e5` y no reutiliza rutas ni procesos del ChatGPT–OpenCode Bridge.
+- **Motivo:** Mantiene dos bridges operativamente aislados y permite validar el camino ChatGPT → Secure MCP Tunnel → MCP oficial → Bridge sin alterar infraestructura existente.
+
+## D-025 — Frontera DPAPI bajo identidad propietaria
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1F-B
+- **Decisión:** La credencial del runtime se referencia como `env:CONTROL_PLANE_API_KEY`. Los scripts la recuperan mediante `ConvertTo-SecureString` sólo bajo la identidad Windows que creó el archivo DPAPI, la mantienen en memoria y la entregan únicamente al proceso hijo. Codex no intenta descifrarla, no copia la clave y no persiste plaintext.
+- **Motivo:** DPAPI CurrentUser es una frontera de seguridad intencional; separar el usuario normal del sandbox evita ampliar privilegios o exponer el secreto.
+
+## D-026 — Readiness local como criterio de arranque
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1F-B
+- **Decisión:** El runtime usa health `127.0.0.1:8877`, health URL y PID propios. `start_mcp_tunnel.ps1` sólo informa listo cuando `/readyz` responde HTTP 200; `doctor_mcp_tunnel.ps1` queda como operación manual y `stop_mcp_tunnel.ps1` limita la detención a procesos inequívocamente asociados.
+- **Motivo:** Evita declarar disponibilidad por un archivo o proceso aislado y mantiene el ciclo de vida comprobable y reversible.
+
+## D-027 — Complemento ChatGPT posterior al runtime
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1F-B
+- **Decisión:** No se crea ni registra todavía ningún complemento ChatGPT. La etapa 1F-C comienza sólo después de validar manualmente doctor, túnel, health/readiness, MCP y aislamiento.
+- **Motivo:** La frontera local debe quedar comprobada antes de introducir interacción externa o configuración de ChatGPT.

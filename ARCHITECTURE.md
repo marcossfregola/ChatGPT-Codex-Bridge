@@ -121,3 +121,50 @@ Bridge Task
 ```
 
 `task_id`, `thread_id` y `turn_id` son identidades distintas y pertenecen a dominios diferentes.
+
+## Secure MCP Tunnel — runtime 1F-B independiente
+
+El runtime local de 1F-B queda separado del ChatGPT–OpenCode Bridge existente:
+
+```text
+ChatGPT
+    ↓
+Secure MCP Tunnel (control-plane tunnel_id autorizado)
+    ↓ stdio
+MCPServer oficial v2
+    ↓
+ChatGPT–Codex Bridge
+```
+
+La instalación nueva vive bajo `%LOCALAPPDATA%\ChatGPTCodexBridge` y mantiene
+su propio `state`, `logs`, `tunnel-client`, `tunnel-client\profiles` y
+`tunnel-state`. La base Bridge sigue siendo
+`%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`; el comando MCP usa
+la ruta absoluta del venv y `--db-path`, por lo que no depende de `Path.cwd()`.
+El perfil dedicado usa el tunnel ID no secreto
+`tunnel_6a8ef626bf008191a6294996145747e5`, channel propio,
+`127.0.0.1:8877`, health URL en
+`%LOCALAPPDATA%\ChatGPTCodexBridge\tunnel-state\health.url` y log en
+`%LOCALAPPDATA%\ChatGPTCodexBridge\logs\tunnel-client.log`. El PID se pasa al
+CLI mediante `--pid.file` y queda en
+`%LOCALAPPDATA%\ChatGPTCodexBridge\tunnel-state\tunnel.pid`.
+
+La referencia de credencial del perfil es únicamente
+`env:CONTROL_PLANE_API_KEY`. El archivo DPAPI se creó bajo la identidad Windows
+normal autorizada; los scripts `start_mcp_tunnel.ps1` y
+`doctor_mcp_tunnel.ps1` lo deserializan con `ConvertTo-SecureString`, recuperan
+el valor sólo en memoria y lo entregan únicamente al proceso hijo. Nunca se
+persiste ni se imprime el plaintext. El sandbox de Codex no intenta descifrar
+esa credencial; el doctor queda para ejecución manual bajo la identidad
+propietaria.
+
+`start_mcp_tunnel.ps1` considera listo el runtime sólo cuando el endpoint
+local `/readyz` responde HTTP 200. `stop_mcp_tunnel.ps1` sólo puede detener el
+PID del tunnel nuevo y procesos MCP hijos inequívocamente asociados por padre,
+módulo y estado `ChatGPTCodexBridge`; no realiza búsquedas genéricas de
+`python.exe` ni toca el runtime OpenCode. El stdout del proceso MCP permanece
+reservado al protocolo MCP; los diagnósticos del servidor van por stderr y el
+log del tunnel por su archivo dedicado.
+
+La conexión de ChatGPT y el complemento siguen fuera de 1F-B; se consideran
+trabajo posterior de 1F-C.
