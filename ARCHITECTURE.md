@@ -82,3 +82,17 @@ CORRECTION_REQUIRED
 `FINISHED` no implica `APPROVED`.
 
 Este documento fija responsabilidades y contratos de alto nivel. No diseña clases, paquetes ni APIs.
+
+## Persistence v0.1
+
+El estado propio inicial del Bridge se persiste localmente con SQLite mediante Python stdlib. La persistencia contiene únicamente Project, Task, estados y correlaciones; no replica sesiones, rollouts ni historial de Codex.
+
+### Correlación de identidades
+
+```text
+Bridge Task
+    ├─ thread_id → referencia Codex
+    └─ turn_id   → referencia Codex
+```
+
+`task_id`, `thread_id` y `turn_id` son identidades distintas y pertenecen a dominios diferentes.

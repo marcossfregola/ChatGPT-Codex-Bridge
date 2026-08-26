@@ -114,3 +114,34 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
 - **Origen:** Etapa 1B
 - **Decisión:** La integración inicial con `app-server` utilizará biblioteca estándar de Python.
 - **Motivo:** El spike no demostró una necesidad de dependencias runtime externas.
+## D-015 — app-server aislado detrás del Executor
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1C
+- **Decisión:** `app-server` es una interfaz que puede evolucionar; sus detalles de protocolo no deben filtrarse al Bridge Core. El `CodexExecutor` funciona como frontera de compatibilidad.
+- **Motivo:** Mantiene aislado el transporte y permite evolucionar el dominio Bridge sin acoplarlo al protocolo Codex.
+
+## D-016 — Capacidades esenciales sin experimentalApi
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1C
+- **Decisión:** El MVP no dependerá de `experimentalApi` para capacidades esenciales. Capacidades experimentales sólo podrán incorporarse posteriormente si existe necesidad concreta y fallback seguro.
+- **Motivo:** El flujo esencial de 1B funciona sin solicitar capabilities experimentales.
+
+## D-017 — SQLite para estado propio del MVP
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1C
+- **Decisión:** El estado propio inicial del Bridge se persistirá localmente con SQLite mediante Python stdlib.
+- **Motivo:** 1C demuestra mediante tests schema versionado, transacciones, foreign keys, roundtrips y reapertura real.
+
+## D-018 — Task y thread/turn son identidades distintas
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1C
+- **Decisión:** Task pertenece al dominio Bridge. Thread/Turn pertenecen a Codex y se almacenan sólo como referencias/correlaciones. No se duplican rollouts Codex.
+- **Motivo:** Evita confundir el estado propio del Bridge con la identidad y el historial interno del executor.

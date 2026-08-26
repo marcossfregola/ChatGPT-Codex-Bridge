@@ -4,7 +4,7 @@
 
 Bootstrap formal y documentación.
 
-## Etapa 1B — ACTUAL / PENDIENTE DE AUDITORÍA
+## Etapa 1B — COMPLETADA / SELLADA
 
 Spike mínimo del CodexExecutor.
 
@@ -21,7 +21,7 @@ proceso Python/Node
 → cierre
 ```
 
-## Etapa 1C
+## Etapa 1C — ACTUAL / PENDIENTE DE AUDITORÍA
 
 Persistencia mínima y modelo Project/Task.
 

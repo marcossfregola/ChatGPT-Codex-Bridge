@@ -2,14 +2,15 @@
 
 ```text
 Proyecto: ChatGPT–Codex Bridge
-Fase: spike de integración
-Última etapa aprobada: 1A
-Etapa actual: 1B
-Implementación: spike CodexExecutor iniciado
+Fase: persistencia de dominio
+Última etapa aprobada: 1B
+Etapa actual: 1C
+Implementación: Project, Task y SQLite v1 implementados
 Repositorio local: creado en esta etapa
 GitHub: no creado
 Commit de 1A: 25082dd67aecb5e1b58cae4152978025e4cf4fc3
-Commit de 1B: pendiente de auditoría
+Commit de 1B: 0d0e69a95795266c7256d3c862a072e64326bb0c
+1C: pendiente de auditoría
 ```
 
 ## Descubrimientos 0A–0C

@@ -1,0 +1,457 @@
+"""Small transactional SQLite store for Project and Task state."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import sqlite3
+from typing import Any
+
+from ..domain.models import (
+    AuditStatus,
+    ExecutionStatus,
+    Project,
+    Task,
+    timestamp_from_text,
+    timestamp_to_text,
+    utc_now,
+)
+
+
+SCHEMA_VERSION = 1
+
+
+class SchemaVersionError(RuntimeError):
+    """Raised when a database schema is newer or incomplete."""
+
+
+_EXECUTION_VALUES = ", ".join(f"'{status.value}'" for status in ExecutionStatus)
+_AUDIT_VALUES = ", ".join(f"'{status.value}'" for status in AuditStatus)
+
+
+_CREATE_PROJECTS_SQL = """
+CREATE TABLE projects (
+    project_id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    repo_path TEXT NOT NULL CHECK (length(trim(repo_path)) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+_CREATE_TASKS_SQL = f"""
+CREATE TABLE tasks (
+    task_id TEXT PRIMARY KEY NOT NULL,
+    project_id TEXT NOT NULL,
+    objective TEXT NOT NULL CHECK (length(trim(objective)) > 0),
+    executor TEXT NOT NULL CHECK (length(trim(executor)) > 0),
+    model TEXT NOT NULL CHECK (length(trim(model)) > 0),
+    execution_status TEXT NOT NULL CHECK (execution_status IN ({_EXECUTION_VALUES})),
+    audit_status TEXT NOT NULL CHECK (audit_status IN ({_AUDIT_VALUES})),
+    thread_id TEXT,
+    turn_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(project_id)
+)
+"""
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    """Normalize only case, whitespace, and a trailing semicolon."""
+
+    return "".join(sql.split()).rstrip(";").upper()
+
+
+_EXPECTED_COLUMNS = {
+    "projects": (
+        ("project_id", "TEXT", 1, 1),
+        ("name", "TEXT", 1, 0),
+        ("repo_path", "TEXT", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ),
+    "tasks": (
+        ("task_id", "TEXT", 1, 1),
+        ("project_id", "TEXT", 1, 0),
+        ("objective", "TEXT", 1, 0),
+        ("executor", "TEXT", 1, 0),
+        ("model", "TEXT", 1, 0),
+        ("execution_status", "TEXT", 1, 0),
+        ("audit_status", "TEXT", 1, 0),
+        ("thread_id", "TEXT", 0, 0),
+        ("turn_id", "TEXT", 0, 0),
+        ("created_at", "TEXT", 1, 0),
+        ("updated_at", "TEXT", 1, 0),
+    ),
+}
+
+_EXPECTED_FOREIGN_KEYS = {
+    "projects": (),
+    "tasks": (("projects", "project_id", "project_id"),),
+}
+
+_EXPECTED_CHECKS = {
+    "projects": (
+        _normalize_schema_sql("CHECK (length(trim(name)) > 0)"),
+        _normalize_schema_sql("CHECK (length(trim(repo_path)) > 0)"),
+    ),
+    "tasks": (
+        _normalize_schema_sql("CHECK (length(trim(objective)) > 0)"),
+        _normalize_schema_sql("CHECK (length(trim(executor)) > 0)"),
+        _normalize_schema_sql("CHECK (length(trim(model)) > 0)"),
+        _normalize_schema_sql(
+            f"CHECK (execution_status IN ({_EXECUTION_VALUES}))"
+        ),
+        _normalize_schema_sql(f"CHECK (audit_status IN ({_AUDIT_VALUES}))"),
+    ),
+}
+
+_EXPECTED_SCHEMA_SQL = {
+    "projects": _normalize_schema_sql(_CREATE_PROJECTS_SQL),
+    "tasks": _normalize_schema_sql(_CREATE_TASKS_SQL),
+}
+
+_UNSET = object()
+
+
+class SQLiteBridgeStore:
+    """Synchronous, single-connection persistence for the 1C domain model."""
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+        self._connection: sqlite3.Connection | None = sqlite3.connect(str(self.db_path))
+        self._connection.row_factory = sqlite3.Row
+        try:
+            self._enable_foreign_keys()
+            self._ensure_schema()
+        except Exception:
+            self.close()
+            raise
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Expose the active connection for small operational checks/tests."""
+
+        return self._require_connection()
+
+    def _require_connection(self) -> sqlite3.Connection:
+        if self._connection is None:
+            raise RuntimeError("SQLiteBridgeStore is closed")
+        return self._connection
+
+    def _enable_foreign_keys(self) -> None:
+        connection = self._require_connection()
+        connection.execute("PRAGMA foreign_keys = ON")
+        enabled = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        if enabled != 1:
+            raise RuntimeError("SQLite foreign keys could not be enabled")
+
+    def _ensure_schema(self) -> None:
+        connection = self._require_connection()
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"database schema version {version} is newer than supported {SCHEMA_VERSION}"
+            )
+        if version == 0:
+            existing_objects = connection.execute(
+                "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            if existing_objects:
+                names = ", ".join(sorted(str(row[0]) for row in existing_objects))
+                raise SchemaVersionError(
+                    "database schema version 0 is not empty; "
+                    f"refusing implicit initialization: {names}"
+                )
+            with connection:
+                connection.execute(_CREATE_PROJECTS_SQL)
+                connection.execute(_CREATE_TASKS_SQL)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return
+        self._verify_schema()
+
+    def _verify_schema(self) -> None:
+        connection = self._require_connection()
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        tables = {str(row[0]) for row in rows}
+        expected_tables = {"projects", "tasks"}
+        missing = expected_tables - tables
+        if missing:
+            names = ", ".join(sorted(missing))
+            raise SchemaVersionError(f"schema v{SCHEMA_VERSION} is missing tables: {names}")
+        unexpected = tables - expected_tables
+        if unexpected:
+            names = ", ".join(sorted(unexpected))
+            raise SchemaVersionError(f"schema v{SCHEMA_VERSION} has unexpected tables: {names}")
+
+        for table, expected_columns in _EXPECTED_COLUMNS.items():
+            info_rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            actual_columns = tuple(
+                (
+                    str(row["name"]),
+                    str(row["type"]).strip().upper(),
+                    int(row["notnull"]),
+                    int(row["pk"]),
+                )
+                for row in info_rows
+            )
+            if actual_columns != expected_columns:
+                raise SchemaVersionError(
+                    f"schema v{SCHEMA_VERSION} table {table} has unexpected column metadata: "
+                    f"{actual_columns!r}"
+                )
+
+        for table, expected_foreign_keys in _EXPECTED_FOREIGN_KEYS.items():
+            foreign_keys = connection.execute(
+                f"PRAGMA foreign_key_list({table})"
+            ).fetchall()
+            actual_foreign_keys = tuple(
+                sorted(
+                    (
+                        str(row["table"]),
+                        str(row["from"]),
+                        str(row["to"]),
+                    )
+                    for row in foreign_keys
+                )
+            )
+            if actual_foreign_keys != tuple(sorted(expected_foreign_keys)):
+                raise SchemaVersionError(
+                    f"schema v{SCHEMA_VERSION} table {table} has unexpected foreign keys: "
+                    f"{actual_foreign_keys!r}"
+                )
+
+        table_rows = connection.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        sql_by_table = {
+            str(row["name"]): str(row["sql"] or "") for row in table_rows
+        }
+        for table, expected_sql in _EXPECTED_SCHEMA_SQL.items():
+            normalized_sql = _normalize_schema_sql(sql_by_table[table])
+            expected_checks = _EXPECTED_CHECKS[table]
+            if (
+                normalized_sql.count("CHECK(") != len(expected_checks)
+                or any(check not in normalized_sql for check in expected_checks)
+            ):
+                raise SchemaVersionError(
+                    f"schema v{SCHEMA_VERSION} table {table} has incorrect CHECK constraints"
+                )
+            if normalized_sql != expected_sql:
+                raise SchemaVersionError(
+                    f"schema v{SCHEMA_VERSION} table {table} has an unexpected SQL definition"
+                )
+        triggers = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()
+        if triggers:
+            names = ", ".join(str(row[0]) for row in triggers)
+            raise SchemaVersionError(f"schema v{SCHEMA_VERSION} has unexpected triggers: {names}")
+
+    def close(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+
+    def __enter__(self) -> "SQLiteBridgeStore":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
+    def create_project(self, project: Project) -> Project:
+        connection = self._require_connection()
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO projects
+                    (project_id, name, repo_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    project.project_id,
+                    project.name,
+                    project.repo_path,
+                    timestamp_to_text(project.created_at),
+                    timestamp_to_text(project.updated_at),
+                ),
+            )
+        return project
+
+    def get_project(self, project_id: str) -> Project | None:
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT project_id, name, repo_path, created_at, updated_at
+            FROM projects WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+        return self._project_from_row(row) if row is not None else None
+
+    def list_projects(self) -> list[Project]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT project_id, name, repo_path, created_at, updated_at
+            FROM projects ORDER BY project_id
+            """
+        ).fetchall()
+        return [self._project_from_row(row) for row in rows]
+
+    @staticmethod
+    def _project_from_row(row: sqlite3.Row) -> Project:
+        return Project(
+            project_id=row["project_id"],
+            name=row["name"],
+            repo_path=row["repo_path"],
+            created_at=timestamp_from_text(row["created_at"]),
+            updated_at=timestamp_from_text(row["updated_at"]),
+        )
+
+    def create_task(self, task: Task) -> Task:
+        connection = self._require_connection()
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO tasks
+                    (task_id, project_id, objective, executor, model,
+                     execution_status, audit_status, thread_id, turn_id,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.task_id,
+                    task.project_id,
+                    task.objective,
+                    task.executor,
+                    task.model,
+                    task.execution_status.value,
+                    task.audit_status.value,
+                    task.thread_id,
+                    task.turn_id,
+                    timestamp_to_text(task.created_at),
+                    timestamp_to_text(task.updated_at),
+                ),
+            )
+        return task
+
+    def get_task(self, task_id: str) -> Task | None:
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT task_id, project_id, objective, executor, model,
+                   execution_status, audit_status, thread_id, turn_id,
+                   created_at, updated_at
+            FROM tasks WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        return self._task_from_row(row) if row is not None else None
+
+    def list_tasks(self, project_id: str) -> list[Task]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT task_id, project_id, objective, executor, model,
+                   execution_status, audit_status, thread_id, turn_id,
+                   created_at, updated_at
+            FROM tasks WHERE project_id = ? ORDER BY task_id
+            """,
+            (project_id,),
+        ).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
+    @staticmethod
+    def _task_from_row(row: sqlite3.Row) -> Task:
+        try:
+            return Task(
+                task_id=row["task_id"],
+                project_id=row["project_id"],
+                objective=row["objective"],
+                executor=row["executor"],
+                model=row["model"],
+                execution_status=row["execution_status"],
+                audit_status=row["audit_status"],
+                thread_id=row["thread_id"],
+                turn_id=row["turn_id"],
+                created_at=timestamp_from_text(row["created_at"]),
+                updated_at=timestamp_from_text(row["updated_at"]),
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("invalid task state in database") from exc
+
+    def update_task_runtime(
+        self,
+        task_id: str,
+        *,
+        execution_status: ExecutionStatus | str | None = None,
+        audit_status: AuditStatus | str | None = None,
+        thread_id: str | None | object = _UNSET,
+        turn_id: str | None | object = _UNSET,
+    ) -> Task:
+        """Atomically update runtime status and Codex correlation references."""
+
+        updates: list[str] = []
+        values: list[Any] = []
+        if execution_status is not None:
+            try:
+                execution_value = (
+                    execution_status
+                    if isinstance(execution_status, ExecutionStatus)
+                    else ExecutionStatus(execution_status)
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid execution_status: {execution_status!r}") from exc
+            updates.append("execution_status = ?")
+            values.append(execution_value.value)
+        if audit_status is not None:
+            try:
+                audit_value = (
+                    audit_status
+                    if isinstance(audit_status, AuditStatus)
+                    else AuditStatus(audit_status)
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid audit_status: {audit_status!r}") from exc
+            updates.append("audit_status = ?")
+            values.append(audit_value.value)
+        if thread_id is not _UNSET:
+            updates.append("thread_id = ?")
+            values.append(self._optional_reference(thread_id, "thread_id"))
+        if turn_id is not _UNSET:
+            updates.append("turn_id = ?")
+            values.append(self._optional_reference(turn_id, "turn_id"))
+        if not updates:
+            raise ValueError("at least one runtime field must be supplied")
+
+        updates.append("updated_at = ?")
+        values.append(timestamp_to_text(utc_now()))
+        values.append(task_id)
+        connection = self._require_connection()
+        with connection:
+            cursor = connection.execute(
+                f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = ?",
+                values,
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"task does not exist: {task_id}")
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise RuntimeError("task disappeared after update")
+        return updated
+
+    @staticmethod
+    def _optional_reference(value: str | None | object, field_name: str) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} must be non-empty text or None")
+        return value
+
+
+__all__ = ["SCHEMA_VERSION", "SQLiteBridgeStore", "SchemaVersionError"]
