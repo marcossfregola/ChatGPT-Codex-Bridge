@@ -18,7 +18,11 @@ from chatgpt_codex_bridge.core import (  # noqa: E402
     _bounded_error_message,
     _bounded_notification_value,
 )
-from chatgpt_codex_bridge.domain.models import AuditStatus, ExecutionStatus  # noqa: E402
+from chatgpt_codex_bridge.domain.models import (  # noqa: E402
+    AuditStatus,
+    ExecutionStatus,
+    TaskStateError,
+)
 from chatgpt_codex_bridge.executors.base import (  # noqa: E402
     ExecutionRequest,
     ExecutionResult,
@@ -66,6 +70,23 @@ class FailingNotificationStore(SQLiteBridgeStore):
         if source == "codex":
             raise RuntimeError("observer persistence failed")
         return super().append_task_event(task_id, source, kind, payload, **kwargs)
+
+
+class CancellableExecutor:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancel_called = False
+        self.requests: list[ExecutionRequest] = []
+
+    async def run(self, request, *, on_correlation=None, on_notification=None):
+        self.requests.append(request)
+        if on_correlation is not None:
+            on_correlation("thread-cancel", "turn-cancel")
+        self.started.set()
+        await asyncio.Event().wait()
+
+    async def cancel_active(self) -> None:
+        self.cancel_called = True
 
 
 class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
@@ -126,6 +147,88 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(executor.requests[0].cwd, "C:/workspace/bridge")
         self.assertEqual(executor.asserted_event_count_during_run, 3)
 
+    async def test_only_queued_tasks_can_run(self) -> None:
+        for status in (
+            ExecutionStatus.RUNNING,
+            ExecutionStatus.FINISHED,
+            ExecutionStatus.FAILED,
+            ExecutionStatus.CANCELLED,
+        ):
+            executor = FakeExecutor(store=self.store)
+            core = self._core(executor)
+            project_id = f"project-{status.value.lower()}"
+            task_id = f"task-{status.value.lower()}"
+            core.create_project("Bridge", "C:/workspace/bridge", project_id=project_id)
+            core.create_task(project_id, "do the task", task_id=task_id)
+            self.store.update_task_runtime(task_id, execution_status=status)
+
+            with self.assertRaisesRegex(TaskStateError, f"state {status.value}"):
+                await core.run_task(task_id)
+            self.assertEqual(executor.requests, [])
+
+    async def test_cancellation_marks_cancelled_once_and_propagates(self) -> None:
+        executor = CancellableExecutor()
+        core = self._core(executor)
+        core.create_project("Bridge", "C:/workspace/bridge", project_id="project-1")
+        core.create_task("project-1", "do the task", task_id="task-1")
+
+        running = asyncio.create_task(core.run_task("task-1"))
+        await executor.started.wait()
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+
+        task = self.store.get_task("task-1")
+        assert task is not None
+        self.assertEqual(task.execution_status, ExecutionStatus.CANCELLED)
+        self.assertTrue(executor.cancel_called)
+        kinds = [event.kind for event in self.store.list_task_events("task-1")]
+        self.assertEqual(kinds.count("task.cancelled"), 1)
+        self.assertNotIn("task.failed", kinds)
+        self.assertNotIn("task.finished", kinds)
+
+    def test_recover_orphaned_running_task_is_failed_once(self) -> None:
+        core = self._core()
+        core.create_project("Bridge", "C:/workspace/bridge", project_id="project-1")
+        core.create_task("project-1", "do the task", task_id="task-1")
+        self.store.transition_task_running("task-1", project_id="project-1")
+
+        self.store.close()
+        self.store = SQLiteBridgeStore(Path(self.tempdir.name) / "bridge.sqlite3")
+        core = self._core()
+
+        recovered = core.recover_orphaned_tasks()
+
+        self.assertEqual([task.task_id for task in recovered], ["task-1"])
+        task = self.store.get_task("task-1")
+        assert task is not None
+        self.assertEqual(task.execution_status, ExecutionStatus.FAILED)
+        events = self.store.list_task_events("task-1")
+        self.assertEqual(
+            [event.kind for event in events],
+            ["task.created", "task.started", "task.recovered", "task.failed"],
+        )
+        self.assertEqual(events[-1].payload["recovered_from"], "RUNNING")
+
+    async def test_success_has_one_terminal_event_after_turn_completed(self) -> None:
+        core = self._core()
+        core.create_project("Bridge", "C:/workspace/bridge", project_id="project-1")
+        core.create_task("project-1", "do the task", task_id="task-1")
+
+        await core.run_task("task-1")
+
+        events = self.store.list_task_events("task-1")
+        terminal = [
+            event
+            for event in events
+            if event.kind in {"task.finished", "task.failed", "task.cancelled"}
+        ]
+        self.assertEqual([event.kind for event in terminal], ["task.finished"])
+        completed_id = next(event.event_id for event in events if event.kind == "turn/completed")
+        finished_id = terminal[0].event_id
+        assert completed_id is not None and finished_id is not None
+        self.assertLess(completed_id, finished_id)
+
     async def test_notifications_are_durable_and_journal_order_is_append_order(self) -> None:
         core = self._core()
         core.create_project("Bridge", "C:/workspace/bridge", project_id="project-1")
@@ -167,6 +270,12 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed.kind, "task.failed")
         self.assertEqual(failed.payload, {"error_type": "ValueError", "message": "controlled failure"})
         self.assertNotIn("Traceback", str(failed.payload))
+        terminal_kinds = [
+            event.kind
+            for event in self.store.list_task_events("task-1")
+            if event.kind in {"task.finished", "task.failed", "task.cancelled"}
+        ]
+        self.assertEqual(terminal_kinds, ["task.failed"])
 
     async def test_observer_persistence_failure_is_not_hidden(self) -> None:
         self.store.close()

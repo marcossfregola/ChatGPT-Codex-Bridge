@@ -27,6 +27,10 @@ class AuditStatus(str, Enum):
     CORRECTION_REQUIRED = "CORRECTION_REQUIRED"
 
 
+class TaskStateError(RuntimeError):
+    """Raised when a task lifecycle transition is not allowed."""
+
+
 def utc_now() -> datetime:
     """Return an aware UTC timestamp."""
 
@@ -140,6 +144,7 @@ __all__ = [
     "AuditStatus",
     "ExecutionStatus",
     "Project",
+    "TaskStateError",
     "Task",
     "ensure_utc",
     "timestamp_from_text",

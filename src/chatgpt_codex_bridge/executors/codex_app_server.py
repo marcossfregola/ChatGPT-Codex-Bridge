@@ -11,6 +11,8 @@ from pathlib import Path
 import shutil
 from typing import Any, Callable, Deque
 
+from .. import THREAD_SOURCE
+
 
 JsonObject = dict[str, Any]
 NotificationObserver = Callable[[str, JsonObject], None]
@@ -343,8 +345,8 @@ class CodexAppServerClient:
             "initialize",
             {
                 "clientInfo": {
-                    "name": "chatgpt-codex-bridge-1b",
-                    "title": "ChatGPT–Codex Bridge 1B",
+                    "name": THREAD_SOURCE,
+                    "title": "ChatGPT–Codex Bridge 1F-D",
                     "version": "0.1.0",
                 },
             },
@@ -369,7 +371,7 @@ class CodexAppServerClient:
                 "approvalsReviewer": "user",
                 "sandbox": "read-only",
                 "ephemeral": ephemeral,
-                "threadSource": "chatgpt-codex-bridge-1b",
+                "threadSource": THREAD_SOURCE,
             },
         )
 
@@ -404,6 +406,14 @@ class CodexAppServerClient:
             on_turn_started(turn_id)
         completed = await self.wait_for_turn_completed(thread_id, turn_id)
         return response, completed
+
+    async def turn_interrupt(self, *, thread_id: str, turn_id: str) -> JsonObject:
+        """Request interruption of one active turn without auto-approving anything."""
+
+        return await self.request(
+            "turn/interrupt",
+            {"threadId": thread_id, "turnId": turn_id},
+        )
 
     async def wait_for_turn_completed(
         self,

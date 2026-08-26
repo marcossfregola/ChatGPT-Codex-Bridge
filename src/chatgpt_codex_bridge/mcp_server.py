@@ -16,6 +16,13 @@ from .core import BridgeCore
 from .executors.codex_executor import CodexExecutor
 from .mcp_adapter import MCPAdapter, MCPToolError
 from .persistence.sqlite_store import SQLiteBridgeStore
+from .single_instance import (
+    MCPInstanceAlreadyRunningError,
+    MCPInstanceLock,
+    MCPInstanceLockError,
+    canonical_db_path,
+    lock_path_for_db,
+)
 
 
 SERVER_NAME = "chatgpt-codex-bridge"
@@ -150,23 +157,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db-path", type=Path, default=default_db_path())
     parser.add_argument("--executable")
     args = parser.parse_args(argv)
-    db_path: Path = args.db_path
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SQLiteBridgeStore(db_path)
+    db_path = canonical_db_path(args.db_path)
     try:
-        print(f"{SERVER_NAME} MCP server pid={os.getpid()}", file=sys.stderr, flush=True)
-        executor = CodexExecutor(executable=args.executable)
-        adapter = MCPAdapter(BridgeCore(store, executor), store)
-        build_server(adapter).run(transport="stdio")
-        return 0
+        with MCPInstanceLock(db_path):
+            store = SQLiteBridgeStore(db_path)
+            try:
+                print(
+                    f"{SERVER_NAME} MCP server pid={os.getpid()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                executor = CodexExecutor(executable=args.executable)
+                core = BridgeCore(store, executor)
+                core.recover_orphaned_tasks()
+                adapter = MCPAdapter(core, store)
+                build_server(adapter).run(transport="stdio")
+                return 0
+            finally:
+                store.close()
+    except MCPInstanceAlreadyRunningError as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        return 2
     except KeyboardInterrupt:
         return 0
-    finally:
-        store.close()
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["DEFAULT_APP_DIRECTORY", "MCPServer", "build_server", "default_db_path", "main"]
+__all__ = [
+    "DEFAULT_APP_DIRECTORY",
+    "MCPInstanceAlreadyRunningError",
+    "MCPInstanceLock",
+    "MCPInstanceLockError",
+    "MCPServer",
+    "build_server",
+    "canonical_db_path",
+    "default_db_path",
+    "lock_path_for_db",
+    "main",
+]

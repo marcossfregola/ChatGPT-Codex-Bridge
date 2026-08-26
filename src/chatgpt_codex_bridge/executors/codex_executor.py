@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import os
 from pathlib import Path
@@ -44,6 +45,9 @@ class CodexExecutor:
         self.last_pid: int | None = None
         self.last_close_result: CloseResult | None = None
         self.last_account_type: str | None = None
+        self._active_thread_id: str | None = None
+        self._active_turn_id: str | None = None
+        self._cancel_requested = False
 
     @staticmethod
     def _result_object(response: dict[str, Any], operation: str) -> dict[str, Any]:
@@ -105,6 +109,9 @@ class CodexExecutor:
         self.last_pid = None
         self.last_close_result = None
         self.last_account_type = None
+        self._active_thread_id = None
+        self._active_turn_id = None
+        self._cancel_requested = False
         primary_error: BaseException | None = None
         try:
             self.last_pid = await client.start()
@@ -118,10 +125,12 @@ class CodexExecutor:
                     ephemeral=True,
                 )
             )
+            self._active_thread_id = thread_id
             if on_correlation is not None:
                 on_correlation(thread_id, None)
 
             def on_turn_started(turn_id: str) -> None:
+                self._active_turn_id = turn_id
                 if on_correlation is not None:
                     on_correlation(thread_id, turn_id)
 
@@ -140,6 +149,13 @@ class CodexExecutor:
                 status=ExecutionStatus.FINISHED,
                 final_response=extract_final_agent_message(completed),
             )
+        except asyncio.CancelledError as exc:
+            primary_error = exc
+            try:
+                await asyncio.shield(self.cancel_active())
+            except BaseException:
+                pass
+            raise
         except BaseException as exc:
             primary_error = exc
             raise
@@ -149,6 +165,29 @@ class CodexExecutor:
             except BaseException:
                 if primary_error is None:
                     raise
+            self._active_thread_id = None
+            self._active_turn_id = None
+
+    async def cancel_active(self) -> bool:
+        """Best-effort interrupt for the currently active turn."""
+
+        if self._cancel_requested:
+            return False
+        client = self.last_client
+        thread_id = self._active_thread_id
+        turn_id = self._active_turn_id
+        interrupt = getattr(client, "turn_interrupt", None) if client is not None else None
+        process = getattr(client, "process", object()) if client is not None else None
+        if client is None or process is None or not thread_id or not turn_id:
+            return False
+        if not callable(interrupt):
+            return False
+        self._cancel_requested = True
+        try:
+            await interrupt(thread_id=thread_id, turn_id=turn_id)
+        except BaseException:
+            return False
+        return True
 
 
 def client_turn_id(completed: dict[str, Any]) -> str:

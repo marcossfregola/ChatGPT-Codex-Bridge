@@ -6,15 +6,15 @@ import asyncio
 from collections.abc import Mapping
 from typing import Any
 
-from . import __version__
-from .core import BridgeCore
+from . import BRIDGE_STAGE, __version__
+from .core import BridgeCore, TaskStateError
 from .domain.events import TaskEvent
 from .domain.models import Project, Task, timestamp_to_text
 from .persistence.sqlite_store import SQLiteBridgeStore
 
 
 DEFAULT_MODEL = "gpt-5.6-luna"
-STAGE = "1E-B"
+STAGE = BRIDGE_STAGE
 MAX_EVENT_LIMIT = 1000
 
 
@@ -134,6 +134,8 @@ class MCPAdapter:
             "task.started",
             "task.finished",
             "task.failed",
+            "task.cancelled",
+            "task.recovered",
             "thread/started",
             "turn/started",
             "turn/completed",
@@ -177,6 +179,8 @@ class MCPAdapter:
     ) -> dict[str, Any]:
         try:
             return await self._call_tool(name, arguments)
+        except TaskStateError as exc:
+            raise MCPToolError(str(exc)) from exc
         except MCPToolError:
             raise
         except Exception as exc:

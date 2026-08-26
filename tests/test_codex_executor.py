@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 
@@ -67,6 +68,40 @@ class FakeClient:
         return CloseResult(pid=4123, returncode=0, killed=False)
 
 
+class InterruptingClient(FakeClient):
+    def __init__(self, executable, cwd, *, notification_observer=None, **kwargs):
+        super().__init__(
+            executable,
+            cwd,
+            notification_observer=notification_observer,
+            **kwargs,
+        )
+        self.process = SimpleNamespace(pid=4124, returncode=None)
+        self.started = asyncio.Event()
+        self.interrupts: list[tuple[str, str]] = []
+
+    async def start(self):
+        return 4124
+
+    async def thread_start(self, *, model, cwd, ephemeral):
+        return {"result": {"thread": {"id": "thread-active"}}}
+
+    async def turn_start(self, *, thread_id, cwd, model, prompt, on_turn_started=None):
+        if on_turn_started is not None:
+            on_turn_started("turn-active")
+        self.started.set()
+        await asyncio.Event().wait()
+
+    async def turn_interrupt(self, *, thread_id, turn_id):
+        self.interrupts.append((thread_id, turn_id))
+        return {"result": {}}
+
+    async def close(self):
+        self.closed = True
+        self.process = None
+        return CloseResult(pid=4124, returncode=0, killed=False)
+
+
 class CodexExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_executor_correlates_early_and_closes_owned_client(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -103,6 +138,31 @@ class CodexExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(executor.last_close_result)
         assert executor.last_client is not None
         self.assertTrue(executor.last_client.closed)
+
+    async def test_cancellation_interrupts_active_turn_before_close(self):
+        client = InterruptingClient(sys.executable, Path.cwd())
+        executor = CodexExecutor(
+            executable=sys.executable,
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        running = asyncio.create_task(
+            executor.run(
+                ExecutionRequest(
+                    task_id="task-1",
+                    cwd=str(Path.cwd()),
+                    objective="wait",
+                    model="gpt-5.6-luna",
+                )
+            )
+        )
+        await client.started.wait()
+        running.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+
+        self.assertEqual(client.interrupts, [("thread-active", "turn-active")])
+        self.assertTrue(client.closed)
 
 
 if __name__ == "__main__":

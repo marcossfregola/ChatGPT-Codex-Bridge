@@ -14,6 +14,7 @@ from ..domain.models import (
     ExecutionStatus,
     Project,
     Task,
+    TaskStateError,
     timestamp_from_text,
     timestamp_to_text,
     utc_now,
@@ -182,6 +183,12 @@ _EXPECTED_SCHEMA_SQL_BY_VERSION = {
 }
 
 _UNSET = object()
+_TERMINAL_EVENT_BY_STATUS = {
+    ExecutionStatus.FINISHED: "task.finished",
+    ExecutionStatus.FAILED: "task.failed",
+    ExecutionStatus.CANCELLED: "task.cancelled",
+}
+_TERMINAL_EVENT_KINDS = tuple(_TERMINAL_EVENT_BY_STATUS.values())
 
 
 class SQLiteBridgeStore:
@@ -468,6 +475,192 @@ class SQLiteBridgeStore:
         ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
+    def list_tasks_by_execution_status(
+        self, execution_status: ExecutionStatus | str
+    ) -> list[Task]:
+        """Return tasks in one lifecycle state, ordered deterministically."""
+
+        try:
+            status = (
+                execution_status
+                if isinstance(execution_status, ExecutionStatus)
+                else ExecutionStatus(execution_status)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid execution_status: {execution_status!r}") from exc
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT task_id, project_id, objective, executor, model,
+                   execution_status, audit_status, thread_id, turn_id,
+                   created_at, updated_at
+            FROM tasks WHERE execution_status = ? ORDER BY task_id
+            """,
+            (status.value,),
+        ).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
+    @staticmethod
+    def _terminal_event_query() -> str:
+        placeholders = ", ".join("?" for _ in _TERMINAL_EVENT_KINDS)
+        return (
+            "SELECT kind FROM task_events WHERE task_id = ? AND source = 'bridge' "
+            f"AND kind IN ({placeholders}) LIMIT 1"
+        )
+
+    def _assert_no_terminal_event(
+        self, connection: sqlite3.Connection, task_id: str
+    ) -> None:
+        row = connection.execute(
+            self._terminal_event_query(),
+            (task_id, *_TERMINAL_EVENT_KINDS),
+        ).fetchone()
+        if row is not None:
+            raise TaskStateError(
+                f"task {task_id} already has terminal event {row['kind']!r}"
+            )
+
+    def transition_task_running(self, task_id: str, *, project_id: str) -> Task:
+        """Atomically move QUEUED to RUNNING and append task.started."""
+
+        connection = self._require_connection()
+        started_at = utc_now()
+        with connection:
+            row = connection.execute(
+                "SELECT execution_status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            try:
+                current = ExecutionStatus(row["execution_status"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid task state in database") from exc
+            if current is not ExecutionStatus.QUEUED:
+                raise TaskStateError(
+                    f"task {task_id} cannot run from state {current.value}; "
+                    "only QUEUED tasks may run"
+                )
+            self._assert_no_terminal_event(connection, task_id)
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET execution_status = ?, audit_status = ?, updated_at = ?
+                WHERE task_id = ? AND execution_status = ?
+                """,
+                (
+                    ExecutionStatus.RUNNING.value,
+                    AuditStatus.PENDING.value,
+                    timestamp_to_text(started_at),
+                    task_id,
+                    ExecutionStatus.QUEUED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TaskStateError(
+                    f"task {task_id} could not transition to RUNNING"
+                )
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                "task.started",
+                {"project_id": project_id},
+                created_at=started_at,
+            )
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise RuntimeError("task disappeared after transition")
+        return updated
+
+    def transition_task_terminal(
+        self,
+        task_id: str,
+        *,
+        execution_status: ExecutionStatus | str,
+        event_kind: str,
+        payload: Any,
+        recovery_payload: Any | None = None,
+    ) -> Task:
+        """Atomically update a RUNNING task and append its terminal event."""
+
+        try:
+            status = (
+                execution_status
+                if isinstance(execution_status, ExecutionStatus)
+                else ExecutionStatus(execution_status)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid execution_status: {execution_status!r}") from exc
+        expected_kind = _TERMINAL_EVENT_BY_STATUS.get(status)
+        if expected_kind is None or event_kind != expected_kind:
+            raise ValueError(
+                f"event_kind {event_kind!r} does not match terminal state {status.value}"
+            )
+
+        connection = self._require_connection()
+        terminal_at = utc_now()
+        with connection:
+            row = connection.execute(
+                "SELECT execution_status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            try:
+                current = ExecutionStatus(row["execution_status"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid task state in database") from exc
+            if current is not ExecutionStatus.RUNNING:
+                if current in _TERMINAL_EVENT_BY_STATUS:
+                    raise TaskStateError(
+                        f"task {task_id} is already terminal ({current.value})"
+                    )
+                raise TaskStateError(
+                    f"task {task_id} cannot transition from {current.value} "
+                    f"to {status.value}; expected RUNNING"
+                )
+            self._assert_no_terminal_event(connection, task_id)
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET execution_status = ?, audit_status = ?, updated_at = ?
+                WHERE task_id = ? AND execution_status = ?
+                """,
+                (
+                    status.value,
+                    AuditStatus.PENDING.value,
+                    timestamp_to_text(terminal_at),
+                    task_id,
+                    ExecutionStatus.RUNNING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TaskStateError(
+                    f"task {task_id} could not transition to {status.value}"
+                )
+            if recovery_payload is not None:
+                self._insert_task_event_in_transaction(
+                    connection,
+                    task_id,
+                    "bridge",
+                    "task.recovered",
+                    recovery_payload,
+                    created_at=terminal_at,
+                )
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                event_kind,
+                payload,
+                created_at=terminal_at,
+            )
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise RuntimeError("task disappeared after terminal transition")
+        return updated
+
     @staticmethod
     def _task_from_row(row: sqlite3.Row) -> Task:
         try:
@@ -581,6 +774,53 @@ class SQLiteBridgeStore:
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("stored event payload is invalid JSON") from exc
 
+    def _insert_task_event_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        source: str,
+        kind: str,
+        payload: Any,
+        *,
+        created_at: datetime | None = None,
+    ) -> TaskEvent:
+        event = TaskEvent(
+            event_id=None,
+            task_id=task_id,
+            source=source,
+            kind=kind,
+            payload=payload,
+            created_at=created_at if created_at is not None else utc_now(),
+        )
+        payload_json = self._serialize_payload(event.payload)
+        cursor = connection.execute(
+            """
+            INSERT INTO task_events
+                (task_id, source, kind, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                event.task_id,
+                event.source,
+                event.kind,
+                payload_json,
+                timestamp_to_text(event.created_at),
+            ),
+        )
+        event_id = cursor.lastrowid
+        if event_id is None:
+            raise RuntimeError("SQLite did not return an event_id")
+        row = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events WHERE event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("event disappeared after insert")
+        return self._event_from_row(row)
+
     @classmethod
     def _event_from_row(cls, row: sqlite3.Row) -> TaskEvent:
         try:
@@ -604,44 +844,16 @@ class SQLiteBridgeStore:
         *,
         created_at: datetime | None = None,
     ) -> TaskEvent:
-        event = TaskEvent(
-            event_id=None,
-            task_id=task_id,
-            source=source,
-            kind=kind,
-            payload=payload,
-            created_at=created_at if created_at is not None else utc_now(),
-        )
-        payload_json = self._serialize_payload(event.payload)
         connection = self._require_connection()
         with connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO task_events
-                    (task_id, source, kind, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    event.task_id,
-                    event.source,
-                    event.kind,
-                    payload_json,
-                    timestamp_to_text(event.created_at),
-                ),
+            return self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                source,
+                kind,
+                payload,
+                created_at=created_at,
             )
-            event_id = cursor.lastrowid
-            if event_id is None:
-                raise RuntimeError("SQLite did not return an event_id")
-        row = connection.execute(
-            """
-            SELECT event_id, task_id, source, kind, payload_json, created_at
-            FROM task_events WHERE event_id = ?
-            """,
-            (event_id,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("event disappeared after insert")
-        return self._event_from_row(row)
 
     def list_task_events(self, task_id: str) -> list[TaskEvent]:
         connection = self._require_connection()

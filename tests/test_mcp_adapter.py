@@ -136,6 +136,9 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("app-server", source)
         self.assertNotIn("CODEX_HOME", source)
 
+    def test_stage_is_1fd(self) -> None:
+        self.assertEqual(self.adapter.stage, "1F-D")
+
     async def test_official_initialize_and_tools_list_expose_exactly_seven_tools(self) -> None:
         async def exercise(session):
             initialized = await session.initialize()
@@ -273,6 +276,24 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.executor.requests), 1)
         self.assertEqual(result.structured_content["execution_status"], "FINISHED")
         self.assertEqual(result.structured_content["final_response"], "MCP_FAKE_OK")
+
+    async def test_run_task_rejects_non_queued_states_without_executor(self) -> None:
+        for status in (
+            ExecutionStatus.RUNNING,
+            ExecutionStatus.FINISHED,
+            ExecutionStatus.FAILED,
+            ExecutionStatus.CANCELLED,
+        ):
+            project_id = f"project-{status.value.lower()}"
+            task_id = f"task-{status.value.lower()}"
+            self.core.create_project("Bridge", "C:/workspace/bridge", project_id=project_id)
+            self.core.create_task(project_id, "do the task", task_id=task_id)
+            self.store.update_task_runtime(task_id, execution_status=status)
+
+            with self.assertRaisesRegex(MCPToolError, f"state {status.value}"):
+                await self.adapter.call_tool("run_task", {"task_id": task_id})
+
+        self.assertEqual(self.executor.requests, [])
 
     async def test_concurrent_run_is_rejected(self) -> None:
         executor = BlockingExecutor()

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
+import inspect
 import uuid
 from typing import Any
 
-from .domain.models import AuditStatus, ExecutionStatus, Project, Task
+from .domain.models import AuditStatus, ExecutionStatus, Project, Task, TaskStateError
 from .executors.base import ExecutionRequest, ExecutionResult, Executor
 from .persistence.sqlite_store import SQLiteBridgeStore
 
@@ -126,25 +128,51 @@ class BridgeCore:
         )
         return created
 
+    def recover_orphaned_tasks(self) -> list[Task]:
+        """Fail closed for RUNNING tasks left by an earlier Bridge process."""
+
+        recovered: list[Task] = []
+        for task in self.store.list_tasks_by_execution_status(ExecutionStatus.RUNNING):
+            recovered.append(
+                self.store.transition_task_terminal(
+                    task.task_id,
+                    execution_status=ExecutionStatus.FAILED,
+                    event_kind="task.failed",
+                    payload={
+                        "error_type": "OrphanedTaskRecovery",
+                        "message": "task recovered after an interrupted Bridge execution",
+                        "recovered_from": ExecutionStatus.RUNNING.value,
+                    },
+                    recovery_payload={
+                        "previous_status": ExecutionStatus.RUNNING.value,
+                        "reason": "bridge_startup_recovery",
+                    },
+                )
+            )
+        return recovered
+
+    async def _cancel_active_execution(self) -> None:
+        cancel_active = getattr(self.executor, "cancel_active", None)
+        if not callable(cancel_active):
+            return
+        result = cancel_active()
+        if inspect.isawaitable(result):
+            await result
+
     async def run_task(self, task_id: str) -> Task:
         task = self.store.get_task(task_id)
         if task is None:
             raise KeyError(f"task does not exist: {task_id}")
+        if task.execution_status is not ExecutionStatus.QUEUED:
+            raise TaskStateError(
+                f"task {task_id} cannot run from state "
+                f"{task.execution_status.value}; only QUEUED tasks may run"
+            )
         project = self.store.get_project(task.project_id)
         if project is None:
             raise RuntimeError(f"project does not exist: {task.project_id}")
 
-        self.store.update_task_runtime(
-            task_id,
-            execution_status=ExecutionStatus.RUNNING,
-            audit_status=AuditStatus.PENDING,
-        )
-        self.store.append_task_event(
-            task_id,
-            "bridge",
-            "task.started",
-            {"project_id": project.project_id},
-        )
+        self.store.transition_task_running(task_id, project_id=project.project_id)
 
         def on_correlation(thread_id: str | None, turn_id: str | None) -> None:
             updates: dict[str, Any] = {}
@@ -186,43 +214,45 @@ class BridgeCore:
                 correlation_updates["thread_id"] = result.thread_id
             if result.turn_id is not None:
                 correlation_updates["turn_id"] = result.turn_id
-            correlation_updates["execution_status"] = ExecutionStatus.FINISHED
-            correlation_updates["audit_status"] = AuditStatus.PENDING
-            self.store.update_task_runtime(task_id, **correlation_updates)
-            self.store.append_task_event(
+            if correlation_updates:
+                self.store.update_task_runtime(task_id, **correlation_updates)
+            finished = self.store.transition_task_terminal(
                 task_id,
-                "bridge",
-                "task.finished",
-                {
+                execution_status=ExecutionStatus.FINISHED,
+                event_kind="task.finished",
+                payload={
                     "thread_id": result.thread_id,
                     "turn_id": result.turn_id,
                     "status": ExecutionStatus.FINISHED.value,
                     "final_response": result.final_response,
                 },
             )
-            finished = self.store.get_task(task_id)
-            if finished is None:
-                raise RuntimeError("task disappeared after completion")
             return finished
-        except Exception as error:
+        except asyncio.CancelledError:
             try:
-                self.store.update_task_runtime(
-                    task_id,
-                    execution_status=ExecutionStatus.FAILED,
-                    audit_status=AuditStatus.PENDING,
-                )
-                self.store.append_task_event(
-                    task_id,
-                    "bridge",
-                    "task.failed",
-                    {
-                        "error_type": type(error).__name__,
-                        "message": _bounded_error_message(error),
-                    },
-                )
-            except Exception as persistence_error:
-                raise persistence_error from error
+                await self._cancel_active_execution()
+            except BaseException:
+                # Preserve cancellation semantics; terminal persistence below
+                # is the Bridge's fail-closed obligation.
+                pass
+            self.store.transition_task_terminal(
+                task_id,
+                execution_status=ExecutionStatus.CANCELLED,
+                event_kind="task.cancelled",
+                payload={"reason": "execution handler cancelled"},
+            )
+            raise
+        except Exception as error:
+            self.store.transition_task_terminal(
+                task_id,
+                execution_status=ExecutionStatus.FAILED,
+                event_kind="task.failed",
+                payload={
+                    "error_type": type(error).__name__,
+                    "message": _bounded_error_message(error),
+                },
+            )
             raise
 
 
-__all__ = ["BridgeCore"]
+__all__ = ["BridgeCore", "TaskStateError"]

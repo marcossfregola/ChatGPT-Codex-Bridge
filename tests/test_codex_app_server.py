@@ -141,6 +141,49 @@ class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["method"], "turn/completed")
         self.assertEqual(seen, [("turn/completed", result["params"])])
 
+    async def test_turn_interrupt_uses_correlated_ids(self) -> None:
+        client = CodexAppServerClient("codex", ROOT)
+        seen: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_request(method: str, params: dict[str, object]):
+            seen.append((method, params))
+            return {"result": {}}
+
+        client.request = fake_request  # type: ignore[method-assign]
+
+        result = await client.turn_interrupt(
+            thread_id="thread-active", turn_id="turn-active"
+        )
+
+        self.assertEqual(result, {"result": {}})
+        self.assertEqual(
+            seen,
+            [
+                (
+                    "turn/interrupt",
+                    {"threadId": "thread-active", "turnId": "turn-active"},
+                )
+            ],
+        )
+
+    async def test_1fd_source_is_used_for_initialize_and_thread_start(self) -> None:
+        client = CodexAppServerClient("codex", ROOT)
+        seen: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_request(method: str, params: dict[str, object]):
+            seen.append((method, params))
+            if method == "thread/start":
+                return {"result": {"thread": {"id": "thread-1fd"}}}
+            return {"result": {}}
+
+        client.request = fake_request  # type: ignore[method-assign]
+
+        await client.initialize()
+        await client.thread_start(model="gpt-5.6-luna", cwd=ROOT)
+
+        self.assertEqual(seen[0][1]["clientInfo"]["name"], "chatgpt-codex-bridge-1f-d")
+        self.assertEqual(seen[1][1]["threadSource"], "chatgpt-codex-bridge-1f-d")
+
     async def test_early_turn_completed_is_observed_once_and_consumed_later(self) -> None:
         reader = asyncio.StreamReader()
         seen: list[str] = []

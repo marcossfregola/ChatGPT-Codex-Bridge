@@ -77,6 +77,22 @@ from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
 )
 
 
+class FailingTerminalStore(SQLiteBridgeStore):
+    def _insert_task_event_in_transaction(
+        self, connection, task_id, source, kind, payload, *, created_at=None
+    ):
+        if kind == "task.finished":
+            raise RuntimeError("terminal event insert failed")
+        return super()._insert_task_event_in_transaction(
+            connection,
+            task_id,
+            source,
+            kind,
+            payload,
+            created_at=created_at,
+        )
+
+
 class SQLiteBridgeStoreTests(unittest.TestCase):
     timestamp = datetime(2026, 8, 26, 12, 0, 0, 123456, tzinfo=timezone.utc)
 
@@ -238,6 +254,40 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             self.assertIsNone(cleared.turn_id)
             self.assertEqual(cleared.execution_status, ExecutionStatus.FINISHED)
             self.assertEqual(cleared.created_at, initial.created_at)
+            store.close()
+
+    def test_terminal_transition_rolls_back_state_when_event_insert_fails(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = FailingTerminalStore(Path(directory) / "bridge.sqlite3")
+            project = self.make_project()
+            task = self.make_task()
+            store.create_project(project)
+            store.create_task(task)
+            store.append_task_event(
+                task.task_id,
+                "bridge",
+                "task.created",
+                {"project_id": project.project_id},
+            )
+            store.transition_task_running(task.task_id, project_id=project.project_id)
+
+            with self.assertRaisesRegex(RuntimeError, "terminal event insert failed"):
+                store.transition_task_terminal(
+                    task.task_id,
+                    execution_status=ExecutionStatus.FINISHED,
+                    event_kind="task.finished",
+                    payload={"final_response": "ok"},
+                )
+
+            recovered = store.get_task(task.task_id)
+            assert recovered is not None
+            self.assertEqual(recovered.execution_status, ExecutionStatus.RUNNING)
+            terminal = [
+                event
+                for event in store.list_task_events(task.task_id)
+                if event.kind in {"task.finished", "task.failed", "task.cancelled"}
+            ]
+            self.assertEqual(terminal, [])
             store.close()
 
     def test_foreign_key_rejects_task_without_project(self) -> None:
