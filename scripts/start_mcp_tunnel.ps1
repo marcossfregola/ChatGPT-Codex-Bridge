@@ -4,6 +4,10 @@ param(
     [int]$ReadinessTimeoutSeconds = 60
 )
 
+if ($PSVersionTable.PSVersion.Major -lt 7 -or $PSVersionTable.PSEdition -ne "Core") {
+    throw "This script requires PowerShell 7+. Run it with pwsh."
+}
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 

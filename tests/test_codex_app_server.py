@@ -12,7 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from chatgpt_codex_bridge.executors.codex_app_server import (  # noqa: E402
+    APP_SERVER_STREAM_LIMIT,
     AppServerError,
+    AppServerMessageLimitError,
     ProtocolError,
     ServerRequestError,
     CodexAppServerClient,
@@ -273,6 +275,68 @@ class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client.process = SimpleNamespace(stdout=reader, returncode=None)
         with self.assertRaises(AppServerError):
             await client._read_message(timeout=0.01)
+
+    async def test_stdout_line_over_64kib_within_configured_limit_is_read(self) -> None:
+        code = (
+            "import json,sys; "
+            "sys.stdout.write(json.dumps({'data':'x'*70000})+'\\n'); "
+            "sys.stdout.flush()"
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=APP_SERVER_STREAM_LIMIT,
+        )
+        client = CodexAppServerClient("codex", ROOT)
+        client.process = process
+        try:
+            message = await client._read_message(timeout=2.0)
+        finally:
+            await client.close()
+        self.assertEqual(len(message["data"]), 70000)
+
+    async def test_stderr_line_over_64kib_within_configured_limit_drains(self) -> None:
+        code = "import sys; sys.stderr.write('x'*70000+'\\n'); sys.stderr.flush()"
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=APP_SERVER_STREAM_LIMIT,
+        )
+        client = CodexAppServerClient("codex", ROOT)
+        client.process = process
+        client._stderr_task = asyncio.create_task(client._drain_stderr())
+        await process.wait()
+        await client._stderr_task
+        self.assertIsNone(client._stderr_error)
+        self.assertEqual(len(client.stderr_lines), 1)
+        self.assertEqual(len(client.stderr_lines[0]), 70000)
+        await client.close()
+
+    async def test_stdout_line_over_configured_limit_is_controlled_error(self) -> None:
+        reader = asyncio.StreamReader(limit=APP_SERVER_STREAM_LIMIT)
+        reader.feed_data(b"x" * (APP_SERVER_STREAM_LIMIT + 1) + b"\n")
+        client = CodexAppServerClient("codex", ROOT)
+        client.process = SimpleNamespace(stdout=reader, returncode=None)
+        with self.assertRaises(AppServerMessageLimitError) as raised:
+            await client._read_message(timeout=1.0)
+        self.assertIn("stdout", str(raised.exception))
+        self.assertNotIsInstance(raised.exception, ValueError)
+
+    async def test_stderr_line_over_configured_limit_has_no_background_exception(self) -> None:
+        reader = asyncio.StreamReader(limit=APP_SERVER_STREAM_LIMIT)
+        reader.feed_data(b"x" * (APP_SERVER_STREAM_LIMIT + 1) + b"\n")
+        client = CodexAppServerClient("codex", ROOT)
+        client.process = SimpleNamespace(stderr=reader)
+        await client._drain_stderr()
+        self.assertIsInstance(client._stderr_error, AppServerMessageLimitError)
+        self.assertEqual(len(client.stderr_lines), 1)
+        self.assertIn("TRUNCATED", client.stderr_lines[0])
 
     async def test_unexpected_response_does_not_requeue_in_request(self) -> None:
         reader = asyncio.StreamReader()

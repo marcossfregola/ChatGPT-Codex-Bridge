@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,7 +15,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from chatgpt_codex_bridge.core import (  # noqa: E402
     BridgeCore,
+    MAX_EVIDENCE_PAYLOAD_BYTES,
+    MAX_FINAL_RESPONSE_BYTES,
     _MAX_NOTIFICATION_TEXT,
+    _bounded_evidence_value,
     _bounded_error_message,
     _bounded_notification_value,
 )
@@ -26,6 +30,9 @@ from chatgpt_codex_bridge.domain.models import (  # noqa: E402
 from chatgpt_codex_bridge.executors.base import (  # noqa: E402
     ExecutionRequest,
     ExecutionResult,
+)
+from chatgpt_codex_bridge.executors.codex_app_server import (  # noqa: E402
+    AppServerMessageLimitError,
 )
 from chatgpt_codex_bridge.persistence.sqlite_store import SQLiteBridgeStore  # noqa: E402
 
@@ -112,6 +119,23 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bounded), _MAX_NOTIFICATION_TEXT)
         self.assertTrue(bounded.endswith("[TRUNCATED]"))
         self.assertTrue(_bounded_error_message(ValueError(long)).endswith("[TRUNCATED]"))
+
+    def test_aggregate_notification_bounding_preserves_correlation(self) -> None:
+        payload = {
+            "threadId": "thread-large",
+            "turnId": "turn-large",
+            **{f"field-{index}": "x" * _MAX_NOTIFICATION_TEXT for index in range(64)},
+        }
+
+        bounded = _bounded_evidence_value(payload)
+
+        encoded = json.dumps(
+            bounded, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        self.assertLessEqual(len(encoded), MAX_EVIDENCE_PAYLOAD_BYTES)
+        self.assertTrue(bounded["_truncated"])
+        self.assertEqual(bounded["threadId"], "thread-large")
+        self.assertEqual(bounded["turnId"], "turn-large")
 
     def test_core_creates_project(self) -> None:
         project = self._core().create_project(
@@ -229,6 +253,34 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
         assert completed_id is not None and finished_id is not None
         self.assertLess(completed_id, finished_id)
 
+    async def test_large_final_response_is_bounded_in_terminal_event(self) -> None:
+        executor = FakeExecutor(store=self.store)
+        executor.final_response = "x" * (MAX_FINAL_RESPONSE_BYTES * 2)
+
+        async def run_with_large_response(request, *, on_correlation=None, on_notification=None):
+            self.assertIsNotNone(request)
+            if on_correlation is not None:
+                on_correlation("thread-large", "turn-large")
+            return ExecutionResult(
+                thread_id="thread-large",
+                turn_id="turn-large",
+                status=ExecutionStatus.FINISHED,
+                final_response=executor.final_response,
+            )
+
+        executor.run = run_with_large_response  # type: ignore[method-assign]
+        core = self._core(executor)
+        core.create_project("Bridge", "C:/workspace/bridge", project_id="project-1")
+        core.create_task("project-1", "do the task", task_id="task-1")
+
+        await core.run_task("task-1")
+
+        finished = self.store.get_last_task_event("task-1")
+        assert finished is not None
+        response = finished.payload["final_response"]
+        self.assertEqual(len(response.encode("utf-8")), MAX_FINAL_RESPONSE_BYTES)
+        self.assertTrue(response.endswith("[TRUNCATED]"))
+
     async def test_notifications_are_durable_and_journal_order_is_append_order(self) -> None:
         core = self._core()
         core.create_project("Bridge", "C:/workspace/bridge", project_id="project-1")
@@ -276,6 +328,27 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
             if event.kind in {"task.finished", "task.failed", "task.cancelled"}
         ]
         self.assertEqual(terminal_kinds, ["task.failed"])
+
+    async def test_message_limit_failure_is_durable_and_controlled(self) -> None:
+        executor = FakeExecutor(
+            fail=AppServerMessageLimitError("app-server stdout line exceeds limit"),
+            store=self.store,
+        )
+        core = self._core(executor)
+        core.create_project("Bridge", "C:/workspace/bridge", project_id="project-1")
+        core.create_task("project-1", "do the task", task_id="task-1")
+
+        with self.assertRaises(AppServerMessageLimitError):
+            await core.run_task("task-1")
+
+        task = self.store.get_task("task-1")
+        assert task is not None
+        self.assertEqual(task.execution_status, ExecutionStatus.FAILED)
+        failed = self.store.get_last_task_event("task-1")
+        assert failed is not None
+        self.assertEqual(failed.kind, "task.failed")
+        self.assertEqual(failed.payload["error_type"], "AppServerMessageLimitError")
+        self.assertNotIn("Traceback", failed.payload["message"])
 
     async def test_observer_persistence_failure_is_not_hidden(self) -> None:
         self.store.close()

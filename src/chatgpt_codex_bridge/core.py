@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import inspect
+import json
 import uuid
 from typing import Any
 
@@ -41,6 +42,23 @@ from .persistence.sqlite_store import SQLiteBridgeStore
 _MAX_NOTIFICATION_DEPTH = 4
 _MAX_NOTIFICATION_ITEMS = 64
 _MAX_NOTIFICATION_TEXT = 4096
+# These are byte limits for data that crosses or is persisted by the Bridge.
+# The structural limits above remain useful for readable previews, while this
+# aggregate limit prevents a broad payload from expanding the journal or MCP
+# response without bound.
+MAX_EVIDENCE_PAYLOAD_BYTES = 16 * 1024
+MAX_FINAL_RESPONSE_BYTES = 12 * 1024
+_CRITICAL_EVIDENCE_KEYS = (
+    "threadId",
+    "turnId",
+    "itemId",
+    "status",
+    "type",
+    "phase",
+    "id",
+    "method",
+    "final_response",
+)
 _SENSITIVE_MARKERS = (
     "auth",
     "cookie",
@@ -73,7 +91,18 @@ def _bounded_notification_value(value: Any, depth: int = 0) -> Any:
         return value[: _MAX_NOTIFICATION_TEXT - len(marker)] + marker
     if isinstance(value, Mapping):
         bounded: dict[str, Any] = {}
-        for index, (key, child) in enumerate(value.items()):
+        items = list(value.items())
+        priority = [
+            item
+            for item in items
+            if str(item[0]) in _CRITICAL_EVIDENCE_KEYS
+        ]
+        regular = [
+            item
+            for item in items
+            if str(item[0]) not in _CRITICAL_EVIDENCE_KEYS
+        ]
+        for index, (key, child) in enumerate((*priority, *regular)):
             if index >= _MAX_NOTIFICATION_ITEMS:
                 bounded["_truncated"] = True
                 break
@@ -91,6 +120,80 @@ def _bounded_notification_value(value: Any, depth: int = 0) -> Any:
             items.append("[TRUNCATED]")
         return items
     return f"[{type(value).__name__}]"
+
+
+def _compact_json_size(value: Any) -> int:
+    """Return the UTF-8 size of the JSON representation used by SQLite."""
+
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+
+
+def _bounded_evidence_value(
+    value: Any, *, max_bytes: int = MAX_EVIDENCE_PAYLOAD_BYTES
+) -> Any:
+    """Apply structural and aggregate bounds while retaining identifiers.
+
+    A large structured notification is represented by a small, valid JSON
+    summary.  Known correlation/status fields are retained when they fit; the
+    original payload is never embedded in the summary.
+    """
+
+    bounded = _bounded_notification_value(value)
+    encoded_size = _compact_json_size(bounded)
+    if encoded_size <= max_bytes:
+        return bounded
+
+    summary: dict[str, Any] = {
+        "_truncated": True,
+        "_original_bytes": encoded_size,
+    }
+    if isinstance(bounded, Mapping):
+        for key in _CRITICAL_EVIDENCE_KEYS:
+            if key not in bounded:
+                continue
+            candidate = dict(summary)
+            candidate[key] = bounded[key]
+            if _compact_json_size(candidate) <= max_bytes:
+                summary = candidate
+    return summary
+
+
+def _bounded_text_bytes(value: str, max_bytes: int) -> str:
+    """Truncate UTF-8 text without splitting a code point."""
+
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    marker = "[TRUNCATED]"
+    marker_bytes = marker.encode("utf-8")
+    if max_bytes <= len(marker_bytes):
+        return marker[:max_bytes]
+    prefix = encoded[: max_bytes - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return prefix + marker
+
+
+def _bounded_final_response(value: str | None) -> str | None:
+    """Keep the public final-response type while enforcing a byte limit."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    return _bounded_text_bytes(value, MAX_FINAL_RESPONSE_BYTES)
+
+
+def _bounded_response_text(value: str) -> str:
+    """Bound text fields returned by task/status MCP representations."""
+
+    return _bounded_text_bytes(value, MAX_FINAL_RESPONSE_BYTES)
 
 
 def _bounded_error_message(error: Exception) -> str:
@@ -452,7 +555,7 @@ class BridgeCore:
                 task_id,
                 "codex",
                 method,
-                _bounded_notification_value(params),
+                _bounded_evidence_value(params),
             )
 
         postflight_recorded = False
@@ -500,7 +603,7 @@ class BridgeCore:
                     "thread_id": result.thread_id,
                     "turn_id": result.turn_id,
                     "status": ExecutionStatus.FINISHED.value,
-                    "final_response": result.final_response,
+                    "final_response": _bounded_final_response(result.final_response),
                 },
             )
             return finished

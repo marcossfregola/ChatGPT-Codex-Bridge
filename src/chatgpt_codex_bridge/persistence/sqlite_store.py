@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from collections.abc import Iterable
 from pathlib import Path
 import json
 import sqlite3
@@ -1012,18 +1013,102 @@ class SQLiteBridgeStore:
                 created_at=created_at,
             )
 
-    def list_task_events(self, task_id: str) -> list[TaskEvent]:
+    @staticmethod
+    def _validate_event_limit(limit: int) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("event limit must be a positive integer")
+
+    def list_task_events(
+        self, task_id: str, limit: int | None = None
+    ) -> list[TaskEvent]:
         connection = self._require_connection()
-        rows = connection.execute(
+        query = """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ?
+            ORDER BY event_id ASC
+        """
+        params: list[Any] = [task_id]
+        if limit is not None:
+            self._validate_event_limit(limit)
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    def list_task_events_window(
+        self,
+        task_id: str,
+        limit: int,
+        *,
+        critical_kinds: Iterable[str] = (),
+        critical_limit: int = 64,
+    ) -> tuple[list[TaskEvent], int]:
+        """Read a bounded head plus recent critical events.
+
+        The head and critical tail are separate SQL-limited queries.  This
+        intentionally does not materialize or deserialize the complete task
+        journal when a caller only needs a bounded view.
+        """
+
+        self._validate_event_limit(limit)
+        self._validate_event_limit(critical_limit)
+        total = self.count_task_events(task_id)
+        connection = self._require_connection()
+        head_rows = connection.execute(
             """
             SELECT event_id, task_id, source, kind, payload_json, created_at
             FROM task_events
             WHERE task_id = ?
             ORDER BY event_id ASC
+            LIMIT ?
             """,
-            (task_id,),
+            (task_id, limit),
         ).fetchall()
-        return [self._event_from_row(row) for row in rows]
+        events = [self._event_from_row(row) for row in head_rows]
+        kinds = tuple(dict.fromkeys(kind for kind in critical_kinds if isinstance(kind, str)))
+        if total <= limit or not kinds:
+            return events, total
+
+        placeholders = ", ".join("?" for _ in kinds)
+        rows = connection.execute(
+            f"""
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ? AND kind IN ({placeholders})
+            ORDER BY event_id DESC
+            LIMIT ?
+            """,
+            (task_id, *kinds, critical_limit),
+        ).fetchall()
+        by_id = {event.event_id: event for event in events}
+        for row in rows:
+            event = self._event_from_row(row)
+            by_id[event.event_id] = event
+        return sorted(by_id.values(), key=lambda event: event.event_id or 0), total
+
+    def get_latest_task_events(
+        self, task_id: str, kinds: Iterable[str]
+    ) -> list[TaskEvent]:
+        """Read at most one latest event for each requested kind."""
+
+        connection = self._require_connection()
+        unique_kinds = tuple(dict.fromkeys(kind for kind in kinds if isinstance(kind, str)))
+        events: list[TaskEvent] = []
+        for kind in unique_kinds:
+            row = connection.execute(
+                """
+                SELECT event_id, task_id, source, kind, payload_json, created_at
+                FROM task_events
+                WHERE task_id = ? AND kind = ?
+                ORDER BY event_id DESC
+                LIMIT 1
+                """,
+                (task_id, kind),
+            ).fetchone()
+            if row is not None:
+                events.append(self._event_from_row(row))
+        return sorted(events, key=lambda event: event.event_id or 0)
 
     def get_last_task_event(self, task_id: str) -> TaskEvent | None:
         connection = self._require_connection()

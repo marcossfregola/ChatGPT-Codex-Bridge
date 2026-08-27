@@ -18,6 +18,12 @@ from ..domain.models import TaskMode
 JsonObject = dict[str, Any]
 NotificationObserver = Callable[[str, JsonObject], None]
 
+# ``asyncio`` defaults StreamReader's line buffer to 64 KiB.  Codex can emit
+# larger JSON-line messages (for example, command output), so the Bridge uses
+# one explicit finite limit for both stdout and stderr.  The value is large
+# enough for normal evidence while retaining a hard memory boundary.
+APP_SERVER_STREAM_LIMIT = 1024 * 1024
+
 
 class AppServerError(RuntimeError):
     """Base class for errors raised by the minimal app-server client."""
@@ -25,6 +31,10 @@ class AppServerError(RuntimeError):
 
 class ProtocolError(AppServerError):
     """Raised when an app-server message is invalid or unexpected."""
+
+
+class AppServerMessageLimitError(AppServerError):
+    """Raised when one app-server stdout/stderr line exceeds the stream limit."""
 
 
 class ExecutableResolutionError(AppServerError):
@@ -51,6 +61,24 @@ def decode_json_line(line: bytes | str) -> JsonObject:
     if not isinstance(message, dict):
         raise ProtocolError("app-server JSON message must be an object")
     return message
+
+
+def _is_stream_limit_error(error: BaseException) -> bool:
+    """Recognize Python's line-buffer overflow messages without leaking internals."""
+
+    if isinstance(error, asyncio.LimitOverrunError):
+        return True
+    if not isinstance(error, ValueError):
+        return False
+    message = str(error).lower()
+    return "limit" in message and ("chunk" in message or "separator" in message)
+
+
+def _stream_limit_error(stream_name: str) -> AppServerMessageLimitError:
+    return AppServerMessageLimitError(
+        f"app-server {stream_name} line exceeds the configured "
+        f"{APP_SERVER_STREAM_LIMIT}-byte limit"
+    )
 
 
 def classify_message(message: JsonObject) -> str:
@@ -188,6 +216,7 @@ class CodexAppServerClient:
         self.events: list[JsonObject] = []
         self.server_requests: list[JsonObject] = []
         self.stderr_lines: list[str] = []
+        self._stderr_error: AppServerMessageLimitError | None = None
         self._next_request_id = 1
         # Only early notifications that must be consumed by
         # wait_for_turn_completed() are retained. Responses are never queued:
@@ -225,6 +254,7 @@ class CodexAppServerClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=APP_SERVER_STREAM_LIMIT,
             )
         except (OSError, PermissionError) as exc:
             self.process = None
@@ -252,6 +282,14 @@ class CodexAppServerClient:
                 self.stderr_lines.append(_redact_stderr(decoded))
                 if len(self.stderr_lines) > 200:
                     del self.stderr_lines[:-200]
+        except (asyncio.LimitOverrunError, ValueError) as exc:
+            if _is_stream_limit_error(exc):
+                self._stderr_error = _stream_limit_error("stderr")
+                self.stderr_lines.append(
+                    f"[TRUNCATED stderr line over {APP_SERVER_STREAM_LIMIT} bytes]"
+                )
+                return
+            raise
         except (OSError, ConnectionError):
             return
 
@@ -266,6 +304,10 @@ class CodexAppServerClient:
             )
         except asyncio.TimeoutError as exc:
             raise AppServerError("timed out waiting for app-server stdout") from exc
+        except (asyncio.LimitOverrunError, ValueError) as exc:
+            if _is_stream_limit_error(exc):
+                raise _stream_limit_error("stdout") from None
+            raise
         if not line:
             raise AppServerError(
                 f"app-server stdout closed (returncode={process.returncode})"
@@ -525,11 +567,17 @@ class CodexAppServerClient:
                         pass
                 self._stderr_task = None
         self.process = None
+        stderr_error = self._stderr_error
+        self._stderr_error = None
+        if stderr_error is not None:
+            raise stderr_error
         return CloseResult(pid=pid, returncode=process.returncode, killed=killed)
 
 
 __all__ = [
     "AppServerError",
+    "APP_SERVER_STREAM_LIMIT",
+    "AppServerMessageLimitError",
     "CodexAppServerClient",
     "CloseResult",
     "ExecutableLaunchError",

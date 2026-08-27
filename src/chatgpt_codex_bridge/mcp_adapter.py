@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import json
 from typing import Any
 
 from . import BRIDGE_STAGE, __version__
-from .core import BridgeCore, TaskStateError
+from .core import (
+    BridgeCore,
+    TaskStateError,
+    _bounded_evidence_value,
+    _bounded_final_response,
+    _bounded_response_text,
+)
 from .domain.events import TaskEvent
-from .domain.models import Project, Task, TaskMode, timestamp_to_text
+from .domain.models import ExecutionStatus, Project, Task, TaskMode, timestamp_to_text
 from .persistence.sqlite_store import SQLiteBridgeStore
 from .policy import PolicyError
 
@@ -17,6 +24,15 @@ from .policy import PolicyError
 DEFAULT_MODEL = "gpt-5.6-luna"
 STAGE = BRIDGE_STAGE
 MAX_EVENT_LIMIT = 1000
+DEFAULT_EVENT_LIMIT = 100
+MAX_CRITICAL_EVENT_RESULTS = 64
+MAX_EVENT_RESPONSE_BYTES = 512 * 1024
+_RESULT_EVENT_KINDS = (
+    "task.finished",
+    "policy.git_checkpoint",
+    "policy.postflight",
+    "policy.violation",
+)
 
 
 class MCPToolError(RuntimeError):
@@ -57,7 +73,7 @@ def _task_dict(task: Task) -> dict[str, Any]:
     return {
         "task_id": task.task_id,
         "project_id": task.project_id,
-        "objective": task.objective,
+        "objective": _bounded_response_text(task.objective),
         "executor": task.executor,
         "model": task.model,
         "mode": task.mode.value,
@@ -76,7 +92,7 @@ def _event_dict(event: TaskEvent) -> dict[str, Any]:
         "task_id": event.task_id,
         "source": event.source,
         "kind": event.kind,
-        "payload": event.payload,
+        "payload": _bounded_evidence_value(event.payload),
         "created_at": timestamp_to_text(event.created_at),
     }
 
@@ -110,32 +126,23 @@ class MCPAdapter:
         return self.store.get_last_task_event(task_id)
 
     def _result_for_task(self, task: Task) -> dict[str, Any]:
-        finished_events = [
-            event
-            for event in self.store.list_task_events(task.task_id)
-            if event.source == "bridge" and event.kind == "task.finished"
-        ]
-        payload = finished_events[-1].payload if finished_events else {}
+        relevant_events = self.store.get_latest_task_events(
+            task.task_id, _RESULT_EVENT_KINDS
+        )
+        by_kind = {
+            event.kind: event
+            for event in relevant_events
+            if event.source == "bridge"
+        }
+        finished_event = by_kind.get("task.finished")
+        payload = finished_event.payload if finished_event is not None else {}
         if not isinstance(payload, dict):
             payload = {}
-        events = self.store.list_task_events(task.task_id)
-        checkpoint_events = [
-            event
-            for event in events
-            if event.source == "bridge" and event.kind == "policy.git_checkpoint"
-        ]
-        postflight_events = [
-            event
-            for event in events
-            if event.source == "bridge" and event.kind == "policy.postflight"
-        ]
-        violation_events = [
-            event
-            for event in events
-            if event.source == "bridge" and event.kind == "policy.violation"
-        ]
-        checkpoint = checkpoint_events[-1].payload if checkpoint_events else {}
-        postflight = postflight_events[-1].payload if postflight_events else {}
+        checkpoint_event = by_kind.get("policy.git_checkpoint")
+        postflight_event = by_kind.get("policy.postflight")
+        violation_event = by_kind.get("policy.violation")
+        checkpoint = checkpoint_event.payload if checkpoint_event is not None else {}
+        postflight = postflight_event.payload if postflight_event is not None else {}
         if not isinstance(checkpoint, dict):
             checkpoint = {}
         if not isinstance(postflight, dict):
@@ -147,17 +154,17 @@ class MCPAdapter:
             "audit_status": task.audit_status.value,
             "thread_id": task.thread_id,
             "turn_id": task.turn_id,
-            "available": bool(finished_events),
-            "final_response": payload.get("final_response"),
-            "event_id": finished_events[-1].event_id if finished_events else None,
+            "available": finished_event is not None,
+            "final_response": _bounded_final_response(payload.get("final_response")),
+            "event_id": finished_event.event_id if finished_event is not None else None,
             "baseline_branch": checkpoint.get("baseline_branch"),
             "baseline_head": checkpoint.get("baseline_head"),
             "final_branch": postflight.get("final_branch"),
             "final_head": postflight.get("final_head"),
-            "changed_files": postflight.get("changed_files", []),
-            "untracked_files": postflight.get("untracked_files", []),
+            "changed_files": _bounded_evidence_value(postflight.get("changed_files", [])),
+            "untracked_files": _bounded_evidence_value(postflight.get("untracked_files", [])),
             "policy_violation": bool(
-                violation_events
+                violation_event is not None
                 or postflight.get("policy_violation", False)
             ),
         }
@@ -179,6 +186,46 @@ class MCPAdapter:
             "turn/started",
             "turn/completed",
         }
+
+    @staticmethod
+    def _response_size(value: Any) -> int:
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+
+    def _bounded_event_response(
+        self,
+        task_id: str,
+        events: list[TaskEvent],
+        total: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Bound event count and aggregate response bytes, retaining critical events."""
+
+        critical_kinds = self._critical_event_kinds()
+        priority = [event for event in events if event.kind in critical_kinds]
+        remainder = [event for event in events if event.kind not in critical_kinds]
+        selected: list[dict[str, Any]] = []
+        omitted = False
+        for event in (*priority, *remainder):
+            event_value = _event_dict(event)
+            candidate = {
+                "task_id": task_id,
+                "events": [*selected, event_value],
+                "count": total,
+                "truncated": True,
+            }
+            if self._response_size(candidate) > MAX_EVENT_RESPONSE_BYTES:
+                omitted = True
+                continue
+            selected.append(event_value)
+        selected.sort(key=lambda event: event.get("event_id") or 0)
+        return selected, omitted
 
     def _status(self) -> dict[str, Any]:
         tasks = self._all_tasks()
@@ -218,6 +265,14 @@ class MCPAdapter:
     ) -> dict[str, Any]:
         try:
             return await self._call_tool(name, arguments)
+        except asyncio.CancelledError:
+            # Core persists task.cancelled and deliberately re-raises.  The
+            # adapter cannot distinguish a peer-cancelled request from the
+            # MCP server's global shutdown: both arrive here as the same
+            # cancellation family, while the high-level MCPServer tool
+            # context does not expose the dispatcher's request cancel event.
+            # Preserve cancellation so a server TaskGroup can terminate.
+            raise
         except TaskStateError as exc:
             raise MCPToolError(str(exc)) from exc
         except PolicyError as exc:
@@ -286,24 +341,21 @@ class MCPAdapter:
                     raise MCPToolError(
                         f"argument 'limit' must be between 1 and {MAX_EVENT_LIMIT}"
                     )
-            events = self.store.list_task_events(task_id)
-            if limit is None or len(events) <= limit:
-                selected = events
-            else:
-                selected = events[:limit]
-                selected_ids = {event.event_id for event in selected}
-                selected.extend(
-                    event
-                    for event in events
-                    if event.kind in self._critical_event_kinds()
-                    and event.event_id not in selected_ids
-                )
-                selected.sort(key=lambda event: event.event_id or 0)
+            requested_limit = DEFAULT_EVENT_LIMIT if limit is None else limit
+            selected, total = self.store.list_task_events_window(
+                task_id,
+                requested_limit,
+                critical_kinds=self._critical_event_kinds(),
+                critical_limit=MAX_CRITICAL_EVENT_RESULTS,
+            )
+            selected_values, response_omitted = self._bounded_event_response(
+                task_id, selected, total
+            )
             return {
                 "task_id": task_id,
-                "events": [_event_dict(event) for event in selected],
-                "count": len(events),
-                "truncated": len(selected) < len(events),
+                "events": selected_values,
+                "count": total,
+                "truncated": response_omitted or len(selected_values) < total,
             }
         if name == "get_result":
             task = self.store.get_task(_required_text(args, "task_id"))
@@ -329,6 +381,7 @@ class MCPAdapter:
 
 __all__ = [
     "DEFAULT_MODEL",
+    "DEFAULT_EVENT_LIMIT",
     "MAX_EVENT_LIMIT",
     "MCPAdapter",
     "MCPConcurrencyError",

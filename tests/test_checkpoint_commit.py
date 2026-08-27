@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -495,6 +496,94 @@ class CheckpointCommitTests(unittest.TestCase):
         with self.assertRaises(CheckpointCommitError):
             core.commit_checkpoint(task.task_id, "checkpoint D3")
         self.assertEqual(git(repo, "rev-parse", "HEAD"), new_head)
+
+    def test_37_large_postflight_survives_sqlite_continuation_and_checkpoint(self) -> None:
+        large_paths = [
+            f"large-postflight-{index:03d}-payload.txt" for index in range(180)
+        ]
+
+        def create_large_dirty_state(path: Path) -> None:
+            for index, relative_path in enumerate(large_paths):
+                (path / relative_path).write_text(
+                    f"payload-{index:03d}\n", encoding="utf-8", newline=""
+                )
+
+        repo, core, first, _ = self._finished(
+            mutation=create_large_dirty_state,
+            task_id="task-large-postflight",
+        )
+        row = self.store.connection.execute(
+            """
+            SELECT payload_json
+            FROM task_events
+            WHERE task_id = ? AND source = 'bridge' AND kind = 'policy.postflight'
+            ORDER BY event_id DESC
+            LIMIT 1
+            """,
+            (first.task_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        serialized = row["payload_json"]
+        self.assertGreater(len(serialized.encode("utf-8")), 16 * 1024)
+        self.assertNotIn("[TRUNCATED]", serialized)
+
+        persisted = next(
+            event
+            for event in reversed(self.store.list_task_events(first.task_id))
+            if event.source == "bridge" and event.kind == "policy.postflight"
+        )
+        self.assertEqual(json.loads(serialized), persisted.payload)
+        self.assertEqual(persisted.payload["untracked_files"], large_paths)
+        self.assertEqual(
+            len(persisted.payload["content_fingerprints"]), len(large_paths)
+        )
+        self.assertTrue(
+            all(
+                item["path"] in large_paths
+                and item["state"] == "untracked"
+                and len(item["sha256"]) == 64
+                for item in persisted.payload["content_fingerprints"]
+            )
+        )
+
+        core.executor = FinishedExecutor(lambda path: None)
+        continuation = core.create_task(
+            "project-checkpoint",
+            "continue the large postflight task",
+            task_id="task-large-postflight-r1",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        asyncio.run(core.run_task(continuation.task_id))
+        continuation_payload = self._postflight_payload(continuation)
+        continuation_row = self.store.connection.execute(
+            """
+            SELECT payload_json
+            FROM task_events
+            WHERE task_id = ? AND source = 'bridge' AND kind = 'policy.postflight'
+            ORDER BY event_id DESC
+            LIMIT 1
+            """,
+            (continuation.task_id,),
+        ).fetchone()
+        self.assertIsNotNone(continuation_row)
+        self.assertGreater(
+            len(continuation_row["payload_json"].encode("utf-8")), 16 * 1024
+        )
+        self.assertNotIn("[TRUNCATED]", continuation_row["payload_json"])
+        self.assertEqual(
+            continuation_payload["untracked_files"], persisted.payload["untracked_files"]
+        )
+        self.assertEqual(
+            continuation_payload["content_fingerprints"],
+            persisted.payload["content_fingerprints"],
+        )
+
+        result = core.commit_checkpoint(
+            continuation.task_id, "checkpoint large postflight"
+        )
+        self.assertTrue(result["clean"])
+        self.assertEqual(result["paths"], sorted(large_paths))
+        self.assertEqual(git_raw(repo, "status", "--porcelain"), "")
 
     def test_adapter_commit_tool_delegates(self) -> None:
         repo, core, task, _ = self._finished()

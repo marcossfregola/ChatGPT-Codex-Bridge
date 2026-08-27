@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,17 +16,24 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from mcp.shared.memory import create_client_server_memory_streams  # noqa: E402
+from mcp.shared.exceptions import MCPError  # noqa: E402
 
-from chatgpt_codex_bridge.core import BridgeCore  # noqa: E402
+from chatgpt_codex_bridge.core import (  # noqa: E402
+    BridgeCore,
+    MAX_FINAL_RESPONSE_BYTES,
+)
 from chatgpt_codex_bridge.domain.models import ExecutionStatus  # noqa: E402
 from chatgpt_codex_bridge.executors.base import ExecutionResult  # noqa: E402
 from chatgpt_codex_bridge.mcp_adapter import (  # noqa: E402
+    DEFAULT_EVENT_LIMIT,
     MCPAdapter,
     MCPConcurrencyError,
     MCPToolError,
 )
 from chatgpt_codex_bridge.mcp_server import (  # noqa: E402
+    _call_adapter,
     build_server,
     default_db_path,
 )
@@ -65,11 +73,20 @@ class BlockingExecutor(ImmediateExecutor):
         super().__init__()
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.child_closed = asyncio.Event()
+        self.cancel_active_called = asyncio.Event()
+
+    def cancel_active(self) -> None:
+        self.cancel_active_called.set()
 
     async def run(self, request, *, on_correlation=None, on_notification=None):
         self.requests.append(request)
         self.started.set()
-        await self.release.wait()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.child_closed.set()
+            raise
         return await ImmediateExecutor.run(
             self,
             request,
@@ -99,6 +116,19 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
     def _create_task(self, task_id: str = "task-mcp") -> None:
         self._create_project()
         self.core.create_task("project-mcp", "do the MCP task", task_id=task_id)
+
+    def _bulk_noise_events(self, task_id: str, count: int) -> None:
+        self.store.connection.executemany(
+            """
+            INSERT INTO task_events (task_id, source, kind, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                (task_id, "codex", "noise", f'{{"index":{index}}}', "2026-08-27T00:00:00Z")
+                for index in range(count)
+            ),
+        )
+        self.store.connection.commit()
 
     async def _with_official_client(self, callback, adapter=None):
         server = build_server(adapter or self.adapter)
@@ -247,6 +277,223 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.is_error)
         self.assertEqual(result.structured_content["events"][0]["kind"], "task.created")
+
+    async def test_get_task_events_default_is_bounded_without_full_deserialization(self) -> None:
+        self._create_task()
+        self._bulk_noise_events("task-mcp", 10_001)
+
+        with patch.object(
+            self.store, "_event_from_row", wraps=self.store._event_from_row
+        ) as decode:
+            result = await self.adapter.call_tool(
+                "get_task_events", {"task_id": "task-mcp"}
+            )
+
+        self.assertEqual(result["count"], 10_002)
+        self.assertTrue(result["truncated"])
+        self.assertLessEqual(len(result["events"]), DEFAULT_EVENT_LIMIT)
+        self.assertLessEqual(decode.call_count, DEFAULT_EVENT_LIMIT + 64)
+
+    async def test_get_task_events_explicit_limit_preserves_critical_events(self) -> None:
+        self._create_task()
+        self._bulk_noise_events("task-mcp", 10_001)
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.FINISHED,
+            event_kind="task.finished",
+            payload={"final_response": "done"},
+        )
+
+        result = await self.adapter.call_tool(
+            "get_task_events", {"task_id": "task-mcp", "limit": 100}
+        )
+
+        self.assertEqual(result["count"], 10_004)
+        self.assertTrue(result["truncated"])
+        kinds = {event["kind"] for event in result["events"]}
+        self.assertIn("task.created", kinds)
+        self.assertIn("task.finished", kinds)
+        self.assertLessEqual(len(result["events"]), 100 + 64)
+
+    async def test_get_result_uses_targeted_latest_queries(self) -> None:
+        self._create_task()
+        await self.adapter.call_tool("run_task", {"task_id": "task-mcp"})
+        with patch.object(
+            self.store,
+            "list_task_events",
+            side_effect=AssertionError("full journal scan is forbidden"),
+        ):
+            result = await self.adapter.call_tool(
+                "get_result", {"task_id": "task-mcp"}
+            )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["final_response"], "MCP_FAKE_OK")
+
+    async def test_get_result_bounds_historical_large_final_response(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.FINISHED,
+            event_kind="task.finished",
+            payload={"final_response": "x" * (MAX_FINAL_RESPONSE_BYTES * 2)},
+        )
+
+        result = await self.adapter.call_tool(
+            "get_result", {"task_id": "task-mcp"}
+        )
+
+        self.assertEqual(
+            len(result["final_response"].encode("utf-8")),
+            MAX_FINAL_RESPONSE_BYTES,
+        )
+        self.assertTrue(result["final_response"].endswith("[TRUNCATED]"))
+
+    async def test_get_status_bounds_large_last_event_payload(self) -> None:
+        self._create_task()
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "item/completed",
+            {
+                "threadId": "thread-status",
+                **{f"field-{index}": "x" * 4096 for index in range(64)},
+            },
+        )
+
+        result = await self.adapter.call_tool("get_status", {})
+
+        payload = result["last_event"]["payload"]
+        self.assertTrue(payload["_truncated"])
+        self.assertEqual(payload["threadId"], "thread-status")
+        self.assertIn("event_id", result["last_event"])
+        self.assertIn("created_at", result["last_event"])
+
+    async def test_cancelled_run_propagates_at_adapter_boundary_and_next_task_runs(self) -> None:
+        executor = BlockingExecutor()
+        self.store.close()
+        self.store = SQLiteBridgeStore(self.db_path)
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self._create_task("task-cancelled")
+
+        running = asyncio.create_task(
+            _call_adapter(self.adapter, "run_task", {"task_id": "task-cancelled"})
+        )
+        await executor.started.wait()
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+
+        await asyncio.wait_for(executor.child_closed.wait(), timeout=2)
+        self.assertTrue(executor.cancel_active_called.is_set())
+        cancelled = await self.adapter.call_tool(
+            "get_task", {"task_id": "task-cancelled"}
+        )
+        self.assertEqual(cancelled["execution_status"], "CANCELLED")
+        status = await self.adapter.call_tool("get_status", {})
+        self.assertEqual(status["last_event"]["kind"], "task.cancelled")
+
+        self.core.create_task("project-mcp", "next", task_id="task-next")
+        executor.release.set()
+        next_result = await self.adapter.call_tool(
+            "run_task", {"task_id": "task-next"}
+        )
+        self.assertEqual(next_result["execution_status"], "FINISHED")
+
+    async def test_official_request_cancellation_keeps_server_operational(self) -> None:
+        executor = BlockingExecutor()
+        self.store.close()
+        self.store = SQLiteBridgeStore(self.db_path)
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self._create_task("task-request-cancelled")
+        self.core.create_task("project-mcp", "next", task_id="task-request-next")
+
+        server = build_server(self.adapter)
+        async with create_client_server_memory_streams() as (client, server_streams):
+            server_task = asyncio.create_task(
+                server._lowlevel_server.run(
+                    server_streams[0],
+                    server_streams[1],
+                    server._lowlevel_server.create_initialization_options(),
+                )
+            )
+            try:
+                async with ClientSession(client[0], client[1]) as session:
+                    await session.initialize()
+                    running = asyncio.create_task(
+                        session.call_tool(
+                            "run_task", {"task_id": "task-request-cancelled"}
+                        )
+                    )
+                    await executor.started.wait()
+                    running.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await running
+
+                    await asyncio.wait_for(executor.child_closed.wait(), timeout=2)
+                    self.assertEqual(
+                        self.store.get_task("task-request-cancelled").execution_status,
+                        ExecutionStatus.CANCELLED,
+                    )
+                    status = await session.call_tool("get_status", {})
+                    self.assertFalse(status.is_error)
+
+                    executor.release.set()
+                    next_result = await session.call_tool(
+                        "run_task", {"task_id": "task-request-next"}
+                    )
+                    self.assertFalse(next_result.is_error)
+                    self.assertEqual(
+                        next_result.structured_content["execution_status"],
+                        ExecutionStatus.FINISHED.value,
+                    )
+            finally:
+                server_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await server_task
+
+    async def test_official_global_shutdown_propagates_cancellation(self) -> None:
+        executor = BlockingExecutor()
+        self.store.close()
+        self.store = SQLiteBridgeStore(self.db_path)
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self._create_task("task-global-shutdown")
+
+        server = build_server(self.adapter)
+        async with create_client_server_memory_streams() as (client, server_streams):
+            server_task = asyncio.create_task(
+                server._lowlevel_server.run(
+                    server_streams[0],
+                    server_streams[1],
+                    server._lowlevel_server.create_initialization_options(),
+                )
+            )
+            async with ClientSession(client[0], client[1]) as session:
+                await session.initialize()
+                running = asyncio.create_task(
+                    session.call_tool(
+                        "run_task", {"task_id": "task-global-shutdown"}
+                    )
+                )
+                await executor.started.wait()
+
+                server_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await server_task
+
+                with self.assertRaises(MCPError) as call_error:
+                    await asyncio.wait_for(running, timeout=2)
+                self.assertNotIsInstance(call_error.exception, ToolError)
+                await asyncio.wait_for(executor.child_closed.wait(), timeout=2)
+                self.assertTrue(executor.cancel_active_called.is_set())
+                self.assertEqual(
+                    self.store.get_task("task-global-shutdown").execution_status,
+                    ExecutionStatus.CANCELLED,
+                )
 
     async def test_official_get_result_after_restart(self) -> None:
         self._create_task()

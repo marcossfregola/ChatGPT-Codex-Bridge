@@ -631,6 +631,50 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             self.assertEqual(reopened.count_task_events("task-1"), 3)
             reopened.close()
 
+    def test_bounded_event_window_uses_sql_limits_and_deserializes_only_selected_rows(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "bounded.sqlite3")
+            try:
+                store.connection.executemany(
+                    """
+                    INSERT INTO task_events (task_id, source, kind, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            "task-1",
+                            "codex",
+                            "noise",
+                            f'{{"index":{index}}}',
+                            "2026-08-27T00:00:00Z",
+                        )
+                        for index in range(10_001)
+                    ),
+                )
+                store.connection.commit()
+
+                with patch.object(store, "_event_from_row", wraps=store._event_from_row) as decode:
+                    events, total = store.list_task_events_window(
+                        "task-1",
+                        100,
+                        critical_kinds={"task.created", "task.finished"},
+                        critical_limit=8,
+                    )
+
+                self.assertEqual(total, 10_001)
+                self.assertLessEqual(len(events), 108)
+                self.assertEqual(events[0].kind, "noise")
+                self.assertLessEqual(decode.call_count, 108)
+
+                with patch.object(store, "_event_from_row", wraps=store._event_from_row) as decode_latest:
+                    latest = store.get_latest_task_events(
+                        "task-1", {"task.created", "task.finished", "noise"}
+                    )
+                self.assertEqual(len(latest), 1)
+                self.assertLessEqual(decode_latest.call_count, 3)
+            finally:
+                store.close()
+
     def test_append_event_foreign_key_rejects_missing_task(self) -> None:
         with TemporaryDirectory() as directory:
             store = SQLiteBridgeStore(Path(directory) / "bridge.sqlite3")
