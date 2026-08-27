@@ -139,7 +139,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_stage_is_1fd(self) -> None:
         self.assertEqual(self.adapter.stage, "1F-D")
 
-    async def test_official_initialize_and_tools_list_expose_exactly_seven_tools(self) -> None:
+    async def test_official_initialize_and_tools_list_expose_exactly_eight_tools(self) -> None:
         async def exercise(session):
             initialized = await session.initialize()
             tools = await session.list_tools()
@@ -158,6 +158,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "get_task",
                 "get_task_events",
                 "get_result",
+                "commit_checkpoint",
             ],
         )
         self.assertIn("properties", tools.tools[1].input_schema)
@@ -172,6 +173,23 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.is_error)
         self.assertEqual(result.structured_content["executor"], "codex")
         self.assertIsNone(result.structured_content["active_task"])
+
+    async def test_commit_checkpoint_tool_has_exact_schema(self) -> None:
+        async def exercise(session):
+            await session.initialize()
+            tools = await session.list_tools()
+            return next(tool for tool in tools.tools if tool.name == "commit_checkpoint")
+
+        tool = await self._with_official_client(exercise)
+        self.assertEqual(
+            set(tool.input_schema["required"]), {"task_id", "message"}
+        )
+        self.assertEqual(
+            tool.input_schema["properties"]["task_id"]["type"], "string"
+        )
+        self.assertEqual(
+            tool.input_schema["properties"]["message"]["type"], "string"
+        )
 
     async def test_official_create_project(self) -> None:
         async def exercise(session):
@@ -370,7 +388,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
                 stderr_text = stderr.read()
 
             self.assertTrue(initialized.protocol_version)
-            self.assertEqual(len(tools.tools), 7)
+            self.assertEqual(len(tools.tools), 8)
             self.assertTrue(db_path.exists())
             self.assertIn("pid=", stderr_text)
             reopened = SQLiteBridgeStore(db_path)

@@ -12,7 +12,9 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 from typing import Any, Iterable
 
 from .domain.models import TaskMode
@@ -75,6 +77,14 @@ class PolicyViolationError(PolicyError):
         super().__init__(f"autonomous-write policy violation: {detail} changed")
 
 
+class CheckpointCommitError(PolicyError):
+    """Raised when a verified local checkpoint cannot be created."""
+
+
+class CheckpointAlreadyCommittedError(CheckpointCommitError):
+    """Raised when one task tries to create more than one checkpoint."""
+
+
 @dataclass(frozen=True)
 class GitCheckpoint:
     """Durable evidence captured immediately before Codex starts."""
@@ -107,6 +117,18 @@ class GitPostflight:
     policy_violation: bool
     untracked_fingerprints: tuple[tuple[str, str], ...] = ()
     content_fingerprints: tuple[tuple[str, str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class CheckpointCommitResult:
+    """Evidence returned after one successful local checkpoint commit."""
+
+    previous_head: str
+    commit_head: str
+    branch: str
+    message: str
+    paths: tuple[str, ...]
+    clean: bool
 
 
 AUTONOMOUS_WRITE_CONTRACT = """[Bridge autonomous-write contract]
@@ -256,28 +278,55 @@ class _GitCommandFailure(GitPreflightError):
         super().__init__(f"git command failed: {args[0] if args else 'git'}")
 
 
-def _git(repo: Path, *args: str, allow_failure: bool = False) -> str:
+def _git_with_env(
+    repo: Path,
+    *args: str,
+    allow_failure: bool = False,
+    env: Mapping[str, str] | None = None,
+    input_bytes: bytes | None = None,
+) -> str:
     command = ("git", "-C", str(repo), *args)
     try:
+        run_kwargs: dict[str, Any] = {
+            "check": False,
+            "capture_output": True,
+            "input": input_bytes,
+            "env": dict(env) if env is not None else None,
+            "timeout": 15,
+        }
+        if input_bytes is None:
+            run_kwargs.update(
+                {"text": True, "encoding": "utf-8", "errors": "replace"}
+            )
         completed = subprocess.run(
             list(command),
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
+            **run_kwargs,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         if allow_failure:
             return ""
         raise GitPreflightError("unable to execute Git") from exc
     if completed.returncode != 0 and not allow_failure:
-        raise _GitCommandFailure(command, completed.stderr)
-    return completed.stdout
+        stderr = completed.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        raise _GitCommandFailure(command, stderr or "")
+    stdout = completed.stdout
+    if isinstance(stdout, bytes):
+        return stdout.decode("utf-8", errors="replace")
+    return stdout or ""
 
 
-def _git_bytes(repo: Path, *args: str) -> bytes:
+def _git(repo: Path, *args: str, allow_failure: bool = False) -> str:
+    return _git_with_env(repo, *args, allow_failure=allow_failure)
+
+
+def _git_bytes_with_env(
+    repo: Path,
+    *args: str,
+    env: Mapping[str, str] | None = None,
+    input_bytes: bytes | None = None,
+) -> bytes:
     """Run Git without decoding stdout, for binary-safe index reads."""
 
     command = ("git", "-C", str(repo), *args)
@@ -285,7 +334,9 @@ def _git_bytes(repo: Path, *args: str) -> bytes:
         completed = subprocess.run(
             list(command),
             check=False,
+            input=input_bytes,
             capture_output=True,
+            env=dict(env) if env is not None else None,
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -296,9 +347,25 @@ def _git_bytes(repo: Path, *args: str) -> bytes:
     return completed.stdout
 
 
-def _git_branch(repo: Path, *, allow_detached: bool = False) -> str:
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    return _git_bytes_with_env(repo, *args)
+
+
+def _git_branch(
+    repo: Path,
+    *,
+    allow_detached: bool = False,
+    env: Mapping[str, str] | None = None,
+) -> str:
     try:
-        return _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").strip()
+        return _git_with_env(
+            repo,
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+            env=env,
+        ).strip()
     except _GitCommandFailure:
         if allow_detached:
             return "(detached)"
@@ -351,16 +418,21 @@ def _filesystem_digest(path: Path) -> str | None:
         raise GitPreflightError("unable to fingerprint dirty file") from exc
 
 
-def _index_digest(repo: Path, path: str) -> str | None:
+def _index_digest(
+    repo: Path,
+    path: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
     """Read a staged blob from the index without decoding binary content."""
 
     try:
-        content = _git_bytes(repo, "cat-file", "blob", f":{path}")
+        content = _git_bytes_with_env(repo, "cat-file", "blob", f":{path}", env=env)
     except _GitCommandFailure as error:
         # A staged deletion has no index entry and therefore no content to
         # hash.  Other failures remain fatal instead of silently weakening the
         # continuation check.  Gitlinks are commit objects, not file content.
-        entries = _git(repo, "ls-files", "--stage", "--", path)
+        entries = _git_with_env(repo, "ls-files", "--stage", "--", path, env=env)
         if not entries.strip() or any(
             line.split(maxsplit=1)[0] == "160000"
             for line in entries.splitlines()
@@ -376,12 +448,14 @@ def _content_fingerprints(
     staged: Iterable[str],
     unstaged: Iterable[str],
     untracked: Iterable[str],
+    *,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[tuple[str, str, str], ...]:
     """Capture bounded SHA-256 evidence for every dirty file with content."""
 
     entries: list[tuple[str, str, str]] = []
     for path in staged:
-        digest = _index_digest(repo, path)
+        digest = _index_digest(repo, path, env=env)
         if digest is not None:
             entries.append((path, "staged", digest))
     for path in unstaged:
@@ -408,9 +482,12 @@ def _legacy_untracked_fingerprints(
     )
 
 
-def _validate_worktree_root(repo: Path) -> None:
+def _validate_worktree_root(
+    repo: Path, *, env: Mapping[str, str] | None = None
+) -> None:
     top_level = _resolved_path(
-        _git(repo, "rev-parse", "--show-toplevel").strip(), require_exists=True
+        _git_with_env(repo, "rev-parse", "--show-toplevel", env=env).strip(),
+        require_exists=True,
     )
     if _path_key(top_level) != _path_key(repo):
         raise GitPreflightError("repo_path is not the Git worktree root")
@@ -422,6 +499,7 @@ def _git_state(
     allow_detached: bool = False,
     include_diff: bool = False,
     include_fingerprints: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[
     str,
     str,
@@ -433,17 +511,21 @@ def _git_state(
     str,
     tuple[tuple[str, str, str], ...],
 ]:
-    _validate_worktree_root(repo)
-    branch = _git_branch(repo, allow_detached=allow_detached)
-    head = _git(repo, "rev-parse", "HEAD").strip()
+    _validate_worktree_root(repo, env=env)
+    branch = _git_branch(repo, allow_detached=allow_detached, env=env)
+    head = _git_with_env(repo, "rev-parse", "HEAD", env=env).strip()
     if not head:
         raise GitPreflightError("Git HEAD is empty")
-    status = _git(repo, "status", "--porcelain", "--untracked-files=all")
+    status = _git_with_env(
+        repo, "status", "--porcelain", "--untracked-files=all", env=env
+    )
     staged, unstaged, untracked = _parse_status(status)
-    diff = _git(repo, "diff") if include_diff else ""
-    cached_diff = _git(repo, "diff", "--cached") if include_diff else ""
+    diff = _git_with_env(repo, "diff", env=env) if include_diff else ""
+    cached_diff = (
+        _git_with_env(repo, "diff", "--cached", env=env) if include_diff else ""
+    )
     fingerprints = (
-        _content_fingerprints(repo, staged, unstaged, untracked)
+        _content_fingerprints(repo, staged, unstaged, untracked, env=env)
         if include_fingerprints
         else ()
     )
@@ -713,8 +795,468 @@ def postflight_payload(postflight: GitPostflight) -> dict[str, Any]:
     }
 
 
+def _require_checkpoint_paths(
+    value: Any, field_name: str, *, allow_empty: bool = False
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise CheckpointCommitError(f"postflight {field_name} evidence is incomplete")
+    if not _evidence_is_complete(value) or (not allow_empty and not value):
+        raise CheckpointCommitError(f"postflight {field_name} evidence is incomplete")
+    for item in value:
+        if not item or "\x00" in item or any(ord(character) < 32 for character in item):
+            raise CheckpointCommitError(f"postflight {field_name} contains an invalid path")
+        if " -> " in item:
+            raise CheckpointCommitError("renamed paths are not supported for checkpoints")
+        normalized = item.replace("\\", "/")
+        if normalized.startswith("/") or normalized.startswith("./"):
+            raise CheckpointCommitError("postflight contains an unsafe path")
+        if len(normalized) >= 2 and normalized[1] == ":":
+            raise CheckpointCommitError("postflight contains an absolute path")
+        if any(part in {"", ".", ".."} for part in normalized.split("/")):
+            raise CheckpointCommitError("postflight contains an unsafe path")
+    return tuple(value)
+
+
+def _normalize_checkpoint_fingerprints(
+    value: Any,
+) -> tuple[tuple[str, str, str], ...]:
+    if not isinstance(value, list) or not _evidence_is_complete(value):
+        raise CheckpointCommitError(
+            "postflight content fingerprints are incomplete"
+        )
+    normalized: list[tuple[str, str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise CheckpointCommitError(
+                "postflight content fingerprints are incomplete"
+            )
+        path = item.get("path")
+        state = item.get("state")
+        digest = item.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not path
+            or state not in {"staged", "unstaged", "untracked"}
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise CheckpointCommitError(
+                "postflight content fingerprints are incomplete"
+            )
+        normalized.append((path, state, digest))
+    return tuple(normalized)
+
+
+def _checkpoint_expected_state(
+    repo: Path,
+    postflight: Mapping[str, Any],
+) -> tuple[str, str, tuple[str, ...], tuple[tuple[str, str, str], ...]]:
+    """Validate and compare one durable postflight against the live worktree."""
+
+    expected_repo = postflight.get("repo_path")
+    expected_branch = postflight.get("final_branch")
+    expected_head = postflight.get("final_head")
+    baseline_branch = postflight.get("baseline_branch")
+    baseline_head = postflight.get("baseline_head")
+    expected_status = postflight.get("status_porcelain")
+    expected_diff = postflight.get("diff")
+    expected_cached_diff = postflight.get("cached_diff")
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            expected_repo,
+            expected_branch,
+            expected_head,
+            baseline_branch,
+            baseline_head,
+        )
+    ):
+        raise CheckpointCommitError("postflight Git identity is incomplete")
+    if not all(
+        isinstance(value, str)
+        for value in (expected_status, expected_diff, expected_cached_diff)
+    ):
+        raise CheckpointCommitError("postflight Git evidence is incomplete")
+    if not all(
+        _evidence_is_complete(value)
+        for value in (expected_status, expected_diff, expected_cached_diff)
+    ):
+        raise CheckpointCommitError("postflight Git evidence was truncated")
+    if postflight.get("policy_violation") is not False:
+        raise CheckpointCommitError("task postflight contains a policy violation")
+    try:
+        expected_root = _resolved_path(expected_repo, require_exists=True)
+    except (GitPreflightError, ValueError) as exc:
+        raise CheckpointCommitError("postflight repo path is invalid") from exc
+    if _path_key(expected_root) != _path_key(repo):
+        raise CheckpointCommitError("postflight repo path differs from the project")
+    expected_changed = _require_checkpoint_paths(
+        postflight.get("changed_files"), "changed_files", allow_empty=True
+    )
+    expected_untracked = _require_checkpoint_paths(
+        postflight.get("untracked_files"), "untracked_files", allow_empty=True
+    )
+    expected_fingerprints = _normalize_checkpoint_fingerprints(
+        postflight.get("content_fingerprints")
+    )
+
+    (
+        branch,
+        head,
+        status,
+        staged,
+        unstaged,
+        untracked,
+        diff,
+        cached_diff,
+        fingerprints,
+    ) = _git_state(repo, include_diff=True, include_fingerprints=True)
+    current_status = _bounded_text(status)
+    current_diff = _bounded_text(diff)
+    current_cached_diff = _bounded_text(cached_diff)
+    current_changed = _bounded_paths((*staged, *unstaged))
+    if not all(
+        _evidence_is_complete(value)
+        for value in (
+            current_status,
+            current_diff,
+            current_cached_diff,
+            current_changed,
+            untracked,
+            fingerprints,
+        )
+    ):
+        raise CheckpointCommitError("current Git evidence is too large to compare")
+    if (
+        branch != expected_branch
+        or head != expected_head
+        or expected_branch != baseline_branch
+        or expected_head != baseline_head
+        or current_status != expected_status
+        or list(current_changed) != list(expected_changed)
+        or list(untracked) != list(expected_untracked)
+        or current_diff != expected_diff
+        or current_cached_diff != expected_cached_diff
+        or tuple(fingerprints) != expected_fingerprints
+    ):
+        raise CheckpointCommitError(
+            "current Git state does not match durable autonomous postflight"
+        )
+    paths = tuple(sorted(set((*expected_changed, *expected_untracked))))
+    if not paths:
+        raise CheckpointCommitError("checkpoint requires Git changes")
+    return head, branch, paths, expected_fingerprints
+
+
+def _checkpoint_git_dir(repo: Path) -> Path:
+    raw = _git(repo, "rev-parse", "--git-dir").strip()
+    if not raw:
+        raise CheckpointCommitError("Git directory could not be resolved")
+    git_dir = Path(raw)
+    if not git_dir.is_absolute():
+        git_dir = repo / git_dir
+    try:
+        return git_dir.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CheckpointCommitError("Git directory could not be resolved") from exc
+
+
+def _checkpoint_index_path(repo: Path) -> Path:
+    raw = _git(repo, "rev-parse", "--git-path", "index").strip()
+    if not raw:
+        raise CheckpointCommitError("Git index path could not be resolved")
+    index = Path(raw)
+    if not index.is_absolute():
+        index = repo / index
+    return index.resolve(strict=False)
+
+
+def _checkpoint_fs_digest(repo: Path, path: str) -> str | None:
+    return _filesystem_digest(repo / Path(path))
+
+
+def _checkpoint_stage_matches_worktree(
+    repo: Path, paths: Iterable[str], env: Mapping[str, str]
+) -> None:
+    for path in paths:
+        fs_digest = _checkpoint_fs_digest(repo, path)
+        index_entries = _git_with_env(
+            repo, "ls-files", "--stage", "--", path, env=env
+        ).strip()
+        index_oid = ""
+        if index_entries:
+            fields = index_entries.splitlines()[0].split(maxsplit=2)
+            if len(fields) < 2:
+                raise CheckpointCommitError("staged Git entry is invalid")
+            index_oid = fields[1]
+        worktree_oid = ""
+        if fs_digest is not None:
+            worktree_oid = _git_with_env(
+                repo,
+                "hash-object",
+                f"--path={path}",
+                "--",
+                path,
+                env=env,
+            ).strip()
+        if index_oid != worktree_oid:
+            raise CheckpointCommitError(
+                "worktree changed while the checkpoint was being staged"
+            )
+
+
+def _checkpoint_commit_metadata(
+    repo: Path,
+    previous_head: str,
+    commit_head: str,
+    env: Mapping[str, str],
+) -> tuple[str, str, str, str, str]:
+    raw = _git_with_env(
+        repo,
+        "show",
+        "-s",
+        "--format=%H%x00%P%x00%an%x00%ae%x00%cn%x00%ce%x00%B",
+        commit_head,
+        env=env,
+    )
+    parts = raw.split("\x00", 6)
+    if len(parts) != 7:
+        raise CheckpointCommitError("checkpoint commit metadata is incomplete")
+    actual_head, parents, author_name, author_email, committer_name, committer_email, body = parts
+    if actual_head != commit_head or parents.strip() != previous_head:
+        raise CheckpointCommitError("checkpoint commit parent or HEAD is invalid")
+    if (author_name, author_email, committer_name, committer_email) != (
+        "Marcos Sfregola",
+        "marcos.sfregola@gmail.com",
+        "Marcos Sfregola",
+        "marcos.sfregola@gmail.com",
+    ):
+        raise CheckpointCommitError("checkpoint commit identity is invalid")
+    return actual_head, parents.strip(), author_name, author_email, body.rstrip("\r\n")
+
+
+def _checkpoint_commit_paths(
+    repo: Path,
+    previous_head: str,
+    commit_head: str,
+    env: Mapping[str, str],
+) -> tuple[str, ...]:
+    raw = _git_bytes_with_env(
+        repo,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "--no-renames",
+        "-r",
+        "-z",
+        previous_head,
+        commit_head,
+        env=env,
+    )
+    values = [
+        item.decode("utf-8", errors="surrogateescape")
+        for item in raw.split(b"\x00")
+        if item
+    ]
+    if any("\x00" in value for value in values):
+        raise CheckpointCommitError("checkpoint commit contains an invalid path")
+    return tuple(sorted(values))
+
+
+def git_checkpoint_commit(
+    repo_path: str | os.PathLike[str],
+    *,
+    postflight: Mapping[str, Any] | GitPostflight,
+    message: str,
+) -> CheckpointCommitResult:
+    """Create one exact local commit from durable autonomous-write evidence.
+
+    All mutable index operations use a temporary index.  The caller's index
+    and worktree therefore remain byte-for-byte unchanged on every failure
+    before HEAD moves.
+    """
+
+    if not isinstance(message, str) or not message.strip():
+        raise CheckpointCommitError("commit message must be non-empty text")
+    if "\x00" in message:
+        raise CheckpointCommitError("commit message contains NUL")
+    if isinstance(postflight, GitPostflight):
+        postflight = postflight_payload(postflight)
+    repo = _resolved_path(repo_path, require_exists=True)
+    _validate_worktree_root(repo)
+    previous_head, branch, paths, _ = _checkpoint_expected_state(repo, postflight)
+
+    git_dir = _checkpoint_git_dir(repo)
+    actual_index = _checkpoint_index_path(repo)
+    temp_dir = Path(tempfile.mkdtemp(prefix=".bridge-checkpoint-", dir=str(git_dir)))
+    temp_index = temp_dir / "index"
+    hooks_dir = temp_dir / "hooks"
+    hooks_dir.mkdir()
+    original_index_exists = actual_index.exists()
+    original_index = actual_index.read_bytes() if original_index_exists else None
+    if original_index_exists:
+        shutil.copyfile(actual_index, temp_index)
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_INDEX_FILE": str(temp_index),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_EDITOR": ":",
+        }
+    )
+
+    try:
+        pathspec = b"".join(
+            path.encode("utf-8", errors="surrogateescape") + b"\x00" for path in paths
+        )
+        _git_with_env(
+            repo,
+            "--literal-pathspecs",
+            "add",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+            env=env,
+            input_bytes=pathspec,
+        )
+        (
+            staged_branch,
+            staged_head,
+            staged_status,
+            staged_paths,
+            staged_unstaged,
+            staged_untracked,
+            staged_diff,
+            staged_cached_diff,
+            staged_fingerprints,
+        ) = _git_state(
+            repo,
+            include_diff=True,
+            include_fingerprints=True,
+            env=env,
+        )
+        if (
+            staged_branch != branch
+            or staged_head != previous_head
+            or staged_unstaged
+            or staged_untracked
+            or tuple(sorted(set(staged_paths))) != paths
+            or not staged_cached_diff
+            or staged_diff
+        ):
+            raise CheckpointCommitError("staged Git state is not the verified checkpoint")
+        _checkpoint_stage_matches_worktree(repo, paths, env)
+        if not _evidence_is_complete(staged_fingerprints):
+            raise CheckpointCommitError("staged Git evidence was truncated")
+        precommit_branch = _git_branch(repo, env=env)
+        precommit_head = _git_with_env(repo, "rev-parse", "HEAD", env=env).strip()
+        if precommit_branch != branch or precommit_head != previous_head:
+            raise CheckpointCommitError("Git branch or HEAD changed before commit")
+
+        commit_args = (
+            "-c",
+            "user.name=Marcos Sfregola",
+            "-c",
+            "user.email=marcos.sfregola@gmail.com",
+            "-c",
+            f"core.hooksPath={hooks_dir}",
+            "-c",
+            "commit.gpgSign=false",
+            "--no-pager",
+            "commit",
+            "--no-verify",
+            "--no-gpg-sign",
+            "-m",
+            message,
+        )
+        _git_with_env(repo, *commit_args, env=env)
+        commit_head = _git_with_env(repo, "rev-parse", "HEAD", env=env).strip()
+        if not commit_head or commit_head == previous_head:
+            raise CheckpointCommitError("checkpoint did not create a new HEAD")
+        actual_head, _, _, _, actual_message = _checkpoint_commit_metadata(
+            repo, previous_head, commit_head, env
+        )
+        if actual_message != message:
+            raise CheckpointCommitError("checkpoint commit message is invalid")
+        committed_paths = _checkpoint_commit_paths(repo, previous_head, commit_head, env)
+        if committed_paths != paths:
+            raise CheckpointCommitError("checkpoint commit paths are invalid")
+        (
+            final_branch,
+            final_head,
+            final_status,
+            _,
+            final_unstaged,
+            final_untracked,
+            final_diff,
+            final_cached_diff,
+            _,
+        ) = _git_state(repo, include_diff=True, include_fingerprints=True, env=env)
+        if (
+            final_branch != branch
+            or final_head != commit_head
+            or final_status.strip()
+            or final_unstaged
+            or final_untracked
+            or final_diff
+            or final_cached_diff
+        ):
+            raise CheckpointCommitError("checkpoint postcommit Git state is not clean")
+        if actual_index.exists() != original_index_exists or (
+            original_index_exists and actual_index.read_bytes() != original_index
+        ):
+            raise CheckpointCommitError("Git index changed concurrently during commit")
+        try:
+            os.replace(temp_index, actual_index)
+        except OSError as exc:
+            # HEAD has already advanced.  Leave the real index/worktree as-is
+            # and surface a recoverable, non-destructive failure.
+            raise CheckpointCommitError(
+                "checkpoint commit created but real Git index could not be installed"
+            ) from exc
+        (
+            installed_branch,
+            installed_head,
+            installed_status,
+            _,
+            installed_unstaged,
+            installed_untracked,
+            installed_diff,
+            installed_cached_diff,
+            _,
+        ) = _git_state(repo, include_diff=True, include_fingerprints=True)
+        if (
+            installed_branch != branch
+            or installed_head != commit_head
+            or installed_status.strip()
+            or installed_unstaged
+            or installed_untracked
+            or installed_diff
+            or installed_cached_diff
+        ):
+            raise CheckpointCommitError("installed Git index is not clean")
+        return CheckpointCommitResult(
+            previous_head=previous_head,
+            commit_head=actual_head,
+            branch=branch,
+            message=message,
+            paths=paths,
+            clean=True,
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# Short public alias for callers that keep Git policy operations behind a
+# generic checkpoint namespace.
+checkpoint_commit = git_checkpoint_commit
+
+
 __all__ = [
     "AUTONOMOUS_WRITE_CONTRACT",
+    "CheckpointAlreadyCommittedError",
+    "CheckpointCommitError",
+    "CheckpointCommitResult",
     "DirtyWorkingTreeError",
     "ContinuationBaselineError",
     "GitCheckpoint",
@@ -726,9 +1268,11 @@ __all__ = [
     "ProtectedRootError",
     "augment_objective",
     "checkpoint_payload",
+    "checkpoint_commit",
     "ensure_autonomous_workspace",
     "git_postflight",
     "git_continuation_preflight",
+    "git_checkpoint_commit",
     "git_preflight",
     "postflight_payload",
     "protected_roots",

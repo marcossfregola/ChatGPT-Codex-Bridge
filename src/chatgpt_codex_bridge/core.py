@@ -27,8 +27,10 @@ from .policy import (
     PolicyViolationError,
     augment_objective,
     checkpoint_payload,
+    CheckpointAlreadyCommittedError,
     ensure_autonomous_workspace,
     git_continuation_preflight,
+    git_checkpoint_commit,
     git_postflight,
     git_preflight,
     postflight_payload,
@@ -263,6 +265,98 @@ class BridgeCore:
                 return candidate.task_id, payload
             return None
         return None
+
+    @staticmethod
+    def _task_creation_order(store: SQLiteBridgeStore, task: Task) -> tuple[Any, ...]:
+        """Return a durable creation order without relying on task_id sorting."""
+
+        created_ids = [
+            event.event_id
+            for event in store.list_task_events(task.task_id)
+            if event.source == "bridge" and event.kind == "task.created"
+        ]
+        if created_ids:
+            return (0, min(created_ids), task.task_id)
+        return (1, task.created_at, task.task_id)
+
+    def _require_last_task(self, task: Task) -> None:
+        tasks = self.store.list_tasks(task.project_id)
+        if not tasks:
+            raise PolicyError("task is not present in its project")
+        latest = max(
+            tasks,
+            key=lambda candidate: self._task_creation_order(self.store, candidate),
+        )
+        if latest.task_id != task.task_id:
+            raise PolicyError("checkpoint task is not the last applicable task")
+
+    def commit_checkpoint(self, task_id: str, message: str) -> dict[str, Any]:
+        """Create one local checkpoint for a finished autonomous task."""
+
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise PolicyError(f"task does not exist: {task_id}")
+        if task.mode is not TaskMode.AUTONOMOUS_WRITE:
+            raise PolicyError("checkpoint commits require AUTONOMOUS_WRITE mode")
+        if task.execution_status is not ExecutionStatus.FINISHED:
+            raise TaskStateError("checkpoint commits require a FINISHED task")
+        if task.audit_status is AuditStatus.CORRECTION_REQUIRED:
+            raise PolicyError("checkpoint commit is blocked by audit correction")
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise PolicyError(f"project does not exist: {task.project_id}")
+        events = self.store.list_task_events(task_id)
+        if any(
+            event.source == "bridge" and event.kind == "checkpoint.commit.created"
+            for event in events
+        ):
+            raise CheckpointAlreadyCommittedError(
+                "checkpoint commit already exists for task"
+            )
+        if any(
+            event.source == "bridge" and event.kind == "policy.violation"
+            for event in events
+        ):
+            raise PolicyError("checkpoint commit is blocked by policy violation")
+        postflight_events = [
+            event
+            for event in events
+            if event.source == "bridge" and event.kind == "policy.postflight"
+        ]
+        if not postflight_events or not isinstance(postflight_events[-1].payload, dict):
+            raise PolicyError("durable autonomous postflight is required")
+        postflight = postflight_events[-1].payload
+        if postflight.get("policy_violation") is not False:
+            raise PolicyError(
+                "durable autonomous postflight contains a policy violation"
+            )
+        self._require_last_task(task)
+        safe_repo = ensure_autonomous_workspace(project.repo_path)
+        result = git_checkpoint_commit(
+            safe_repo,
+            postflight=postflight,
+            message=message,
+        )
+        payload = {
+            "task_id": task.task_id,
+            "project_id": project.project_id,
+            "previous_head": result.previous_head,
+            "commit_head": result.commit_head,
+            "branch": result.branch,
+            "message": result.message,
+            "paths": list(result.paths),
+            "clean": result.clean,
+        }
+        # Do not attempt a Git rollback if SQLite persistence fails here.  The
+        # new HEAD remains the durable proof and a retry is rejected by the
+        # branch/HEAD and idempotency preconditions.
+        self.store.append_task_event(
+            task_id,
+            "bridge",
+            "checkpoint.commit.created",
+            payload,
+        )
+        return payload
 
     async def _cancel_active_execution(self) -> None:
         cancel_active = getattr(self.executor, "cancel_active", None)

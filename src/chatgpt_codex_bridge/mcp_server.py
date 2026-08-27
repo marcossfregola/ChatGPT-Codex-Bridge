@@ -151,6 +151,18 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
     async def get_result(task_id: str) -> dict[str, Any]:
         return await _call_adapter(adapter, "get_result", {"task_id": task_id})
 
+    @server.tool(
+        name="commit_checkpoint",
+        description="Create one verified local checkpoint commit for a finished autonomous task.",
+        structured_output=True,
+    )
+    async def commit_checkpoint(task_id: str, message: str) -> dict[str, Any]:
+        return await _call_adapter(
+            adapter,
+            "commit_checkpoint",
+            {"task_id": task_id, "message": message},
+        )
+
     return server
 
 

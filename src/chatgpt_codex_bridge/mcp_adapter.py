@@ -174,6 +174,7 @@ class MCPAdapter:
             "policy.git_checkpoint",
             "policy.postflight",
             "policy.violation",
+            "checkpoint.commit.created",
             "thread/started",
             "turn/started",
             "turn/completed",
@@ -309,6 +310,11 @@ class MCPAdapter:
             if task is None:
                 raise MCPToolError(f"task does not exist: {args.get('task_id')}")
             return self._result_for_task(task)
+        if name == "commit_checkpoint":
+            return self.core.commit_checkpoint(
+                _required_text(args, "task_id"),
+                _required_text(args, "message"),
+            )
         if name == "run_task":
             task_id = _required_text(args, "task_id")
             if self._run_lock.locked():
