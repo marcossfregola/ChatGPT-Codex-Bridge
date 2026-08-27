@@ -1,73 +1,100 @@
 # Roadmap — ChatGPT–Codex Bridge
 
-## Etapa 1A — COMPLETADA / SELLADA
+El roadmap distingue lo que ya está implementado del trabajo futuro que sólo
+se abrirá si aparece una necesidad real.
 
-Bootstrap formal y documentación.
+## Completado MVP
 
-## Etapa 1B — COMPLETADA / SELLADA
+### 1A — Bootstrap
 
-Spike mínimo del CodexExecutor.
+Repositorio, documentación base y límites de ownership.
 
-Objetivo futuro:
+### 1B — Codex app-server
 
-```text
-proceso Python/Node
-→ app-server
-→ initialize
-→ account/read
-→ thread/start Luna
-→ turn/start
-→ eventos
-→ cierre
-```
+Executor local por `stdio://`, initialize, account/read, threads, turns,
+notificaciones, aprobaciones, interrupt y cierre.
 
-## Etapa 1C — COMPLETADA / SELLADA
+### 1C — Projects/Tasks y SQLite
 
-Persistencia mínima y modelo Project/Task.
+Modelo persistente, foreign keys, schema versionado y reapertura durable.
 
-## Etapa 1D — COMPLETADA / SELLADA
+### 1D — Event Journal
 
-Observabilidad y event journal.
+Journal SQLite append-only con `event_id`, source, kind, payload y timestamp.
 
-## Etapa 1E-A — COMPLETADA / SELLADA
+### 1E-A — Core y Executor Contract
 
-Bridge Core, Executor Contract async, CodexExecutor y ejecución real con
-journal durable.
+Bridge Core, contrato async, CodexExecutor, correlación thread/turn y
+persistencia de eventos durante la ejecución.
 
-## Etapa 1E-B / 1E-B-R1 — MCP oficial — COMPLETADA / SELLADA
+### 1E-B — MCP oficial
 
-MCP local sobre Bridge Core mediante el MCP Python SDK oficial v2 y transporte
-stdio. El `MCPAdapter` conserva la frontera de aplicación; el SDK se ocupa del
-protocolo, lifecycle, schemas, JSON-RPC y framing. Incluye wiring a un
-CodexExecutor, persistencia SQLite reutilizable en una ruta estable de
-`%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`, consulta del journal
-y una ejecución concurrente como máximo. `--db-path` permite laboratorios
-aislados.
+MCP Python SDK v2, MCPAdapter separado y exactamente siete tools.
 
-1E-B-R1 migra el wire manual al SDK oficial y valida un flujo fake y un flujo
-real MCP → Luna con reapertura durable de SQLite. El túnel y la conexión con
-ChatGPT quedaron para 1F.
+### 1F-B — Secure MCP Tunnel
 
-No se planifican todavía versiones 0.2/0.3.
+Runtime independiente bajo `%LOCALAPPDATA%\ChatGPTCodexBridge`, perfil propio,
+DPAPI, health `/readyz` y scripts start/stop/doctor.
 
-## Etapa 1F-B — Secure MCP Tunnel local independiente — PREPARADA / DOCTOR MANUAL PENDIENTE
+### 1F-C — Integración ChatGPT E2E
 
-La etapa prepara un runtime nuevo bajo `%LOCALAPPDATA%\ChatGPTCodexBridge`, sin
-reutilizar estado, perfiles, procesos, logs, secretos ni rutas del
-ChatGPT–OpenCode Bridge. El perfil dedicado usa el tunnel ID no secreto
-`tunnel_6a8ef626bf008191a6294996145747e5`, credencial referenciada como
-`env:CONTROL_PLANE_API_KEY`, MCP stdio sobre la copia nueva del tunnel-client,
-base SQLite estable y health local en `127.0.0.1:8877`.
+Complemento operativo ChatGPT–Codex Bridge D2 y flujo ChatGPT → túnel → MCP →
+Bridge validado externamente.
 
-Se agregan scripts acotados de start/stop y un doctor manual. El doctor debe
-ejecutarse desde PowerShell bajo la identidad Windows normal que creó la
-credencial DPAPI; Codex no lo ejecuta ni intenta acceder al plaintext. El
-arranque sólo se considera listo con `/readyz` HTTP 200.
+### 1F-D1 — Lifecycle y recovery
 
-Quedan fuera de esta etapa: interacción con ChatGPT, creación del complemento,
-Luna, Project/Task de validación y cualquier modificación al Bridge OpenCode.
+Terminalidad atómica, recuperación de Tasks `RUNNING` huérfanas y
+single-instance por SQLite.
 
-## Etapa 1F-C — complemento ChatGPT — PENDIENTE
+### 1F-D2 — AUTONOMOUS_WRITE
 
-Se iniciará únicamente después de validar manualmente el doctor, el runtime,
-la negociación MCP y la independencia de ambos bridges.
+Git checkpoint/postflight, protected roots, policy contractual y detección de
+cambios de branch/HEAD.
+
+### 1F-D2-CONT / R2 — Continuation
+
+Continuación sólo sobre el estado Git durable y fingerprints exactos, con
+rechazo conservador de divergencias.
+
+### 1F-D3 — E2E adaptativa
+
+Cadena externa de tres Tasks, definiendo cada siguiente Task después de la
+auditoría de la anterior.
+
+### 1F-D4 — Long-run
+
+Task externa de aproximadamente 75 segundos de espera real y retorno normal.
+
+La evidencia E2E D3/D4 está documentada en `STATUS.md`; no es un test
+reproducible de la suite local.
+
+## Cierre documental
+
+1G-B actualiza la documentación viva para reflejar el MVP, sus límites, la
+seguridad real y el quickstart operativo. No modifica código, schemas, tools,
+runtime ni dependencias.
+
+## Dogfooding siguiente
+
+El siguiente uso real es el desarrollo controlado del **ComfyUI Orchestrator**
+en un repositorio independiente. No se crea ni se incorpora ese repositorio
+automáticamente.
+
+## Futuro sólo si existe necesidad real
+
+Podrían considerarse, sin compromiso ni fecha:
+
+- `post_audit` y aprobación durable;
+- persistent Codex threads;
+- dashboard;
+- scheduler o notificaciones;
+- multi-executor/OpenCode;
+- retries;
+- rollback explícito;
+- métricas avanzadas;
+- GitHub automation;
+- timeout total de Task;
+- E2E adicional de desconexión y crash.
+
+Estas posibilidades no forman parte del MVP ni deben tratarse como
+implementadas.

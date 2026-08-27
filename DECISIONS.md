@@ -235,3 +235,27 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
   Git no haya cambiado desde el postflight conocido.
 - **Motivo:** Permite encadenar Tasks sin commit, stash, reset, clean ni snapshots
   generales, rechazando cualquier divergencia antes de invocar el executor.
+
+## D-029 — Cierre MVP con AUTONOMOUS_WRITE pragmático
+
+- **Fecha:** 2026-08-26
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1G-A
+- **Decisión:** El MVP adopta `AUTONOMOUS_WRITE` pragmático únicamente para
+  repositorios locales controlados, con `approvalPolicy=never` y
+  `sandbox=danger-full-access`.
+- **Motivación:** `workspace-write` con aprobaciones fail-closed impedía la
+  programación autónoma; un staged workspace agregaba complejidad sin resolver
+  el problema; D3 demostró autonomía real; y Git checkpoint/postflight aporta
+  detección y recuperabilidad, no aislamiento.
+- **Riesgo aceptado:** Protected roots no son un sandbox fuerte. Una ejecución
+  con `danger-full-access` no ofrece aislamiento adversarial del host y exige
+  auditoría postflight.
+- **Repositorio válido:** Un repositorio local persistente y recuperable, como
+  `C:\Codex\ComfyUI-Orchestrator`, es compatible con este modo; no se exige que
+  el proyecto real sea descartable, sólo que esté controlado y fuera de los
+  protected roots.
+- **Veredicto:** `MVP APTO PARA USO REAL CONTROLADO`.
+- **No se declara:** autonomía desatendida permanente ni seguridad adversarial.
+- **Siguiente paso:** dogfooding con el ComfyUI Orchestrator y hardening guiado
+  por incidentes reales.

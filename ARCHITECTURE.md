@@ -1,170 +1,174 @@
 # Architecture — ChatGPT–Codex Bridge v0.1
 
-## Arquitectura aprobada
+## Estado
 
-```text
-Official MCP Python SDK v2 (MCPServer / stdio)
-    ↓
-MCPAdapter
-    ↓
-Bridge Core
-    ↓
-Executor Contract
-    ↓
-CodexExecutor
-```
+Arquitectura implementada y validada para un **MVP apto para uso real
+controlado**. El repositorio no pretende ser un sistema de aislamiento
+adversarial ni un scheduler autónomo.
 
-El MCP de 1E-B-R1 usa el SDK oficial MCP Python v2 como dueño del protocolo,
-del ciclo de vida, la negociación de versión, JSON-RPC, schemas, framing y
-transporte. `MCPAdapter` se conserva como frontera de aplicación sobre Bridge
-Core y no conoce el wire protocol de MCP ni el de Codex.
-
-## Responsabilidades
-
-### MCP Adapter
-
-Expone `get_status`, `create_project`, `create_task`, `run_task`, `get_task`,
-`get_task_events` y `get_result`. Llama únicamente a Bridge Core y a la
-persistencia para lecturas durables. No conoce el protocolo Codex ni contiene
-reglas específicas del executor.
-
-### MCP process
-
-`chatgpt-codex-bridge-mcp` construye un único `MCPServer` oficial y lo ejecuta
-con transporte local stdio. El SDK escribe exclusivamente el protocolo en
-stdout, mantiene los diagnósticos en stderr y gestiona initialize,
-notifications, tools, errores, framing y cierre. El wiring del proceso crea
-`SQLiteBridgeStore → BridgeCore(SQLiteBridgeStore, CodexExecutor) → MCPAdapter`
-→ `MCPServer`. La base por defecto queda en
-`%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`, independiente del
-directorio de trabajo; `--db-path` permite seleccionar una base explícita para
-tests y laboratorios.
-
-### Bridge Core
-
-Es autoridad sobre proyectos, tareas, autorizaciones, estado de auditoría y correlación operativa.
-
-### CodexExecutor
-
-Encapsula completamente la interacción con `codex app-server` detrás del Executor Contract. Traduce solicitudes, eventos, aprobaciones, resultados y errores sin filtrar detalles de transporte al MCP Adapter.
-
-### Persistence
-
-Contiene únicamente estado propio del Bridge: proyectos, tareas, correlaciones, timeline, autorizaciones, evidencia y journal de eventos. No replica `CODEX_HOME`, sesiones ni rollouts de Codex.
-
-### Event Journal v0.1
-
-El Bridge mantiene un journal SQLite append-only asociado a cada Task. Cada evento conserva únicamente evidencia que el Bridge decide registrar: source, kind, payload JSON, timestamp UTC y un `event_id` que fija el orden de inserción.
-
-Codex sigue siendo dueño de autenticación, sesiones y rollouts. El journal no copia rollouts, sesiones, `CODEX_HOME` ni credenciales.
-
-### Observability
-
-Registra eventos operativos y evidencia reproducible con secretos redactados.
-
-## Contratos iniciales
-
-- **Transporte v0.1:** MCP oficial sobre stdio, provisto por MCP Python SDK v2.
-- **Executor v0.1:** Codex exclusivamente.
-- **Autenticación:** Codex administra su propia sesión ChatGPT y `CODEX_HOME`.
-
-El Bridge:
-
-- no lee `auth.json`;
-- no copia `auth.json`;
-- no parsea `auth.json`;
-- no almacena `auth.json` ni tokens Codex.
-
-## Ownership
-
-Codex es dueño de autenticación, `CODEX_HOME`, sesiones, rollouts y estado interno.
-
-Bridge es dueño de project, task, correlación thread/turn, autorizaciones, timeline, evidencia y auditoría.
-
-## Estados de ejecución
-
-```text
-QUEUED
-RUNNING
-WAITING_USER
-FINISHED
-FAILED
-CANCELLED
-```
-
-## Estados de auditoría
-
-```text
-PENDING
-APPROVED
-CORRECTION_REQUIRED
-```
-
-`FINISHED` no implica `APPROVED`.
-
-Este documento fija responsabilidades y contratos de alto nivel. No diseña clases, paquetes ni APIs.
-
-## Persistence v0.1
-
-El estado propio inicial del Bridge se persiste localmente con SQLite mediante Python stdlib. La persistencia contiene únicamente Project, Task, estados, correlaciones y journal de eventos; no replica sesiones, rollouts ni historial de Codex.
-
-La resolución de ruta default es explícita y estable: cambia el cwd no cambia
-`%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`. Las pruebas y los
-laboratorios pasan `--db-path` para no escribir estado dentro del repositorio.
-
-### Correlación de identidades
-
-```text
-Bridge Task
-    ├─ thread_id → referencia Codex
-    └─ turn_id   → referencia Codex
-```
-
-`task_id`, `thread_id` y `turn_id` son identidades distintas y pertenecen a dominios diferentes.
-
-## Secure MCP Tunnel — runtime 1F-B independiente
-
-El runtime local de 1F-B queda separado del ChatGPT–OpenCode Bridge existente:
+## Fronteras
 
 ```text
 ChatGPT
-    ↓
-Secure MCP Tunnel (control-plane tunnel_id autorizado)
-    ↓ stdio
+  ↓
+Secure MCP Tunnel
+  ↓ stdio
 MCPServer oficial v2
-    ↓
-ChatGPT–Codex Bridge
+  ↓
+MCPAdapter
+  ↓
+Bridge Core
+  ↓ Executor Contract
+CodexExecutor
+  ↓ stdio://
+Codex app-server
+  ↓
+Luna o Terra
 ```
 
-La instalación nueva vive bajo `%LOCALAPPDATA%\ChatGPTCodexBridge` y mantiene
-su propio `state`, `logs`, `tunnel-client`, `tunnel-client\profiles` y
-`tunnel-state`. La base Bridge sigue siendo
-`%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`; el comando MCP usa
-la ruta absoluta del venv y `--db-path`, por lo que no depende de `Path.cwd()`.
-El perfil dedicado usa el tunnel ID no secreto
-`tunnel_6a8ef626bf008191a6294996145747e5`, channel propio,
-`127.0.0.1:8877`, health URL en
-`%LOCALAPPDATA%\ChatGPTCodexBridge\tunnel-state\health.url` y log en
-`%LOCALAPPDATA%\ChatGPTCodexBridge\logs\tunnel-client.log`. El PID se pasa al
-CLI mediante `--pid.file` y queda en
-`%LOCALAPPDATA%\ChatGPTCodexBridge\tunnel-state\tunnel.pid`.
+### MCP server y adapter
 
-La referencia de credencial del perfil es únicamente
-`env:CONTROL_PLANE_API_KEY`. El archivo DPAPI se creó bajo la identidad Windows
-normal autorizada; los scripts `start_mcp_tunnel.ps1` y
-`doctor_mcp_tunnel.ps1` lo deserializan con `ConvertTo-SecureString`, recuperan
-el valor sólo en memoria y lo entregan únicamente al proceso hijo. Nunca se
-persiste ni se imprime el plaintext. El sandbox de Codex no intenta descifrar
-esa credencial; el doctor queda para ejecución manual bajo la identidad
-propietaria.
+`mcp_server.py` construye un `MCPServer` del MCP Python SDK v2. El SDK posee
+initialize, schemas, JSON-RPC, framing, lifecycle, errores y transporte stdio.
+`MCPAdapter` es la frontera de aplicación y no importa el SDK ni el wire de
+Codex. Las siete tools son `get_status`, `create_project`, `create_task`,
+`run_task`, `get_task`, `get_task_events` y `get_result`.
 
-`start_mcp_tunnel.ps1` considera listo el runtime sólo cuando el endpoint
-local `/readyz` responde HTTP 200. `stop_mcp_tunnel.ps1` sólo puede detener el
-PID del tunnel nuevo y procesos MCP hijos inequívocamente asociados por padre,
-módulo y estado `ChatGPTCodexBridge`; no realiza búsquedas genéricas de
-`python.exe` ni toca el runtime OpenCode. El stdout del proceso MCP permanece
-reservado al protocolo MCP; los diagnósticos del servidor van por stderr y el
-log del tunnel por su archivo dedicado.
+### Bridge Core
 
-La conexión de ChatGPT y el complemento siguen fuera de 1F-B; se consideran
-trabajo posterior de 1F-C.
+`BridgeCore` es autoridad sobre Projects, Tasks, lifecycle, policy,
+correlación y transiciones. Depende de `SQLiteBridgeStore` y del
+`Executor Contract`; no depende de MCP ni del protocolo app-server.
+
+### Projects y Tasks
+
+Un Project identifica un repositorio. Una Task conserva objetivo, executor,
+model, mode, estados, timestamps y referencias opcionales `thread_id` y
+`turn_id`. Task, thread y turn son identidades distintas.
+
+Los modos son:
+
+- `READ_ONLY`: inspección sin escritura.
+- `AUTONOMOUS_WRITE`: escritura autorizada en un repositorio controlado, con
+  checkpoint y postflight.
+
+### SQLite y Event Journal
+
+SQLite contiene únicamente estado propio del Bridge: Projects, Tasks y un
+journal append-only `task_events`. Cada evento tiene `event_id` autoincremental,
+`source`, `kind`, payload JSON y timestamp UTC. Los eventos se recuperan en
+orden de `event_id`.
+
+El journal conserva lifecycle, correlación, notificaciones Codex, checkpoints,
+postflight, policy violations, resultados y errores acotados. No replica
+`CODEX_HOME`, credenciales, sesiones ni rollouts Codex.
+
+### Policy
+
+La policy canonicaliza el repositorio, exige la raíz Git correcta, rechaza
+protected roots, captura branch/HEAD, estado Git y fingerprints SHA-256, y
+compara el postflight. También limita payloads y elimina claves sensibles de
+notificaciones.
+
+### Executor Contract y CodexExecutor
+
+El contrato sólo expone `ExecutionRequest`, `ExecutionResult`, callbacks de
+correlación/notificación y `run`. `CodexExecutor` traduce el contrato al
+app-server y garantiza el cierre del proceso que él mismo inició.
+
+### Codex app-server
+
+El cliente inicia:
+
+```text
+codex app-server --listen stdio://
+```
+
+Correlaciona respuestas, registra notificaciones, observa
+`thread/started`, `turn/started` y `turn/completed`, y soporta
+`turn/interrupt`. EOF, JSON inválido, respuestas inesperadas y timeouts son
+errores explícitos.
+
+### Secure MCP Tunnel
+
+El runtime independiente vive en:
+
+```text
+%LOCALAPPDATA%\ChatGPTCodexBridge
+```
+
+La base default es
+`%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`; `--db-path` permite
+laboratorios aislados. Los scripts versionados start/stop/doctor usan sólo esa
+raíz. El perfil externo del tunnel-client usa `channel: main`, el tunnel ID
+autorizado, MCP stdio y readiness local en `127.0.0.1:8877/readyz`.
+
+El runtime no reutiliza rutas, procesos, locks, perfiles ni secretos del
+ChatGPT–OpenCode Bridge ni de VisorVideosDevBridge.
+
+## Lifecycle real
+
+Estados implementados:
+
+```text
+QUEUED → RUNNING → FINISHED
+                 ↘ FAILED
+                 ↘ CANCELLED
+```
+
+`WAITING_USER` existe en el modelo y se considera activo para `get_status`,
+pero no tiene flujo activo en el MVP.
+
+- `QUEUED → RUNNING` es una actualización condicional y agrega `task.started`
+  atómicamente.
+- Preflight fallido produce `policy.violation` y un único `task.failed`.
+- Cada transición terminal verifica que no exista otra terminalidad y se
+  confirma en una transacción SQLite.
+- La cancelación conserva `task.cancelled` y propaga `CancelledError`.
+- Un executor fallido conserva `task.failed`.
+- Al arrancar, las Tasks `RUNNING` huérfanas se recuperan como `FAILED`, con
+  `task.recovered` y `task.failed`.
+- Las Tasks terminales no se pueden relanzar.
+- `MCPInstanceLock` impide dos servidores sobre la misma DB.
+
+## AUTONOMOUS_WRITE y continuation
+
+Antes de ejecutar, el Bridge registra un `policy.git_checkpoint`.
+
+Un repositorio limpio usa:
+
+```text
+baseline_kind=clean
+previous_task_id=null
+```
+
+Un repositorio dirty sólo continúa si coincide exactamente con el postflight
+durable de una Task `AUTONOMOUS_WRITE` previa, `FINISHED` y sin policy
+violation. Se comparan branch, HEAD, staged, unstaged, untracked, diffs,
+cached diffs y fingerprints de contenido. Evidencia truncada, legacy dirty sin
+fingerprints o cualquier cambio externo se rechaza.
+
+El postflight registra branch/HEAD finales, archivos cambiados, untracked y
+policy violation. No hace commit, reset, clean ni rollback automático.
+
+## App-server: aprobaciones y tiempos
+
+`READ_ONLY` usa `approvalPolicy=on-request`, reviewer de usuario, sandbox
+read-only y red deshabilitada en el turno.
+
+`AUTONOMOUS_WRITE` usa `approvalPolicy=never` y `sandbox=danger-full-access`.
+Esto es una decisión pragmática para el MVP, no un aislamiento fuerte.
+
+Los RPC cortos tienen deadline total de 30 s. La espera de turno tiene un
+timeout de inactividad de 300 s entre mensajes, no un timeout total de Task.
+El cierre espera 5 s y luego mata únicamente el proceso hijo propio si es
+necesario.
+
+## Observabilidad y límites
+
+`get_task_events` expone el journal y `get_result` recupera la respuesta final y
+la evidencia Git. No se persisten rollouts Codex, credenciales, raw stderr,
+duración total, retry history ni una auditoría ChatGPT automática.
+
+Las demostraciones E2E D3 y D4 fueron obtenidas externamente; la suite local no
+reproduce esas Tasks reales. Sus datos de cierre están en `STATUS.md`.
