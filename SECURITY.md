@@ -41,6 +41,20 @@ No operaciones destructivas no solicitadas.
 Estas instrucciones son una restricción contractual y deben acompañarse con
 auditoría postflight. No son un mecanismo de aislamiento del sistema operativo.
 
+### Checkpoint local posterior a auditoría
+
+`commit_checkpoint` sólo se acepta para la última Task aprobada de una etapa
+lógica, después de verificar el postflight durable. El Bridge Core/Policy
+comprueba branch y HEAD exactos, estado Git, fingerprints SHA-256 y paths
+exactos; prepara un índice temporal, neutraliza hooks y signing, instala el
+índice real de forma atómica y verifica el resultado final.
+
+El resultado es únicamente un commit local. No depende de GitHub ni del
+keyring, no hace push, tag, release, merge, rebase, reset ni clean, y la
+identidad Git se pasa sólo con `git -c`. Una cadena `A → A-R1 → A-R2` puede
+producir como máximo un checkpoint sobre la última Task aprobada; la operación
+no autoriza commits adicionales y `Luna`/`CodexExecutor` no commitean.
+
 ## C. Riesgo aceptado del MVP
 
 `AUTONOMOUS_WRITE` usa exactamente:

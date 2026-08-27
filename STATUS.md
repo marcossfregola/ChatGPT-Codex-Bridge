@@ -5,8 +5,8 @@ Proyecto: ChatGPT–Codex Bridge
 Versión: 0.1.0
 Estado: MVP APTO PARA USO REAL CONTROLADO
 Rama: main
-HEAD técnico base: 389ef55928415470e68309ef01763261439a0cd9
-Suite: 125 tests OK
+HEAD técnico base: 29d524fdc1f6fed2f59e4ae4b0f7f7ff1880e864
+Suite: 167 tests OK
 ```
 
 ## Etapas completadas
@@ -25,10 +25,12 @@ Suite: 125 tests OK
 - D2-CONT-R2 — baseline limpio y fallos terminales.
 - D3 — cadena adaptativa multi-Task.
 - D4 — long-run controlado.
+- 1H-B / 1H-B-R1 — checkpoint commits locales auditados.
+- 1H-C — cadena real de checkpoints A→B→C.
 
 ## MCP vigente
 
-El servidor usa el MCP Python SDK oficial v2 y expone exactamente siete tools:
+El servidor usa el MCP Python SDK oficial v2 y expone exactamente ocho tools:
 
 ```text
 get_status
@@ -38,6 +40,7 @@ run_task
 get_task
 get_task_events
 get_result
+commit_checkpoint
 ```
 
 Los modos de Task son:
@@ -81,6 +84,24 @@ run_task retornó normalmente
 USER_INTERVENTION=0
 ```
 
+### 1H-C — checkpoint commits reales
+
+```text
+HEAD0: 5b7880e19f48a7525ae1b33f5ab07cf745c37b7e
+HEAD_A: 72c95e3f67182237ff1b34b1e1e9bfb8649bece0
+HEAD_B: 77ac4d46b7715e9624bd04a9c991ee72c80a1466
+HEAD_C: bf5ed3eb4e9d84564937d40d654c682904ae5a9f
+CHECKPOINTS_CREATED=3
+A necesitó una continuation correctiva.
+B y C no.
+CLEAN_AFTER_EACH_CHECKPOINT=true
+PUSH=0
+USER_INTERVENTION_BETWEEN_STAGES=0
+```
+
+La autorización se precisó por etapa lógica: la cadena A→A-R1 produjo un
+único checkpoint sobre A-R1 antes de continuar con B y C.
+
 ## Runtime
 
 El runtime se instala de forma independiente bajo:
@@ -114,7 +135,7 @@ borrarse ni modificarse destructivamente.
 
 ## Próximo uso
 
-El MVP queda habilitado para dogfooding controlado mediante el desarrollo del
-**ComfyUI Orchestrator** en un repositorio separado. El siguiente cambio
-previsto es documental y el hardening posterior debe guiarse por incidentes
+1H queda cerrada. El Bridge queda **APTO PARA USO REAL CONTROLADO /
+DOGFOODING** mediante el desarrollo del **ComfyUI Orchestrator** en un
+repositorio separado. El hardening posterior debe guiarse por incidentes
 reales, no por complejidad preventiva.

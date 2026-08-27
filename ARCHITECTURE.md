@@ -31,8 +31,8 @@ Luna o Terra
 `mcp_server.py` construye un `MCPServer` del MCP Python SDK v2. El SDK posee
 initialize, schemas, JSON-RPC, framing, lifecycle, errores y transporte stdio.
 `MCPAdapter` es la frontera de aplicación y no importa el SDK ni el wire de
-Codex. Las siete tools son `get_status`, `create_project`, `create_task`,
-`run_task`, `get_task`, `get_task_events` y `get_result`.
+Codex. Las ocho tools son `get_status`, `create_project`, `create_task`,
+`run_task`, `get_task`, `get_task_events`, `get_result` y `commit_checkpoint`.
 
 ### Bridge Core
 
@@ -150,6 +150,20 @@ fingerprints o cualquier cambio externo se rechaza.
 
 El postflight registra branch/HEAD finales, archivos cambiados, untracked y
 policy violation. No hace commit, reset, clean ni rollback automático.
+
+## Checkpoint commits locales
+
+Después de un postflight durable `FINISHED` y de una auditoría ChatGPT
+`APPROVED`, `commit_checkpoint(task_id, message)` valida nuevamente el Project,
+la última Task de la etapa lógica y el estado Git. Compara branch, HEAD,
+fingerprints y paths exactos; prepara un índice temporal, neutraliza hooks y
+signing, y crea un único commit local con identidad Git command-scoped. Luego
+instala atómicamente el índice real y verifica que el repositorio quede clean.
+
+La autorización cubre una etapa lógica, no un `task_id` rígido: una cadena
+`A → A-R1 → A-R2` sólo puede producir un checkpoint sobre `A-R2`, si es la
+última Task aprobada. El checkpoint no hace push, tag, release, merge, rebase,
+reset ni clean; `Luna`/`CodexExecutor` tampoco reciben permiso para commitear.
 
 ## App-server: aprobaciones y tiempos
 

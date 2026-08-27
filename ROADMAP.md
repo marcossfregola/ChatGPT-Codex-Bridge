@@ -29,7 +29,7 @@ persistencia de eventos durante la ejecución.
 
 ### 1E-B — MCP oficial
 
-MCP Python SDK v2, MCPAdapter separado y exactamente siete tools.
+MCP Python SDK v2, MCPAdapter separado y exactamente ocho tools.
 
 ### 1F-B — Secure MCP Tunnel
 
@@ -65,6 +65,12 @@ auditoría de la anterior.
 
 Task externa de aproximadamente 75 segundos de espera real y retorno normal.
 
+### 1H — Checkpoint commits locales
+
+Checkpoint local posterior a postflight durable y auditoría ChatGPT aprobada,
+con autorización por etapa lógica. La cadena real 1H-C creó tres commits locales
+con el repositorio clean después de cada checkpoint; no hubo push.
+
 La evidencia E2E D3/D4 está documentada en `STATUS.md`; no es un test
 reproducible de la suite local.
 
@@ -76,9 +82,9 @@ runtime ni dependencias.
 
 ## Dogfooding siguiente
 
-El siguiente uso real es el desarrollo controlado del **ComfyUI Orchestrator**
-en un repositorio independiente. No se crea ni se incorpora ese repositorio
-automáticamente.
+1H está completada. Next: dogfooding mediante el desarrollo controlado del
+**ComfyUI Orchestrator** en un repositorio independiente. No se crea ni se
+incorpora ese repositorio automáticamente.
 
 ## Futuro sólo si existe necesidad real
 

@@ -259,3 +259,18 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
 - **No se declara:** autonomía desatendida permanente ni seguridad adversarial.
 - **Siguiente paso:** dogfooding con el ComfyUI Orchestrator y hardening guiado
   por incidentes reales.
+
+## D-030 — Checkpoint commits locales por etapa lógica
+
+- **Fecha:** 2026-08-27
+- **Estado:** `ACTIVE`
+- **Origen:** Etapa 1H
+- **Decisión:** Los checkpoints Git locales pueden ejecutarse después de una
+  auditoría aprobada, con autorización humana previa por etapa lógica. Una
+  cadena de continuaciones produce como máximo un checkpoint sobre la última
+  Task aprobada; push permanece separado.
+- **Motivo:** La evidencia 1H-C demostró tres commits locales auditables,
+  clean después de cada checkpoint y cero push, preservando el control humano
+  y evitando commits adicionales.
+- **Reemplazo:** Ninguno; decisión vigente.
+- **Documento de autoridad:** [SECURITY.md](SECURITY.md)
