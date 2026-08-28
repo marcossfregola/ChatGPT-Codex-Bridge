@@ -265,25 +265,48 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
 
         await self.assert_dirty_rejected(repo, core, executor)
 
-    async def test_newer_failed_task_supersedes_eligible_baseline(self) -> None:
+    async def test_failed_preflight_without_postflight_does_not_invalidate_baseline(
+        self,
+    ) -> None:
         def mutate(path: Path) -> None:
             (path / "untracked.txt").write_text("UNCHANGED\n", encoding="utf-8")
 
         repo = make_repo(self.root)
-        executor = SequenceExecutor(mutate)
+        executor = SequenceExecutor(mutate, None, None, None)
         core = self.new_core(repo, executor)
         previous = self.create_task(core, "task-previous")
         await core.run_task(previous.task_id)
+        readonly = self.create_task(
+            core, "task-read-only", mode=TaskMode.READ_ONLY
+        )
+        await core.run_task(readonly.task_id)
+
         failed = self.create_task(core, "task-failed")
-        self.store.transition_task_running(failed.task_id, project_id="project-cont")
-        self.store.transition_task_terminal(
-            failed.task_id,
-            execution_status=ExecutionStatus.FAILED,
-            event_kind="task.failed",
-            payload={"error_type": "TestFailure", "message": "expected"},
+        (repo / "untracked.txt").write_text("EXTERNAL\n", encoding="utf-8")
+        with self.assertRaises(ContinuationBaselineError):
+            await core.run_task(failed.task_id)
+        self.assertEqual(len(executor.requests), 2)
+        self.assert_preflight_terminal(failed.task_id)
+        self.assertFalse(
+            any(
+                event.kind == "policy.postflight"
+                for event in self.store.list_task_events(failed.task_id)
+            )
         )
 
-        await self.assert_dirty_rejected(repo, core, executor, expected_requests=1)
+        (repo / "untracked.txt").write_text("UNCHANGED\n", encoding="utf-8")
+        current = self.create_task(core, "task-current")
+        result = await core.run_task(current.task_id)
+
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(executor.requests), 3)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
+        self.assertEqual(checkpoint.payload["previous_task_id"], previous.task_id)
 
     async def test_cancelled_prior_task_is_not_a_continuation_baseline(self) -> None:
         repo = make_repo(self.root)
@@ -334,19 +357,62 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
 
         await self.assert_dirty_rejected(repo, core, executor, expected_requests=1)
 
-    async def test_newer_read_only_task_supersedes_eligible_baseline(self) -> None:
+    async def test_read_only_task_does_not_invalidate_autonomous_baseline(self) -> None:
         def mutate(path: Path) -> None:
             (path / "untracked.txt").write_text("UNCHANGED\n", encoding="utf-8")
 
         repo = make_repo(self.root)
-        executor = SequenceExecutor(mutate, None)
+        executor = SequenceExecutor(mutate, None, None)
         core = self.new_core(repo, executor)
         previous = self.create_task(core, "task-previous")
         await core.run_task(previous.task_id)
         readonly = self.create_task(core, "task-read-only", mode=TaskMode.READ_ONLY)
         await core.run_task(readonly.task_id)
 
-        await self.assert_dirty_rejected(repo, core, executor, expected_requests=2)
+        current = self.create_task(core, "task-current")
+        result = await core.run_task(current.task_id)
+
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(executor.requests), 3)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
+        self.assertEqual(checkpoint.payload["previous_task_id"], previous.task_id)
+
+    async def test_newer_autonomous_postflight_precedes_older_baseline(self) -> None:
+        def first(path: Path) -> None:
+            (path / "first.txt").write_text("FIRST\n", encoding="utf-8")
+
+        def second(path: Path) -> None:
+            (path / "second.txt").write_text("SECOND\n", encoding="utf-8")
+
+        repo = make_repo(self.root)
+        executor = SequenceExecutor(first, None, second, None)
+        core = self.new_core(repo, executor)
+        first_task = self.create_task(core, "task-first")
+        await core.run_task(first_task.task_id)
+        intermediate = self.create_task(
+            core, "task-intermediate", mode=TaskMode.READ_ONLY
+        )
+        await core.run_task(intermediate.task_id)
+        second_task = self.create_task(core, "task-second")
+        await core.run_task(second_task.task_id)
+
+        current = self.create_task(core, "task-current")
+        result = await core.run_task(current.task_id)
+
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(executor.requests), 4)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
+        self.assertEqual(checkpoint.payload["previous_task_id"], second_task.task_id)
 
     async def test_branch_change_rejects_continuation(self) -> None:
         def mutate(path: Path) -> None:
@@ -501,6 +567,54 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(executor.requests), 1)
         self.assert_preflight_terminal(current.task_id)
 
+    async def test_different_project_postflight_is_not_a_baseline(self) -> None:
+        def mutate(path: Path) -> None:
+            (path / "untracked.txt").write_text("PROJECT_A\n", encoding="utf-8")
+
+        repo = make_repo(self.root, "workspace-a")
+        executor = SequenceExecutor(mutate)
+        core = self.new_core(repo, executor)
+        previous = self.create_task(core, "task-project-a")
+        await core.run_task(previous.task_id)
+
+        other_repo = make_repo(self.root, "workspace-b")
+        core.create_project("Other", str(other_repo), project_id="project-other")
+        (other_repo / "app.txt").write_text("EXTERNAL\n", encoding="utf-8")
+        current = core.create_task(
+            "project-other",
+            "perform the requested continuation",
+            task_id="task-project-b",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+
+        with self.assertRaises(DirtyWorkingTreeError):
+            await core.run_task(current.task_id)
+        self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
+
+    async def test_policy_violation_postflight_is_not_a_baseline(self) -> None:
+        def mutate(path: Path) -> None:
+            (path / "untracked.txt").write_text("UNCHANGED\n", encoding="utf-8")
+
+        repo, executor, core, _, current = await self.seed_finished_auto(mutate)
+        postflight = next(
+            event
+            for event in self.store.list_task_events("task-previous")
+            if event.kind == "policy.postflight"
+        )
+        payload = dict(postflight.payload)
+        payload["policy_violation"] = True
+        self.store.connection.execute(
+            "UPDATE task_events SET payload_json = ? WHERE event_id = ?",
+            (json.dumps(payload), postflight.event_id),
+        )
+        self.store.connection.commit()
+
+        with self.assertRaises(DirtyWorkingTreeError):
+            await core.run_task(current.task_id)
+        self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
+
     async def test_missing_untracked_path_allows_new_clean_baseline(
         self,
     ) -> None:
@@ -540,6 +654,31 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
         self.assertEqual(checkpoint.payload["staged_paths"], ["app.txt"])
         self.assertEqual(checkpoint.payload["unstaged_paths"], [])
+
+    async def test_staged_state_change_rejects_continuation(self) -> None:
+        def mutate(path: Path) -> None:
+            (path / "app.txt").write_text("STAGED\n", encoding="utf-8")
+            git(path, "add", "app.txt")
+
+        repo, executor, core, _, current = await self.seed_finished_auto(mutate)
+        git(repo, "reset", "HEAD", "--", "app.txt")
+
+        with self.assertRaises(ContinuationBaselineError):
+            await core.run_task(current.task_id)
+        self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
+
+    async def test_unstaged_state_change_rejects_continuation(self) -> None:
+        def mutate(path: Path) -> None:
+            (path / "app.txt").write_text("UNSTAGED\n", encoding="utf-8")
+
+        repo, executor, core, _, current = await self.seed_finished_auto(mutate)
+        git(repo, "add", "app.txt")
+
+        with self.assertRaises(ContinuationBaselineError):
+            await core.run_task(current.task_id)
+        self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
 
     async def test_old_dirty_postflight_without_content_evidence_is_rejected(self) -> None:
         def mutate(path: Path) -> None:

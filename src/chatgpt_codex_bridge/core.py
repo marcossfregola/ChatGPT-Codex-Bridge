@@ -828,32 +828,76 @@ class BridgeCore:
     def _previous_continuation_baseline(
         self, task: Task
     ) -> tuple[str, dict[str, Any]] | None:
-        """Return the latest prior task only when it is an eligible baseline."""
+        """Return the latest eligible durable autonomous postflight baseline."""
 
-        latest: tuple[int, Task, list[Any]] | None = None
+        latest: tuple[int, str, dict[str, Any]] | None = None
+        blocking_event_id: int | None = None
         for candidate in self.store.list_tasks(task.project_id):
-            if candidate.task_id == task.task_id:
+            if (
+                candidate.task_id == task.task_id
+                or candidate.project_id != task.project_id
+                or candidate.mode is not TaskMode.AUTONOMOUS_WRITE
+            ):
                 continue
             events = self.store.list_task_events(candidate.task_id)
-            event_id = max((event.event_id or 0 for event in events), default=0)
-            if latest is None or event_id > latest[0]:
-                latest = (event_id, candidate, events)
+            latest_event_id = max(
+                (event.event_id or 0 for event in events), default=0
+            )
+            postflight_events = [
+                event
+                for event in events
+                if event.source == "bridge" and event.kind == "policy.postflight"
+            ]
+            if not postflight_events:
+                preflight_failure = any(
+                    event.source == "bridge"
+                    and event.kind == "policy.violation"
+                    and isinstance(event.payload, dict)
+                    and event.payload.get("phase") == "preflight"
+                    for event in events
+                )
+                if (
+                    candidate.execution_status is ExecutionStatus.QUEUED
+                    or (
+                        candidate.execution_status is ExecutionStatus.FAILED
+                        and preflight_failure
+                    )
+                ):
+                    continue
+                # A preflight-only failure has no Codex/postflight evidence and
+                # therefore cannot have changed the worktree.  Other AW states
+                # without postflight evidence remain ambiguous barriers.
+                if latest_event_id:
+                    blocking_event_id = max(blocking_event_id or 0, latest_event_id)
+                continue
+            postflight = max(
+                postflight_events,
+                key=lambda event: event.event_id if event.event_id is not None else 0,
+            )
+            payload = postflight.payload
+            if (
+                candidate.execution_status is not ExecutionStatus.FINISHED
+                or postflight.event_id is None
+                or not isinstance(payload, dict)
+                or payload.get("policy_violation") is not False
+                or any(
+                    event.source == "bridge" and event.kind == "policy.violation"
+                    for event in events
+                )
+            ):
+                # Do not fall back to stale evidence when a newer AW execution
+                # has an invalid postflight or is not durably FINISHED.
+                if latest_event_id:
+                    blocking_event_id = max(blocking_event_id or 0, latest_event_id)
+                continue
+            if latest is None or postflight.event_id > latest[0]:
+                latest = (postflight.event_id, candidate.task_id, payload)
         if latest is None:
             return None
-        _, candidate, events = latest
-        if (
-            candidate.mode is not TaskMode.AUTONOMOUS_WRITE
-            or candidate.execution_status is not ExecutionStatus.FINISHED
-        ):
+        if blocking_event_id is not None and blocking_event_id > latest[0]:
             return None
-        for event in reversed(events):
-            if event.source != "bridge" or event.kind != "policy.postflight":
-                continue
-            payload = event.payload
-            if isinstance(payload, dict) and payload.get("policy_violation") is False:
-                return candidate.task_id, payload
-            return None
-        return None
+        _, previous_task_id, previous_postflight = latest
+        return previous_task_id, previous_postflight
 
     @staticmethod
     def _task_creation_order(store: SQLiteBridgeStore, task: Task) -> tuple[Any, ...]:
