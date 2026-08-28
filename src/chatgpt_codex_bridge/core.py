@@ -21,6 +21,11 @@ from .domain.models import (
     utc_now,
 )
 from .executors.base import ExecutionRequest, ExecutionResult, Executor
+from .readonly_git_index import (
+    ReadOnlyGitIndexError,
+    ReadOnlyGitIndexResult,
+    preflight_read_only_git_index,
+)
 from .policy import (
     ContinuationBaselineError,
     GitCheckpoint,
@@ -603,6 +608,68 @@ class BridgeCore:
             expected_status=expected_status,
         )
 
+    @staticmethod
+    def _read_only_index_event_payload(
+        result: ReadOnlyGitIndexResult | ReadOnlyGitIndexError,
+    ) -> dict[str, str]:
+        """Return the bounded, path-free payload for the dedicated event."""
+
+        payload = {"outcome": result.outcome, "reason": result.reason}
+        if isinstance(result, ReadOnlyGitIndexError) and result.rollback_status:
+            payload["rollback_status"] = result.rollback_status
+        return payload
+
+    def _preflight_read_only_index(
+        self,
+        task: Task,
+        project: Project,
+        *,
+        expected_status: ExecutionStatus,
+    ) -> None:
+        """Run the Windows READ_ONLY index preflight before executor.run."""
+
+        if task.mode is not TaskMode.READ_ONLY:
+            return
+        try:
+            result = preflight_read_only_git_index(project.repo_path)
+        except ReadOnlyGitIndexError as error:
+            # This event is deliberately appended before the generic terminal
+            # failure transition, so an executor can never be called without
+            # durable evidence of the fail-closed decision.
+            self.store.append_task_event(
+                task.task_id,
+                "bridge",
+                "policy.read_only_git_index_access",
+                self._read_only_index_event_payload(error),
+            )
+            self._record_preflight_failure(
+                task.task_id,
+                error,
+                expected_status=expected_status,
+            )
+            raise
+        except Exception as error:
+            safe_error = ReadOnlyGitIndexError("internal_error")
+            self.store.append_task_event(
+                task.task_id,
+                "bridge",
+                "policy.read_only_git_index_access",
+                self._read_only_index_event_payload(safe_error),
+            )
+            self._record_preflight_failure(
+                task.task_id,
+                safe_error,
+                expected_status=expected_status,
+            )
+            raise safe_error from error
+        if result.outcome != "noop":
+            self.store.append_task_event(
+                task.task_id,
+                "bridge",
+                "policy.read_only_git_index_access",
+                self._read_only_index_event_payload(result),
+            )
+
     async def _execute_running_task(
         self,
         task: Task,
@@ -734,6 +801,11 @@ class BridgeCore:
             raise RuntimeError(f"project does not exist: {task.project_id}")
 
         checkpoint: GitCheckpoint | None = None
+        self._preflight_read_only_index(
+            task,
+            project,
+            expected_status=ExecutionStatus.QUEUED,
+        )
         if task.mode is TaskMode.AUTONOMOUS_WRITE:
             try:
                 checkpoint = self._preflight_checkpoint(task, project)
@@ -773,6 +845,11 @@ class BridgeCore:
             raise RuntimeError(f"project does not exist: {task.project_id}")
 
         checkpoint: GitCheckpoint | None = None
+        self._preflight_read_only_index(
+            task,
+            project,
+            expected_status=ExecutionStatus.RUNNING,
+        )
         if task.mode is TaskMode.AUTONOMOUS_WRITE:
             try:
                 checkpoint = self._preflight_checkpoint(task, project)
