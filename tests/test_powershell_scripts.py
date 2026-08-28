@@ -9,6 +9,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = (
     ROOT / "scripts" / "start_mcp_tunnel.ps1",
+    ROOT / "scripts" / "stop_mcp_tunnel.ps1",
     ROOT / "scripts" / "doctor_mcp_tunnel.ps1",
     ROOT / "scripts" / "start_execution_worker.ps1",
     ROOT / "scripts" / "stop_execution_worker.ps1",

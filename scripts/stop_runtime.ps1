@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [ValidateRange(1, 120)]
-    [int]$WorkerGracePeriodSeconds = 20
+    [int]$WorkerGracePeriodSeconds = 20,
+    [string]$TunnelRuntimeAlias = ""
 )
 
 if ($PSVersionTable.PSVersion.Major -lt 7 -or $PSVersionTable.PSEdition -ne "Core") {
@@ -12,15 +13,49 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $scriptsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$tunnelStop = Join-Path $scriptsRoot "stop_mcp_tunnel.ps1"
 $workerStop = Join-Path $scriptsRoot "stop_execution_worker.ps1"
+$tunnelStop = Join-Path $scriptsRoot "stop_mcp_tunnel.ps1"
 $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
 $exitCode = 0
+$workerReadyForTunnel = $true
 
-Write-Output "RUNTIME_STOP_ORDER=tunnel_then_worker"
+Write-Output "RUNTIME_STOP_ORDER=worker_then_managed_tunnel"
 
 try {
-    $tunnelOutput = & $pwsh -NoProfile -File $tunnelStop 2>&1
+    $workerOutput = & $pwsh -NoProfile -File $workerStop -GracePeriodSeconds $WorkerGracePeriodSeconds 2>&1
+    $workerExit = $LASTEXITCODE
+    foreach ($line in $workerOutput) {
+        Write-Output ("WORKER: " + $line)
+    }
+    if ($workerExit -ne 0) {
+        $exitCode = 1
+        $workerReadyForTunnel = $false
+        Write-Output ("WORKER_STOP=FAILED(" + $workerExit + ")")
+    }
+    else {
+        Write-Output "WORKER_STOP=OK"
+    }
+}
+catch {
+    $exitCode = 1
+    $workerReadyForTunnel = $false
+    Write-Output ("WORKER_STOP=FAILED: " + $_.Exception.Message)
+}
+
+if (!$workerReadyForTunnel) {
+    Write-Output "TUNNEL_STOP=SKIPPED_WORKER_FAILURE"
+}
+else {
+try {
+    $tunnelArguments = @(
+        "-NoProfile",
+        "-File",
+        $tunnelStop
+    )
+    if (![string]::IsNullOrWhiteSpace($TunnelRuntimeAlias)) {
+        $tunnelArguments += @("-RuntimeAlias", $TunnelRuntimeAlias)
+    }
+    $tunnelOutput = & $pwsh @tunnelArguments 2>&1
     $tunnelExit = $LASTEXITCODE
     foreach ($line in $tunnelOutput) {
         Write-Output ("TUNNEL: " + $line)
@@ -37,24 +72,6 @@ catch {
     $exitCode = 1
     Write-Output ("TUNNEL_STOP=FAILED: " + $_.Exception.Message)
 }
-
-try {
-    $workerOutput = & $pwsh -NoProfile -File $workerStop -GracePeriodSeconds $WorkerGracePeriodSeconds 2>&1
-    $workerExit = $LASTEXITCODE
-    foreach ($line in $workerOutput) {
-        Write-Output ("WORKER: " + $line)
-    }
-    if ($workerExit -ne 0) {
-        $exitCode = 1
-        Write-Output ("WORKER_STOP=FAILED(" + $workerExit + ")")
-    }
-    else {
-        Write-Output "WORKER_STOP=OK"
-    }
-}
-catch {
-    $exitCode = 1
-    Write-Output ("WORKER_STOP=FAILED: " + $_.Exception.Message)
 }
 
 if ($exitCode -eq 0) {

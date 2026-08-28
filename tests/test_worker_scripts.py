@@ -124,8 +124,8 @@ class WorkerScriptLifecycleTests(unittest.TestCase):
             start_runtime.index("start_mcp_tunnel.ps1"),
         )
         self.assertLess(
-            stop_runtime.index("stop_mcp_tunnel.ps1"),
             stop_runtime.index("stop_execution_worker.ps1"),
+            stop_runtime.index("stop_mcp_tunnel.ps1"),
         )
         self.assertIn("ChatGPTCodexBridge", start_runtime)
         self.assertIn("bridge.sqlite3", start_runtime)
@@ -137,6 +137,39 @@ class WorkerScriptLifecycleTests(unittest.TestCase):
         self.assertIn("mode=ro", doctor)
         self.assertIn("query_only", doctor)
         self.assertNotIn("SQLiteBridgeStore", doctor)
+
+    def test_tunnel_stop_is_fail_closed_without_managed_runtime(self) -> None:
+        tunnel_stop = (SCRIPTS / "stop_mcp_tunnel.ps1").read_text(encoding="utf-8")
+        tunnel_start = (SCRIPTS / "start_mcp_tunnel.ps1").read_text(encoding="utf-8")
+        worker_start = (SCRIPTS / "start_execution_worker.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("RuntimeAlias", tunnel_stop)
+        self.assertIn("runtimes stop", tunnel_stop)
+        self.assertIn("supported local graceful shutdown", tunnel_stop)
+        self.assertNotIn("Stop-Process", tunnel_stop)
+        self.assertNotIn("Stop-Process -Force", tunnel_start)
+        self.assertNotIn("Stop-Process -Force", worker_start)
+
+    def test_runtime_stop_requires_explicit_managed_alias_and_stops_worker_first(self) -> None:
+        stop_runtime = (SCRIPTS / "stop_runtime.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("TunnelRuntimeAlias", stop_runtime)
+        self.assertIn("worker_then_managed_tunnel", stop_runtime)
+        self.assertLess(
+            stop_runtime.index("$workerStop"),
+            stop_runtime.index("$tunnelStop"),
+        )
+
+    def test_direct_tunnel_stop_refuses_before_process_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "ChatGPTCodexBridge" / "tunnel-state"
+            runtime.mkdir(parents=True)
+            (runtime / "tunnel.pid").write_text("12345\n", encoding="ascii")
+
+            stopped = self._run("stop_mcp_tunnel.ps1", directory)
+
+            self.assertNotEqual(stopped.returncode, 0)
+            self.assertIn("no supported local graceful shutdown", stopped.stdout + stopped.stderr)
 
 
 if __name__ == "__main__":

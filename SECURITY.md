@@ -129,8 +129,11 @@ credenciales en objetivos ni prompts.
 Los scripts `start_runtime.ps1` y `stop_runtime.ps1` requieren PowerShell 7 y
 operan únicamente sobre `%LOCALAPPDATA%\ChatGPTCodexBridge`. El wrapper de
 arranque puede dejar un estado parcial (worker vivo, túnel fallido) y lo
-reporta; el wrapper de parada conserva el orden túnel/MCP → worker. El doctor
-del worker es de sólo lectura y no elimina sidecars ni detiene procesos.
+reporta; el wrapper de parada solicita primero el cierre del worker mediante
+stop-file y sólo después usa `tunnel-client runtimes stop` con un alias gestionado
+explícito. Un perfil directo no ofrece una parada graceful local verificable: el
+script se niega a terminar procesos. El doctor del worker es de sólo lectura y
+no elimina sidecars ni detiene procesos.
 
 ## Tiempos y recuperación
 
@@ -140,8 +143,9 @@ del worker es de sólo lectura y no elimina sidecars ni detiene procesos.
 - Cierre del app-server: 5 s y kill sólo del proceso hijo propio si hace falta.
 - El stop del worker deja de reclamar, solicita `cancel_active`, espera un
   grace period acotado y persiste `task.cancelled` si había una Task RUNNING.
-- Un crash deja Tasks `RUNNING` para recuperación determinista fail-closed a
-  `FAILED` al siguiente arranque del worker; las Tasks `QUEUED` sin
+- Un crash deja Tasks `RUNNING` para recuperación determinista basada sólo en
+  evidencia durable; si el resultado no puede demostrarse, conserva
+  `task.reconciliation_required` y no inventa `FINISHED`. Las Tasks `QUEUED` sin
   `task.execution_requested` se ignoran.
 - La prueba aislada con el Codex app-server real clasificó
   `REAL CHILD TERMINATES RELIABLY` al morir el owner y cerrarse stdin; no se

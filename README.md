@@ -27,15 +27,18 @@ pwsh -NoProfile -File .\scripts\start_runtime.ps1
 (Invoke-WebRequest -Uri http://127.0.0.1:8877/readyz -UseBasicParsing).StatusCode
 & .\scripts\doctor_mcp_tunnel.ps1
 & .\scripts\doctor_execution_worker.ps1
-pwsh -NoProfile -File .\scripts\stop_runtime.ps1
+pwsh -NoProfile -File .\scripts\stop_runtime.ps1 -TunnelRuntimeAlias <managed-alias>
 ```
 
 El arranque sólo se considera listo con `/readyz` HTTP 200 y un worker activo.
 `start_runtime.ps1` inicia primero el worker y después el túnel; es idempotente
-y reporta arranques parciales. `stop_runtime.ps1` detiene primero el túnel y
-después solicita el cierre controlado del worker. Los dos wrappers requieren
-PowerShell 7 (`pwsh -NoProfile`). Los `doctor` son flujos manuales de sólo
-lectura que deben ejecutarse bajo la identidad Windows que creó la credencial
+y reporta arranques parciales. `stop_runtime.ps1` solicita primero el cierre
+controlado del worker mediante su stop-file y luego detiene un túnel supervisado
+por `tunnel-client runtimes stop`. El alias gestionado debe pasarse
+explícitamente: un perfil directo no ofrece un mecanismo local de parada
+graceful verificable y el script se niega a terminar procesos. Los wrappers
+requieren PowerShell 7 (`pwsh -NoProfile`). Los `doctor` son flujos manuales de
+sólo lectura que deben ejecutarse bajo la identidad Windows que creó la credencial
 DPAPI. No se debe ejecutar el doctor desde el sandbox de Codex ni mostrar la
 credencial.
 
@@ -133,6 +136,12 @@ El worker no inicia MCP ni el túnel y no comparte rutas, procesos, perfiles,
 locks o secretos con `ChatGPTOpenCodeBridge` o `VisorVideosDevBridge`. El túnel
 puede reiniciarse sin reiniciar el worker; reiniciar MCP tampoco reclama de
 nuevo una Task `RUNNING` legítima.
+
+El sidecar `state.json` se publica mediante un archivo temporal propio, flush y
+`fsync`, seguido de un `replace` atómico con reintentos acotados para el
+`PermissionError` transitorio de Windows. Si la publicación sigue fallando, el
+worker conserva SQLite como autoridad durable, registra el error y continúa; un
+sidecar de observabilidad no puede detener ni marcar fallida la ejecución.
 
 Para arquitectura, seguridad, lifecycle, continuation y limitaciones, ver
 `ARCHITECTURE.md` y `SECURITY.md`.

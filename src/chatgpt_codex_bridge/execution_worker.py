@@ -9,6 +9,7 @@ from pathlib import Path
 import json
 import os
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -36,6 +37,8 @@ from .single_instance import (
 
 DEFAULT_POLL_INTERVAL = 0.25
 DEFAULT_CANCEL_TIMEOUT = 5.0
+SIDECAR_REPLACE_ATTEMPTS = 4
+SIDECAR_RETRY_DELAY_SECONDS = 0.05
 WORKER_PID_SUFFIX = ".execution-worker.pid"
 WORKER_STATE_SUFFIX = ".execution-worker.state.json"
 WORKER_STOP_SUFFIX = ".execution-worker.stop"
@@ -64,12 +67,37 @@ def worker_runtime_paths(db_path: str | os.PathLike[str]) -> WorkerRuntimePaths:
 
 
 def _write_text_atomically(path: Path, value: str) -> None:
-    """Write one bounded control/state file without exposing a partial value."""
+    """Publish one bounded sidecar without exposing a partial value.
+
+    Windows can transiently deny replacing a file while another reader is
+    closing it.  Retry only that specific, bounded failure and always clean up
+    the temp file owned by this process.  Persistent errors are returned to
+    the caller so it can decide whether the sidecar is authoritative.
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(value, encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        for attempt in range(SIDECAR_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt + 1 >= SIDECAR_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(SIDECAR_RETRY_DELAY_SECONDS * (attempt + 1))
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Never remove or report on a file that is not this operation's
+            # own PID-scoped temp path.
+            pass
 
 
 def read_worker_state(db_path: str | os.PathLike[str]) -> dict[str, Any] | None:
@@ -119,6 +147,7 @@ class ExecutionWorker:
         self._active_task_id: str | None = None
         self._stop_requested = False
         self._last_error: str | None = None
+        self._sidecar_error: str | None = None
         if runtime_paths is not None:
             _write_text_atomically(runtime_paths.pid_path, f"{self.pid}\n")
             self._write_state("starting")
@@ -159,10 +188,21 @@ class ExecutionWorker:
             "last_error": self._last_error,
             "updated_at": timestamp_to_text(utc_now()),
         }
-        _write_text_atomically(
-            paths.state_path,
-            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
-        )
+        try:
+            _write_text_atomically(
+                paths.state_path,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+            )
+        except OSError as error:
+            self._sidecar_error = str(error)[:500]
+            print(
+                "execution worker sidecar publish failed "
+                f"path={paths.state_path}: {self._sidecar_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            self._sidecar_error = None
 
     def _stop_file_exists(self) -> bool:
         return self.runtime_paths is not None and self.runtime_paths.stop_path.exists()
@@ -536,6 +576,8 @@ __all__ = [
     "DEFAULT_CANCEL_TIMEOUT",
     "DEFAULT_POLL_INTERVAL",
     "ExecutionWorker",
+    "SIDECAR_REPLACE_ATTEMPTS",
+    "SIDECAR_RETRY_DELAY_SECONDS",
     "WorkerRuntimePaths",
     "main",
     "read_worker_state",

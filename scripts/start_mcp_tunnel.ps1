@@ -163,11 +163,10 @@ catch {
     if ($null -ne $startedProcess) {
         try {
             if (!$startedProcess.HasExited) {
-                $runningPath = $startedProcess.MainModule.FileName
-                if (![string]::IsNullOrWhiteSpace($runningPath) -and
-                    ((Resolve-Path -LiteralPath $runningPath).Path -ieq $resolvedTunnelClient)) {
-                    Stop-Process -Id $startedProcess.Id -Force -ErrorAction SilentlyContinue
-                }
+                Write-Warning (
+                    "The tunnel-client process PID $($startedProcess.Id) is still running after " +
+                    "startup failure; no process was killed. Use the managed runtime stop path."
+                )
             }
         }
         catch {

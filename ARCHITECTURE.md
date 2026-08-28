@@ -126,9 +126,12 @@ autorizado, MCP stdio y readiness local en `127.0.0.1:8877/readyz`.
 
 El lifecycle normal se opera con `start_runtime.ps1` y `stop_runtime.ps1`.
 `start_runtime.ps1` inicia worker y túnel en ese orden, sin duplicar los que ya
-estén vivos; `stop_runtime.ps1` detiene túnel/MCP y luego el worker de forma
-controlada. `doctor_execution_worker.ps1` es sólo lectura y muestra PID/state,
-proceso, lock, DB y Tasks solicitadas o en ejecución.
+estén vivos; `stop_runtime.ps1` solicita primero el cierre controlado del worker
+mediante stop-file y luego usa `tunnel-client runtimes stop` con un alias
+gestionado explícito. Un perfil directo no ofrece una parada graceful local
+verificable y el script se niega a terminar procesos. `doctor_execution_worker.ps1`
+es sólo lectura y muestra PID/state, proceso, lock, DB y Tasks solicitadas o en
+ejecución.
 
 El runtime no reutiliza rutas, procesos, locks, perfiles ni secretos del
 ChatGPT–OpenCode Bridge ni de VisorVideosDevBridge.

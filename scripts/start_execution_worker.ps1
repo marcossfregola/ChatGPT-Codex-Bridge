@@ -161,7 +161,22 @@ catch {
             if (!$workerProcess.HasExited) {
                 $verified = Get-VerifiedWorkerProcess $workerProcess.Id
                 if ($null -ne $verified) {
-                    Stop-Process -Id $workerProcess.Id -Force -ErrorAction SilentlyContinue
+                    [IO.File]::WriteAllText(
+                        $stopFile,
+                        "{`"requested_by`":`"start_execution_worker`"}" + [Environment]::NewLine,
+                        [Text.UTF8Encoding]::new($false)
+                    )
+                    $stopDeadline = (Get-Date).AddSeconds(10)
+                    while ((Get-Date) -lt $stopDeadline) {
+                        $workerProcess.Refresh()
+                        if ($workerProcess.HasExited) {
+                            break
+                        }
+                        Start-Sleep -Milliseconds 200
+                    }
+                    if (!$workerProcess.HasExited) {
+                        Write-Warning "Worker startup failed and graceful cleanup timed out; no process was killed."
+                    }
                 }
             }
         }
