@@ -668,8 +668,8 @@ class SQLiteBridgeStore:
         """Return latest task id, its creation event id, and non-checkpoint HWM."""
 
         rows = connection.execute(
-            "SELECT task_id, created_at FROM tasks WHERE project_id = ?",
-            (project_id,),
+            "SELECT task_id, created_at FROM tasks WHERE project_id = ? AND mode = ?",
+            (project_id, TaskMode.AUTONOMOUS_WRITE.value),
         ).fetchall()
         latest: tuple[tuple[Any, ...], str, int] | None = None
         high_water = 0

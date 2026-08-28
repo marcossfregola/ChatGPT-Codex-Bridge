@@ -913,7 +913,11 @@ class BridgeCore:
         return (1, task.created_at, task.task_id)
 
     def _require_last_task(self, task: Task) -> None:
-        tasks = self.store.list_tasks(task.project_id)
+        tasks = [
+            candidate
+            for candidate in self.store.list_tasks(task.project_id)
+            if candidate.mode is TaskMode.AUTONOMOUS_WRITE
+        ]
         if not tasks:
             raise PolicyError("task is not present in its project")
         latest = max(

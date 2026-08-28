@@ -353,12 +353,20 @@ class CheckpointCommitTests(unittest.TestCase):
             )
         )
 
-    def test_26_later_task_rejects_earlier_checkpoint(self) -> None:
+    def test_26_later_read_only_does_not_block_earlier_checkpoint(self) -> None:
         repo, core, task, _ = self._finished()
-        core.create_task("project-checkpoint", "later", task_id="task-later", mode=TaskMode.READ_ONLY)
-        with self.assertRaises(PolicyError):
-            core.commit_checkpoint(task.task_id, "checkpoint D3")
-        self.assertEqual(git_raw(repo, "status", "--porcelain"), " M tracked.txt\n")
+        head_before = git(repo, "rev-parse", "HEAD")
+        core.create_task(
+            "project-checkpoint",
+            "later",
+            task_id="task-later",
+            mode=TaskMode.READ_ONLY,
+        )
+
+        core.commit_checkpoint(task.task_id, "checkpoint D3")
+
+        self.assertNotEqual(git(repo, "rev-parse", "HEAD"), head_before)
+        self.assertEqual(git_raw(repo, "status", "--porcelain"), "")
 
     def test_27_stage_failure_preserves_real_index_and_worktree(self) -> None:
         repo, core, task, _ = self._finished()
