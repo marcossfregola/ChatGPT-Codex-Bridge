@@ -16,9 +16,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from chatgpt_codex_bridge.core import BridgeCore  # noqa: E402
 from chatgpt_codex_bridge.persistence.sqlite_store import SQLiteBridgeStore  # noqa: E402
 from chatgpt_codex_bridge.single_instance import (  # noqa: E402
+    ExecutionWorkerAlreadyRunningError,
+    ExecutionWorkerLock,
     MCPInstanceAlreadyRunningError,
     MCPInstanceLock,
     canonical_db_path,
+    execution_worker_lock_path_for_db,
     lock_path_for_db,
 )
 
@@ -109,6 +112,30 @@ class MCPInstanceLockTests(unittest.TestCase):
             canonical = canonical_db_path(db_path)
             self.assertEqual(canonical, db_path.resolve())
             self.assertEqual(lock_path_for_db(db_path), Path(f"{canonical}.mcp.lock"))
+
+    def test_execution_worker_uses_an_independent_lock_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "bridge.sqlite3"
+            canonical = canonical_db_path(db_path)
+            self.assertEqual(
+                execution_worker_lock_path_for_db(db_path),
+                Path(f"{canonical}.execution-worker.lock"),
+            )
+            with MCPInstanceLock(db_path):
+                with ExecutionWorkerLock(db_path) as worker_lock:
+                    self.assertTrue(worker_lock.acquired)
+                    self.assertNotEqual(worker_lock.lock_path, lock_path_for_db(db_path))
+
+    def test_second_execution_worker_cannot_acquire_same_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "bridge.sqlite3"
+            first = ExecutionWorkerLock(db_path)
+            first.acquire()
+            try:
+                with self.assertRaises(ExecutionWorkerAlreadyRunningError):
+                    ExecutionWorkerLock(db_path).acquire()
+            finally:
+                first.release()
 
     def test_normal_release_allows_next_process_and_file_can_remain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

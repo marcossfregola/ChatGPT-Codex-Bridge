@@ -3,10 +3,10 @@
 ```text
 Proyecto: ChatGPT–Codex Bridge
 Versión: 0.1.0
-Estado: MVP APTO PARA USO REAL CONTROLADO
+Estado: D3-R2-B APTO PARA E2E REAL (preparación completada)
 Rama: main
-HEAD técnico base: 29d524fdc1f6fed2f59e4ae4b0f7f7ff1880e864
-Suite: 167 tests OK
+HEAD técnico base R2-A: 66db63d8d7a2a3737fe6bf3cbf0c98ee94037db0
+Suite: 207 tests OK (unittest discover -s tests)
 ```
 
 ## Etapas completadas
@@ -25,6 +25,9 @@ Suite: 167 tests OK
 - D2-CONT-R2 — baseline limpio y fallos terminales.
 - D3 — cadena adaptativa multi-Task.
 - D4 — long-run controlado.
+- D3-R2-A — dispatch durable y execution worker persistente auditados.
+- D3-R2-B — lifecycle del worker, wrappers PS7, doctor, observabilidad y
+  preparación E2E completados; sin commit.
 - 1H-B / 1H-B-R1 — checkpoint commits locales auditados.
 - 1H-C — cadena real de checkpoints A→B→C.
 
@@ -113,23 +116,57 @@ El runtime se instala de forma independiente bajo:
 La base default es
 `%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`. El readiness del
 túnel se verifica con `http://127.0.0.1:8877/readyz` HTTP 200. Los scripts
-versionados son `scripts/start_mcp_tunnel.ps1`, `scripts/stop_mcp_tunnel.ps1`
-y `scripts/doctor_mcp_tunnel.ps1`.
+versionados son `scripts/start_runtime.ps1`, `scripts/stop_runtime.ps1`,
+`scripts/start_execution_worker.ps1`, `scripts/stop_execution_worker.ps1`,
+`scripts/doctor_execution_worker.ps1` y los scripts del túnel.
 
-El complemento operativo es **ChatGPT–Codex Bridge D2**. El complemento
-original conserva un schema MCP cacheado anterior a `TaskMode`; no debe
-borrarse ni modificarse destructivamente.
+El arranque completo inicia primero el único execution worker y después el
+túnel; ambos componentes son idempotentes y un fallo parcial se informa sin
+reiniciar el componente que quedó vivo. La parada detiene túnel/MCP y luego
+envía la señal de stop al worker. El worker mantiene sidecars de PID, state,
+stop y lock junto a `bridge.sqlite3`, no depende del túnel y no comparte nada
+con los Bridges protegidos.
+
+`run_task` es dispatch rápido: persiste `task.execution_requested` y el
+resultado se observa haciendo polling con `get_task`, `get_task_events` y
+`get_result`. No hay long-polling ni `cancel_task` pública. Un zombie histórico
+`QUEUED` sin request no se ejecuta; un `RUNNING` sin owner vivo se recupera
+fail-closed como `FAILED` al reiniciar el worker.
+
+El runtime operativo de esta etapa es **ChatGPT–Codex Bridge D3-R2-B**. El
+complemento original conserva un schema MCP cacheado anterior a `TaskMode`; no
+debe borrarse ni modificarse destructivamente.
+
+## Evidencia D3-R2-B
+
+La suite local verificó start idempotente, double-start, stop controlado,
+wrappers de runtime, doctor read-only, lock único, requests pendientes,
+recovery fail-closed de `RUNNING`, zombies ignorados y el retorno rápido de
+`run_task` frente a un executor deliberadamente lento. El harness real aislado
+del Codex app-server usó un `CODEX_HOME` temporal sin Project ni Task; al matar
+abruptamente al owner, el child terminó por el cierre de stdin:
+
+```text
+REAL_ORPHAN_PROBE: REAL CHILD TERMINATES RELIABLY
+```
+
+Por esa evidencia no se agregó Job Object. El resultado prepara el runtime para
+el E2E largo posterior, pero no ejecuta todavía ese E2E ni reinicia el runtime
+productivo.
 
 ## Limitaciones MVP
 
 - No hay timeout total de Task; el timeout de turno es de inactividad de 300 s.
 - No hay E2E real de desconexión ChatGPT/MCP.
-- No se ha probado un crash real durante Luna.
+- No se ha probado un crash productivo del runtime durante Luna.
 - `audit_status` permanece `PENDING` y no existe `post_audit`.
 - El Bridge no puede despertar ChatGPT espontáneamente.
 - `AUTONOMOUS_WRITE` usa `approvalPolicy=never` y `sandbox=danger-full-access`.
 - Los protected roots son policy, no un sandbox adversarial.
-- No hay rollback automático ni retries complejos.
+- No hay rollback automático, retries complejos, scheduler ni múltiples
+  workers.
+- No existe una tool pública `cancel_task`; el stop es un control local del
+  worker con grace period.
 - El stop script conserva un race benigno cuando el proceso ya terminó.
 - `WAITING_USER` existe en el modelo, pero no tiene flujo activo.
 

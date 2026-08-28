@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import dataclass
 import inspect
 import json
 import uuid
@@ -16,6 +17,8 @@ from .domain.models import (
     Task,
     TaskMode,
     TaskStateError,
+    timestamp_to_text,
+    utc_now,
 )
 from .executors.base import ExecutionRequest, ExecutionResult, Executor
 from .policy import (
@@ -36,7 +39,17 @@ from .policy import (
     git_preflight,
     postflight_payload,
 )
-from .persistence.sqlite_store import SQLiteBridgeStore
+from .persistence.sqlite_store import D3_R2_CONTRACT, SQLiteBridgeStore
+
+
+@dataclass(frozen=True)
+class ExecutionDispatch:
+    """Durable acceptance returned by the request/dispatch boundary."""
+
+    task: Task
+    request_id: str | None
+    accepted: bool
+    already_requested: bool
 
 
 _MAX_NOTIFICATION_DEPTH = 4
@@ -203,7 +216,7 @@ def _bounded_error_message(error: Exception) -> str:
 class BridgeCore:
     """Create Bridge entities and run tasks through an injected executor."""
 
-    def __init__(self, store: SQLiteBridgeStore, executor: Executor) -> None:
+    def __init__(self, store: SQLiteBridgeStore, executor: Executor | None = None) -> None:
         self.store = store
         self.executor = executor
 
@@ -258,6 +271,65 @@ class BridgeCore:
             },
         )
         return created
+
+    @staticmethod
+    def _request_id_from_event(event: Any) -> str | None:
+        payload = getattr(event, "payload", None)
+        request_id = payload.get("request_id") if isinstance(payload, Mapping) else None
+        return request_id if isinstance(request_id, str) and request_id else None
+
+    def _dispatch_for_nonqueued_task(self, task: Task) -> ExecutionDispatch:
+        event = self.store.get_execution_request(task.task_id)
+        return ExecutionDispatch(
+            task=task,
+            request_id=self._request_id_from_event(event),
+            accepted=task.execution_status is ExecutionStatus.RUNNING,
+            already_requested=(
+                task.execution_status is ExecutionStatus.RUNNING or event is not None
+            ),
+        )
+
+    def request_execution(self, task_id: str) -> ExecutionDispatch:
+        """Validate a task and durably accept one asynchronous execution request."""
+
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        if task.execution_status is ExecutionStatus.QUEUED:
+            if self.store.get_project(task.project_id) is None:
+                raise RuntimeError(f"project does not exist: {task.project_id}")
+            request_id = str(uuid.uuid4())
+            requested_at = timestamp_to_text(utc_now())
+            try:
+                updated, event, created = self.store.request_task_execution(
+                    task_id,
+                    {
+                        "contract": D3_R2_CONTRACT,
+                        "requested_via": "run_task",
+                        "request_id": request_id,
+                        "requested_at": requested_at,
+                        "requested_by": "mcp",
+                    },
+                )
+            except TaskStateError:
+                # A worker may claim between the initial read and the
+                # BEGIN-IMMEDIATE request transaction.  Reflect the durable
+                # state instead of turning that benign race into an MCP error.
+                current = self.store.get_task(task_id)
+                if current is None or current.execution_status is ExecutionStatus.QUEUED:
+                    raise
+                return self._dispatch_for_nonqueued_task(current)
+            # On an idempotent retry, return the durable request's identifier,
+            # not the newly generated transient candidate.
+            return ExecutionDispatch(
+                task=updated,
+                request_id=self._request_id_from_event(event),
+                accepted=True,
+                already_requested=not created,
+            )
+        # A RUNNING task is already owned; terminal and user-waiting tasks are
+        # observable but never relaunchable.
+        return self._dispatch_for_nonqueued_task(task)
 
     def recover_orphaned_tasks(self) -> list[Task]:
         """Fail closed for RUNNING tasks left by an earlier Bridge process."""
@@ -462,6 +534,8 @@ class BridgeCore:
         return payload
 
     async def _cancel_active_execution(self) -> None:
+        if self.executor is None:
+            return
         cancel_active = getattr(self.executor, "cancel_active", None)
         if not callable(cancel_active):
             return
@@ -469,75 +543,76 @@ class BridgeCore:
         if inspect.isawaitable(result):
             await result
 
-    async def run_task(self, task_id: str) -> Task:
-        task = self.store.get_task(task_id)
-        if task is None:
-            raise KeyError(f"task does not exist: {task_id}")
-        if task.execution_status is not ExecutionStatus.QUEUED:
-            raise TaskStateError(
-                f"task {task_id} cannot run from state "
-                f"{task.execution_status.value}; only QUEUED tasks may run"
-            )
-        project = self.store.get_project(task.project_id)
-        if project is None:
-            raise RuntimeError(f"project does not exist: {task.project_id}")
+    def _require_executor(self) -> Executor:
+        if self.executor is None:
+            raise RuntimeError("task execution belongs to the persistent execution worker")
+        return self.executor
 
-        checkpoint: GitCheckpoint | None = None
-        if task.mode is TaskMode.AUTONOMOUS_WRITE:
-            try:
-                safe_repo = ensure_autonomous_workspace(project.repo_path)
-                try:
-                    checkpoint = git_preflight(safe_repo)
-                except DirtyWorkingTreeError:
-                    previous = self._previous_continuation_baseline(task)
-                    if previous is None:
-                        raise
-                    previous_task_id, previous_postflight = previous
-                    checkpoint = git_continuation_preflight(
-                        safe_repo,
-                        previous_task_id=previous_task_id,
-                        previous_postflight=previous_postflight,
-                    )
-            except Exception as error:
-                if not isinstance(error, PolicyError):
-                    raise
-                # A definitive policy/preflight rejection is a failed Task,
-                # not a retryable queued Task.  Persist the violation and the
-                # single terminal event atomically without invoking Codex.
-                violation_payload: dict[str, Any] = {
-                    "phase": "preflight",
-                    "error_type": type(error).__name__,
-                    "message": _bounded_error_message(error),
-                    "policy_violation": True,
-                }
-                if isinstance(error, DirtyWorkingTreeError):
-                    violation_payload.update(
-                        {
-                            "status_porcelain": error.status_porcelain,
-                            "staged_paths": list(error.staged_paths),
-                            "unstaged_paths": list(error.unstaged_paths),
-                            "untracked_paths": list(error.untracked_paths),
-                        }
-                    )
-                elif isinstance(error, ContinuationBaselineError):
-                    violation_payload["baseline_kind"] = "continuation"
-                self.store.transition_task_preflight_failed(
-                    task_id,
-                    policy_payload=violation_payload,
-                    failed_payload={
-                        "error_type": type(error).__name__,
-                        "message": _bounded_error_message(error),
-                    },
-                )
+    def _preflight_checkpoint(self, task: Task, project: Project) -> GitCheckpoint | None:
+        if task.mode is not TaskMode.AUTONOMOUS_WRITE:
+            return None
+        safe_repo = ensure_autonomous_workspace(project.repo_path)
+        try:
+            return git_preflight(safe_repo)
+        except DirtyWorkingTreeError:
+            previous = self._previous_continuation_baseline(task)
+            if previous is None:
                 raise
-            self.store.append_task_event(
-                task_id,
-                "bridge",
-                "policy.git_checkpoint",
-                {"mode": task.mode.value, **checkpoint_payload(checkpoint)},
+            previous_task_id, previous_postflight = previous
+            return git_continuation_preflight(
+                safe_repo,
+                previous_task_id=previous_task_id,
+                previous_postflight=previous_postflight,
             )
 
-        self.store.transition_task_running(task_id, project_id=project.project_id)
+    @staticmethod
+    def _preflight_violation_payload(error: PolicyError) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "phase": "preflight",
+            "error_type": type(error).__name__,
+            "message": _bounded_error_message(error),
+            "policy_violation": True,
+        }
+        if isinstance(error, DirtyWorkingTreeError):
+            payload.update(
+                {
+                    "status_porcelain": error.status_porcelain,
+                    "staged_paths": list(error.staged_paths),
+                    "unstaged_paths": list(error.unstaged_paths),
+                    "untracked_paths": list(error.untracked_paths),
+                }
+            )
+        elif isinstance(error, ContinuationBaselineError):
+            payload["baseline_kind"] = "continuation"
+        return payload
+
+    def _record_preflight_failure(
+        self,
+        task_id: str,
+        error: PolicyError,
+        *,
+        expected_status: ExecutionStatus,
+    ) -> None:
+        self.store.transition_task_preflight_failed(
+            task_id,
+            policy_payload=self._preflight_violation_payload(error),
+            failed_payload={
+                "error_type": type(error).__name__,
+                "message": _bounded_error_message(error),
+            },
+            expected_status=expected_status,
+        )
+
+    async def _execute_running_task(
+        self,
+        task: Task,
+        project: Project,
+        checkpoint: GitCheckpoint | None,
+    ) -> Task:
+        """Execute one task whose durable owner already set it RUNNING."""
+
+        executor = self._require_executor()
+        task_id = task.task_id
 
         def on_correlation(thread_id: str | None, turn_id: str | None) -> None:
             updates: dict[str, Any] = {}
@@ -570,7 +645,7 @@ class BridgeCore:
                 model=task.model,
                 mode=task.mode,
             )
-            result = await self.executor.run(
+            result = await executor.run(
                 request,
                 on_correlation=on_correlation,
                 on_notification=on_notification,
@@ -595,7 +670,7 @@ class BridgeCore:
                 postflight_recorded = True
                 if postflight.policy_violation:
                     raise PolicyViolationError(postflight)
-            finished = self.store.transition_task_terminal(
+            return self.store.transition_task_terminal(
                 task_id,
                 execution_status=ExecutionStatus.FINISHED,
                 event_kind="task.finished",
@@ -606,7 +681,6 @@ class BridgeCore:
                     "final_response": _bounded_final_response(result.final_response),
                 },
             )
-            return finished
         except asyncio.CancelledError:
             try:
                 await self._cancel_active_execution()
@@ -642,6 +716,79 @@ class BridgeCore:
                 },
             )
             raise
+
+    async def run_task(self, task_id: str) -> Task:
+        """Legacy synchronous execution path retained for direct Core callers."""
+
+        self._require_executor()
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        if task.execution_status is not ExecutionStatus.QUEUED:
+            raise TaskStateError(
+                f"task {task_id} cannot run from state "
+                f"{task.execution_status.value}; only QUEUED tasks may run"
+            )
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise RuntimeError(f"project does not exist: {task.project_id}")
+
+        checkpoint: GitCheckpoint | None = None
+        if task.mode is TaskMode.AUTONOMOUS_WRITE:
+            try:
+                checkpoint = self._preflight_checkpoint(task, project)
+            except PolicyError as error:
+                # Direct Core callers retain the original queue/preflight
+                # contract; the worker-owned path uses expected_status=RUNNING.
+                self._record_preflight_failure(
+                    task_id, error, expected_status=ExecutionStatus.QUEUED
+                )
+                raise
+            self.store.append_task_event(
+                task_id,
+                "bridge",
+                "policy.git_checkpoint",
+                {"mode": task.mode.value, **checkpoint_payload(checkpoint)},
+            )
+
+        self.store.transition_task_running(task_id, project_id=project.project_id)
+        return await self._execute_running_task(task, project, checkpoint)
+
+    async def execute_claimed_task(self, task_id: str) -> Task:
+        """Run one task after a persistent worker atomically claimed it."""
+
+        self._require_executor()
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        if task.execution_status is not ExecutionStatus.RUNNING:
+            raise TaskStateError(
+                f"task {task_id} cannot execute from state "
+                f"{task.execution_status.value}; expected RUNNING"
+            )
+        if self.store.get_execution_claim(task_id) is None:
+            raise TaskStateError(f"task {task_id} has no persistent worker claim")
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise RuntimeError(f"project does not exist: {task.project_id}")
+
+        checkpoint: GitCheckpoint | None = None
+        if task.mode is TaskMode.AUTONOMOUS_WRITE:
+            try:
+                checkpoint = self._preflight_checkpoint(task, project)
+            except PolicyError as error:
+                self._record_preflight_failure(
+                    task_id, error, expected_status=ExecutionStatus.RUNNING
+                )
+                raise
+            self.store.append_task_event(
+                task_id,
+                "bridge",
+                "policy.git_checkpoint",
+                {"mode": task.mode.value, **checkpoint_payload(checkpoint)},
+            )
+
+        return await self._execute_running_task(task, project, checkpoint)
 
     def _persist_postflight(
         self, task_id: str, checkpoint: GitCheckpoint
@@ -685,4 +832,4 @@ class BridgeCore:
         return postflight
 
 
-__all__ = ["BridgeCore", "TaskStateError"]
+__all__ = ["BridgeCore", "ExecutionDispatch", "TaskStateError"]

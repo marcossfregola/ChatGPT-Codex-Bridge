@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 import json
 import sqlite3
@@ -247,6 +247,13 @@ _TERMINAL_EVENT_BY_STATUS = {
     ExecutionStatus.CANCELLED: "task.cancelled",
 }
 _TERMINAL_EVENT_KINDS = tuple(_TERMINAL_EVENT_BY_STATUS.values())
+
+# D3-R2 uses the existing append-only journal as the durable dispatch queue.
+# These names are deliberately constants so the MCP request path and the
+# persistent worker cannot drift apart while the SQLite schema remains v3.
+D3_R2_CONTRACT = "D3-R2"
+EXECUTION_REQUEST_EVENT = "task.execution_requested"
+EXECUTION_CLAIM_EVENT = "task.execution_claimed"
 
 
 class SQLiteBridgeStore:
@@ -659,14 +666,241 @@ class SQLiteBridgeStore:
             raise RuntimeError("task disappeared after transition")
         return updated
 
+    def _execution_request_in_transaction(
+        self, connection: sqlite3.Connection, task_id: str
+    ) -> TaskEvent | None:
+        """Return the first explicit D3-R2 request for ``task_id``."""
+
+        rows = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ? AND source = 'bridge' AND kind = ?
+            ORDER BY event_id ASC
+            """,
+            (task_id, EXECUTION_REQUEST_EVENT),
+        ).fetchall()
+        for row in rows:
+            event = self._event_from_row(row)
+            if isinstance(event.payload, Mapping) and event.payload.get("contract") == D3_R2_CONTRACT:
+                return event
+        return None
+
+    def get_execution_request(self, task_id: str) -> TaskEvent | None:
+        """Return the durable D3-R2 request, if one exists."""
+
+        connection = self._require_connection()
+        return self._execution_request_in_transaction(connection, task_id)
+
+    def get_execution_claim(self, task_id: str) -> TaskEvent | None:
+        """Return the latest durable worker claim, if one exists."""
+
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ? AND source = 'bridge' AND kind = ?
+            ORDER BY event_id DESC
+            LIMIT 1
+            """,
+            (task_id, EXECUTION_CLAIM_EVENT),
+        ).fetchone()
+        return self._event_from_row(row) if row is not None else None
+
+    def request_task_execution(
+        self, task_id: str, payload: Mapping[str, Any]
+    ) -> tuple[Task, TaskEvent, bool]:
+        """Durably enqueue one explicit D3-R2 execution request.
+
+        The state check, idempotency lookup, and event insert are one
+        ``BEGIN IMMEDIATE`` transaction.  ``bool`` is true only when this
+        call inserted the request; a retry receives the original event.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise ValueError("execution request payload must be an object")
+        normalized_payload = dict(payload)
+        if normalized_payload.get("contract") != D3_R2_CONTRACT:
+            raise ValueError("execution request payload must declare contract D3-R2")
+
+        connection = self._require_connection()
+        request_event: TaskEvent | None = None
+        created = False
+        requested_at = utc_now()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT task_id, project_id, objective, executor, model,
+                       mode, execution_status, audit_status, thread_id, turn_id,
+                       created_at, updated_at
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            task = self._task_from_row(row)
+            if task.execution_status is not ExecutionStatus.QUEUED:
+                raise TaskStateError(
+                    f"task {task_id} cannot request execution from state "
+                    f"{task.execution_status.value}; only QUEUED tasks may request"
+                )
+
+            request_event = self._execution_request_in_transaction(connection, task_id)
+            if request_event is None:
+                request_event = self._insert_task_event_in_transaction(
+                    connection,
+                    task_id,
+                    "bridge",
+                    EXECUTION_REQUEST_EVENT,
+                    normalized_payload,
+                    created_at=requested_at,
+                )
+                created = True
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        updated = self.get_task(task_id)
+        if updated is None or request_event is None:
+            raise RuntimeError("task disappeared after execution request")
+        return updated, request_event, created
+
+    def find_next_requested_task(self) -> Task | None:
+        """Return the oldest QUEUED task with an explicit D3-R2 request."""
+
+        candidates: list[tuple[int, Task]] = []
+        for task in self.list_tasks_by_execution_status(ExecutionStatus.QUEUED):
+            event = self.get_execution_request(task.task_id)
+            if event is not None:
+                candidates.append((event.event_id or 0, task))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: (item[0], item[1].task_id))[1]
+
+    def claim_task_execution(
+        self, task_id: str, owner_payload: Mapping[str, Any]
+    ) -> tuple[Task, TaskEvent]:
+        """Atomically claim one requested task for the persistent worker."""
+
+        if not isinstance(owner_payload, Mapping):
+            raise ValueError("execution owner payload must be an object")
+        owner_kind = owner_payload.get("owner_kind")
+        owner_id = owner_payload.get("owner_id")
+        pid = owner_payload.get("pid")
+        if owner_kind != "persistent_worker":
+            raise ValueError("execution owner must be a persistent_worker")
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("execution owner_id must be non-empty text")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError("execution owner pid must be a positive integer")
+        normalized_owner = {
+            "owner_kind": owner_kind,
+            "owner_id": owner_id,
+            "pid": pid,
+        }
+        connection = self._require_connection()
+        claim_event: TaskEvent | None = None
+        claimed_at = utc_now()
+        normalized_owner["claimed_at"] = timestamp_to_text(claimed_at)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT task_id, project_id, objective, executor, model,
+                       mode, execution_status, audit_status, thread_id, turn_id,
+                       created_at, updated_at
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            task = self._task_from_row(row)
+            if task.execution_status is not ExecutionStatus.QUEUED:
+                raise TaskStateError(
+                    f"task {task_id} cannot be claimed from state "
+                    f"{task.execution_status.value}; only QUEUED tasks may be claimed"
+                )
+            request_event = self._execution_request_in_transaction(connection, task_id)
+            if request_event is None:
+                raise TaskStateError(
+                    f"task {task_id} has no explicit D3-R2 execution request"
+                )
+            started = connection.execute(
+                """
+                SELECT event_id FROM task_events
+                WHERE task_id = ? AND source = 'bridge' AND kind = 'task.started'
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if started is not None:
+                raise TaskStateError(f"task {task_id} already has task.started")
+            self._assert_no_terminal_event(connection, task_id)
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET execution_status = ?, audit_status = ?, updated_at = ?
+                WHERE task_id = ? AND execution_status = ?
+                """,
+                (
+                    ExecutionStatus.RUNNING.value,
+                    AuditStatus.PENDING.value,
+                    timestamp_to_text(claimed_at),
+                    task_id,
+                    ExecutionStatus.QUEUED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TaskStateError(f"task {task_id} could not be claimed")
+            claim_event = self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                EXECUTION_CLAIM_EVENT,
+                normalized_owner,
+                created_at=claimed_at,
+            )
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                "task.started",
+                {"project_id": task.project_id},
+                created_at=claimed_at,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        updated = self.get_task(task_id)
+        if updated is None or claim_event is None:
+            raise RuntimeError("task disappeared after execution claim")
+        return updated, claim_event
+
     def transition_task_preflight_failed(
         self,
         task_id: str,
         *,
         policy_payload: Any,
         failed_payload: Any,
+        expected_status: ExecutionStatus | str = ExecutionStatus.QUEUED,
     ) -> Task:
-        """Atomically fail a QUEUED task rejected by autonomous preflight."""
+        """Atomically fail a task rejected by autonomous preflight."""
+
+        try:
+            expected = (
+                expected_status
+                if isinstance(expected_status, ExecutionStatus)
+                else ExecutionStatus(expected_status)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid expected_status: {expected_status!r}") from exc
 
         connection = self._require_connection()
         failed_at = utc_now()
@@ -681,14 +915,14 @@ class SQLiteBridgeStore:
                 current = ExecutionStatus(row["execution_status"])
             except (TypeError, ValueError) as exc:
                 raise ValueError("invalid task state in database") from exc
-            if current is not ExecutionStatus.QUEUED:
+            if current is not expected:
                 if current in _TERMINAL_EVENT_BY_STATUS:
                     raise TaskStateError(
                         f"task {task_id} is already terminal ({current.value})"
                     )
                 raise TaskStateError(
                     f"task {task_id} cannot transition from {current.value} "
-                    "to FAILED; expected QUEUED"
+                    f"to FAILED; expected {expected.value}"
                 )
             self._assert_no_terminal_event(connection, task_id)
             cursor = connection.execute(
@@ -702,7 +936,7 @@ class SQLiteBridgeStore:
                     AuditStatus.PENDING.value,
                     timestamp_to_text(failed_at),
                     task_id,
-                    ExecutionStatus.QUEUED.value,
+                    expected.value,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1133,4 +1367,11 @@ class SQLiteBridgeStore:
         return int(row[0])
 
 
-__all__ = ["SCHEMA_VERSION", "SQLiteBridgeStore", "SchemaVersionError"]
+__all__ = [
+    "D3_R2_CONTRACT",
+    "EXECUTION_CLAIM_EVENT",
+    "EXECUTION_REQUEST_EVENT",
+    "SCHEMA_VERSION",
+    "SQLiteBridgeStore",
+    "SchemaVersionError",
+]

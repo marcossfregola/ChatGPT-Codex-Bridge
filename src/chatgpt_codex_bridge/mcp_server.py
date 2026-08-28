@@ -13,7 +13,6 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .core import BridgeCore
-from .executors.codex_executor import CodexExecutor
 from .mcp_adapter import MCPAdapter, MCPToolError
 from .persistence.sqlite_store import SQLiteBridgeStore
 from .single_instance import (
@@ -114,7 +113,7 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
 
     @server.tool(
         name="run_task",
-        description="Run one queued Bridge task.",
+        description="Durably request one queued Bridge task for the execution worker.",
         structured_output=True,
     )
     async def run_task(task_id: str) -> dict[str, Any]:
@@ -181,9 +180,10 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
-                executor = CodexExecutor(executable=args.executable)
-                core = BridgeCore(store, executor)
-                core.recover_orphaned_tasks()
+                # The MCP child owns only the request/dispatch boundary.  A
+                # separate persistent execution worker owns Codex processes
+                # and performs recovery after acquiring its own lock.
+                core = BridgeCore(store)
                 adapter = MCPAdapter(core, store)
                 build_server(adapter).run(transport="stdio")
                 return 0

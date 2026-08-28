@@ -1,9 +1,10 @@
 # ChatGPT–Codex Bridge
 
 Bridge local para uso real controlado: ChatGPT invoca herramientas MCP, el
-Bridge coordina Projects y Tasks, y `CodexExecutor` ejecuta Codex local sobre
-un repositorio explícito. La versión vigente es `0.1.0` y el HEAD técnico base
-es `29d524fdc1f6fed2f59e4ae4b0f7f7ff1880e864`.
+Bridge coordina Projects y Tasks, y un execution worker persistente entrega
+las Tasks aceptadas a `CodexExecutor` sobre un repositorio explícito. La
+versión vigente es `0.1.0` y el HEAD técnico base de D3-R2-A es
+`66db63d8d7a2a3737fe6bf3cbf0c98ee94037db0`.
 
 El consumidor previsto del MVP es el desarrollo del Orquestador ComfyUI. El
 ChatGPT–OpenCode Bridge existente es infraestructura independiente y no se
@@ -22,21 +23,25 @@ reutiliza ni se modifica.
 Desde `C:\Codex\ChatGPT-Codex-Bridge`:
 
 ```powershell
-.venv\Scripts\Activate.ps1
-& .\scripts\start_mcp_tunnel.ps1
+pwsh -NoProfile -File .\scripts\start_runtime.ps1
 (Invoke-WebRequest -Uri http://127.0.0.1:8877/readyz -UseBasicParsing).StatusCode
 & .\scripts\doctor_mcp_tunnel.ps1
-& .\scripts\stop_mcp_tunnel.ps1
+& .\scripts\doctor_execution_worker.ps1
+pwsh -NoProfile -File .\scripts\stop_runtime.ps1
 ```
 
-El arranque sólo se considera listo con `/readyz` HTTP 200. `doctor` es un
-flujo manual que debe ejecutarse bajo la identidad Windows que creó la
-credencial DPAPI. No se debe ejecutar el doctor desde el sandbox de Codex ni
-mostrar la credencial.
+El arranque sólo se considera listo con `/readyz` HTTP 200 y un worker activo.
+`start_runtime.ps1` inicia primero el worker y después el túnel; es idempotente
+y reporta arranques parciales. `stop_runtime.ps1` detiene primero el túnel y
+después solicita el cierre controlado del worker. Los dos wrappers requieren
+PowerShell 7 (`pwsh -NoProfile`). Los `doctor` son flujos manuales de sólo
+lectura que deben ejecutarse bajo la identidad Windows que creó la credencial
+DPAPI. No se debe ejecutar el doctor desde el sandbox de Codex ni mostrar la
+credencial.
 
-El complemento operativo actual es **ChatGPT–Codex Bridge D2**. El complemento
-original conserva un schema MCP cacheado anterior a `TaskMode`; no debe
-borrarse ni modificarse destructivamente.
+El runtime operativo de esta etapa es **ChatGPT–Codex Bridge D3-R2-B**. El
+complemento original conserva un schema MCP cacheado anterior a `TaskMode`; no
+debe borrarse ni modificarse destructivamente.
 
 ## Flujo
 
@@ -45,6 +50,8 @@ ChatGPT
   → Secure MCP Tunnel
   → MCPServer oficial / MCPAdapter
   → Bridge Core
+  → SQLite durable (request)
+  → execution worker persistente
   → CodexExecutor
   → Codex app-server
   → Luna o Terra
@@ -91,6 +98,33 @@ requiriendo al usuario cuando corresponda.
 
 La evidencia E2E D3/D4 se obtuvo externamente y se documenta en
 `STATUS.md`; no forma parte de la suite unitaria reproducible.
+
+### Dispatch y polling
+
+`run_task` sólo valida y persiste una solicitud `task.execution_requested` en
+SQLite. Devuelve la aceptación sin esperar a Codex ni al resultado remoto. Un
+único worker persistente reclama las solicitudes explícitas en orden y escribe
+`task.execution_claimed`, `task.started` y la transición terminal. El cliente
+consulta `get_task`, `get_task_events` y `get_result`; no hay long-polling ni
+una tool pública `cancel_task`.
+
+Una Task histórica que quedó `QUEUED` sin `task.execution_requested` es un
+zombie y no se ejecuta automáticamente. Una Task `RUNNING` sin dueño vivo se
+recupera fail-closed como `FAILED` al arrancar un worker nuevo.
+
+## Runtime D3-R2-B
+
+El worker usa la misma base y perfil de D3 bajo
+`%LOCALAPPDATA%\ChatGPTCodexBridge`. Además de la base
+`state\bridge.sqlite3`, mantiene sidecars de PID, estado JSON, señal de stop y
+lock con scope de esa base. `doctor_execution_worker.ps1` informa la
+consistencia PID/state, el proceso verificado, el lock y las Tasks
+`QUEUED` solicitadas o `RUNNING`.
+
+El worker no inicia MCP ni el túnel y no comparte rutas, procesos, perfiles,
+locks o secretos con `ChatGPTOpenCodeBridge` o `VisorVideosDevBridge`. El túnel
+puede reiniciarse sin reiniciar el worker; reiniciar MCP tampoco reclama de
+nuevo una Task `RUNNING` legítima.
 
 Para arquitectura, seguridad, lifecycle, continuation y limitaciones, ver
 `ARCHITECTURE.md` y `SECURITY.md`.

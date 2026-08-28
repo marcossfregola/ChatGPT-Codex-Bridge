@@ -3,8 +3,9 @@
 ## Estado
 
 Arquitectura implementada y validada para un **MVP apto para uso real
-controlado**. El repositorio no pretende ser un sistema de aislamiento
-adversarial ni un scheduler autónomo.
+controlado**, con dispatch durable D3-R2-B y un único execution worker
+persistentemente controlado. El repositorio no pretende ser un sistema de
+aislamiento adversarial ni un scheduler autónomo.
 
 ## Fronteras
 
@@ -18,6 +19,8 @@ MCPServer oficial v2
 MCPAdapter
   ↓
 Bridge Core
+  ↓ task.execution_requested (SQLite)
+ExecutionWorker (único owner)
   ↓ Executor Contract
 CodexExecutor
   ↓ stdio://
@@ -36,9 +39,25 @@ Codex. Las ocho tools son `get_status`, `create_project`, `create_task`,
 
 ### Bridge Core
 
-`BridgeCore` es autoridad sobre Projects, Tasks, lifecycle, policy,
-correlación y transiciones. Depende de `SQLiteBridgeStore` y del
+`BridgeCore` es autoridad sobre Projects, Tasks, dispatch, lifecycle, policy,
+correlación y transiciones. `run_task` persiste una solicitud durable y no
+ejecuta Codex dentro del request MCP. Depende de `SQLiteBridgeStore` y del
 `Executor Contract`; no depende de MCP ni del protocolo app-server.
+
+### Execution worker y ownership
+
+`ExecutionWorker` es el único owner de la ejecución. Reclama atómicamente la
+Task `QUEUED` más antigua que tenga `task.execution_requested`, registra el
+owner persistente y ejecuta una sola Task por vez. El lock
+`<db>.execution-worker.lock` y los sidecars `<db>.execution-worker.pid`,
+`state.json` y `stop` pertenecen exclusivamente a esa base. El worker se
+puede iniciar sin túnel ni MCP y sobrevive a su reinicio.
+
+El stop escribe una señal de control acotada; el worker deja de reclamar,
+solicita `cancel_active` al executor, persiste `task.cancelled` cuando la
+cancelación alcanza una Task `RUNNING` y sale dentro del grace period. No hay
+servidor HTTP de control, kill por nombre global, scheduler, múltiples workers
+ni una tool pública `cancel_task`.
 
 ### Projects y Tasks
 
@@ -59,9 +78,11 @@ journal append-only `task_events`. Cada evento tiene `event_id` autoincremental,
 `source`, `kind`, payload JSON y timestamp UTC. Los eventos se recuperan en
 orden de `event_id`.
 
-El journal conserva lifecycle, correlación, notificaciones Codex, checkpoints,
-postflight, policy violations, resultados y errores acotados. No replica
-`CODEX_HOME`, credenciales, sesiones ni rollouts Codex.
+El journal conserva lifecycle, dispatch (`task.execution_requested` y
+`task.execution_claimed`), correlación, notificaciones Codex, checkpoints,
+postflight, policy violations, resultados y errores acotados. El dispatch usa
+el schema v3 existente; no agrega tablas ni migra el schema para R2-B. No
+replica `CODEX_HOME`, credenciales, sesiones ni rollouts Codex.
 
 ### Policy
 
@@ -103,6 +124,12 @@ laboratorios aislados. Los scripts versionados start/stop/doctor usan sólo esa
 raíz. El perfil externo del tunnel-client usa `channel: main`, el tunnel ID
 autorizado, MCP stdio y readiness local en `127.0.0.1:8877/readyz`.
 
+El lifecycle normal se opera con `start_runtime.ps1` y `stop_runtime.ps1`.
+`start_runtime.ps1` inicia worker y túnel en ese orden, sin duplicar los que ya
+estén vivos; `stop_runtime.ps1` detiene túnel/MCP y luego el worker de forma
+controlada. `doctor_execution_worker.ps1` es sólo lectura y muestra PID/state,
+proceso, lock, DB y Tasks solicitadas o en ejecución.
+
 El runtime no reutiliza rutas, procesos, locks, perfiles ni secretos del
 ChatGPT–OpenCode Bridge ni de VisorVideosDevBridge.
 
@@ -111,7 +138,7 @@ ChatGPT–OpenCode Bridge ni de VisorVideosDevBridge.
 Estados implementados:
 
 ```text
-QUEUED → RUNNING → FINISHED
+QUEUED + execution_requested → RUNNING → FINISHED
                  ↘ FAILED
                  ↘ CANCELLED
 ```
@@ -121,15 +148,22 @@ pero no tiene flujo activo en el MVP.
 
 - `QUEUED → RUNNING` es una actualización condicional y agrega `task.started`
   atómicamente.
+- `run_task` devuelve la aceptación durable rápidamente; el worker agrega
+  `task.execution_claimed` antes de `task.started` y el cliente hace polling
+  con `get_task`, `get_task_events` y `get_result`.
+- Una Task histórica `QUEUED` sin `task.execution_requested` permanece ignorada;
+  no existe ejecución automática de zombies.
 - Preflight fallido produce `policy.violation` y un único `task.failed`.
 - Cada transición terminal verifica que no exista otra terminalidad y se
   confirma en una transacción SQLite.
 - La cancelación conserva `task.cancelled` y propaga `CancelledError`.
 - Un executor fallido conserva `task.failed`.
-- Al arrancar, las Tasks `RUNNING` huérfanas se recuperan como `FAILED`, con
-  `task.recovered` y `task.failed`.
+- Al arrancar, las Tasks `RUNNING` huérfanas se recuperan fail-closed como
+  `FAILED`, con `task.recovered` y `task.failed`. Una Task `RUNNING` legítima
+  no se relanza por reiniciar MCP.
 - Las Tasks terminales no se pueden relanzar.
-- `MCPInstanceLock` impide dos servidores sobre la misma DB.
+- `MCPInstanceLock` impide dos servidores sobre la misma DB y
+  `ExecutionWorkerLock` impide dos owners de ejecución sobre la misma DB.
 
 ## AUTONOMOUS_WRITE y continuation
 
@@ -176,12 +210,17 @@ Esto es una decisión pragmática para el MVP, no un aislamiento fuerte.
 Los RPC cortos tienen deadline total de 30 s. La espera de turno tiene un
 timeout de inactividad de 300 s entre mensajes, no un timeout total de Task.
 El cierre espera 5 s y luego mata únicamente el proceso hijo propio si es
-necesario.
+necesario. El harness aislado de R2-B observó que el app-server real termina
+fiablemente cuando su owner muere y se cierra el stdin (`REAL CHILD TERMINATES
+RELIABLY`); por eso no se agregó un Job Object ni containment adicional.
 
 ## Observabilidad y límites
 
-`get_task_events` expone el journal y `get_result` recupera la respuesta final y
-la evidencia Git. No se persisten rollouts Codex, credenciales, raw stderr,
+`get_status` incorpora la señal bounded del worker (`worker_active`,
+`worker_pid`, `worker_owner`, `requested_task_id` y `running_task_id`), mientras
+que `doctor_execution_worker.ps1` verifica el proceso y la DB con más detalle.
+`get_task_events` expone el journal y `get_result` recupera la respuesta final
+y la evidencia Git. No se persisten rollouts Codex, credenciales, raw stderr,
 duración total, retry history ni una auditoría ChatGPT automática.
 
 Las demostraciones E2E D3 y D4 fueron obtenidas externamente; la suite local no

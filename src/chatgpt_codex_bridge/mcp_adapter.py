@@ -17,6 +17,7 @@ from .core import (
 )
 from .domain.events import TaskEvent
 from .domain.models import ExecutionStatus, Project, Task, TaskMode, timestamp_to_text
+from .execution_worker import read_worker_state
 from .persistence.sqlite_store import SQLiteBridgeStore
 from .policy import PolicyError
 
@@ -114,7 +115,6 @@ class MCPAdapter:
         self.bridge_version = bridge_version
         self.stage = stage
         self.executor_name = executor_name
-        self._run_lock = asyncio.Lock()
 
     def _all_tasks(self) -> list[Task]:
         tasks: list[Task] = []
@@ -173,6 +173,8 @@ class MCPAdapter:
     def _critical_event_kinds() -> set[str]:
         return {
             "task.created",
+            "task.execution_requested",
+            "task.execution_claimed",
             "task.started",
             "task.finished",
             "task.failed",
@@ -228,19 +230,113 @@ class MCPAdapter:
         return selected, omitted
 
     def _status(self) -> dict[str, Any]:
+        worker_state = read_worker_state(self.store.db_path)
+        worker_status = (
+            worker_state.get("status")
+            if isinstance(worker_state, Mapping)
+            and isinstance(worker_state.get("status"), str)
+            else None
+        )
+        worker_pid = (
+            worker_state.get("pid")
+            if isinstance(worker_state, Mapping)
+            and isinstance(worker_state.get("pid"), int)
+            and not isinstance(worker_state.get("pid"), bool)
+            and worker_state.get("pid") > 0
+            else None
+        )
+        worker_id = (
+            worker_state.get("worker_id")
+            if isinstance(worker_state, Mapping)
+            and isinstance(worker_state.get("worker_id"), str)
+            and worker_state.get("worker_id")
+            else None
+        )
+        worker_active = worker_status in {
+            "starting",
+            "idle",
+            "claiming",
+            "running",
+            "stopping",
+            "error",
+        }
+        worker_owner: dict[str, Any] | None = None
+        if worker_active:
+            worker_owner = {"owner_kind": "persistent_worker"}
+            if worker_id is not None:
+                worker_owner["owner_id"] = worker_id
+            if worker_pid is not None:
+                worker_owner["pid"] = worker_pid
         tasks = self._all_tasks()
-        active_statuses = {"QUEUED", "RUNNING", "WAITING_USER"}
-        active = [task for task in tasks if task.execution_status.value in active_statuses]
-        active.sort(key=lambda task: task.updated_at)
-        active_task = active[-1] if active else None
+        running = [
+            task
+            for task in tasks
+            if task.execution_status is ExecutionStatus.RUNNING
+        ]
+        queued_requested = [
+            task
+            for task in tasks
+            if task.execution_status is ExecutionStatus.QUEUED
+            and self.store.get_execution_request(task.task_id) is not None
+        ]
+        waiting = [
+            task
+            for task in tasks
+            if task.execution_status is ExecutionStatus.WAITING_USER
+        ]
+        if running:
+            active_task = max(running, key=lambda task: task.updated_at)
+            active_source = "running"
+        elif queued_requested:
+            active_task = max(queued_requested, key=lambda task: task.updated_at)
+            active_source = "queued_request"
+        elif waiting:
+            active_task = max(waiting, key=lambda task: task.updated_at)
+            active_source = "waiting_user"
+        else:
+            active_task = None
+            active_source = "historical"
         project = (
             self.store.get_project(active_task.project_id) if active_task is not None else None
         )
         latest_task = max(tasks, key=lambda task: task.updated_at) if tasks else None
+        if active_task is None:
+            active_task = latest_task
+            project = (
+                self.store.get_project(active_task.project_id)
+                if active_task is not None
+                else None
+            )
         last_event = (
             self._latest_event(active_task.task_id)
             if active_task is not None
             else self._latest_event(latest_task.task_id) if latest_task is not None else None
+        )
+        claim = (
+            self.store.get_execution_claim(active_task.task_id)
+            if active_task is not None and active_source == "running"
+            else None
+        )
+        owner: dict[str, Any] | None = None
+        if claim is not None and isinstance(claim.payload, Mapping):
+            owner_kind = claim.payload.get("owner_kind")
+            owner_id = claim.payload.get("owner_id")
+            pid = claim.payload.get("pid")
+            claimed_at = claim.payload.get("claimed_at")
+            if owner_kind == "persistent_worker":
+                owner = {"owner_kind": owner_kind}
+                if isinstance(owner_id, str) and owner_id:
+                    owner["owner_id"] = owner_id
+                if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                    owner["pid"] = pid
+                if isinstance(claimed_at, str) and claimed_at:
+                    owner["claimed_at"] = claimed_at
+                worker_owner = dict(owner)
+        requested_task_id = (
+            active_task.task_id if active_source == "queued_request" and active_task else None
+        )
+        running_task_id = (
+            active_task.task_id if active_source == "running" and active_task else None
         )
         return {
             "bridge_version": self.bridge_version,
@@ -248,6 +344,18 @@ class MCPAdapter:
             "executor": self.executor_name,
             "active_project": _project_dict(project) if project is not None else None,
             "active_task": _task_dict(active_task) if active_task is not None else None,
+            "active_task_source": active_source if active_task is not None else None,
+            "worker_active": worker_active,
+            "worker_status": worker_status,
+            "worker_pid": worker_pid,
+            "worker_owner": worker_owner,
+            "requested_task_id": requested_task_id,
+            "running_task_id": running_task_id,
+            "owner": owner,
+            "owner_kind": owner.get("owner_kind") if owner is not None else None,
+            "owner_id": owner.get("owner_id") if owner is not None else None,
+            "pid": owner.get("pid") if owner is not None else None,
+            "claimed_at": owner.get("claimed_at") if owner is not None else None,
             "project_id": project.project_id if project is not None else None,
             "task_id": active_task.task_id if active_task is not None else None,
             "model": active_task.model if active_task is not None else None,
@@ -369,13 +477,16 @@ class MCPAdapter:
             )
         if name == "run_task":
             task_id = _required_text(args, "task_id")
-            if self._run_lock.locked():
-                raise MCPConcurrencyError("another task is already running")
-            async with self._run_lock:
-                task = await self.core.run_task(task_id)
-                result = _task_dict(task)
-                result["final_response"] = self._result_for_task(task)["final_response"]
-                return result
+            dispatch = self.core.request_execution(task_id)
+            result = _task_dict(dispatch.task)
+            result.update(
+                {
+                    "accepted": dispatch.accepted,
+                    "already_requested": dispatch.already_requested,
+                    "request_id": dispatch.request_id,
+                }
+            )
+            return result
         raise MCPToolError(f"unknown tool: {name}")
 
 

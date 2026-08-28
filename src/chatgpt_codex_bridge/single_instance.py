@@ -39,6 +39,13 @@ def lock_path_for_db(db_path: str | os.PathLike[str]) -> Path:
     return Path(f"{canonical}.mcp.lock")
 
 
+def execution_worker_lock_path_for_db(db_path: str | os.PathLike[str]) -> Path:
+    """Return the independent persistent-worker lock path for one database."""
+
+    canonical = canonical_db_path(db_path)
+    return Path(f"{canonical}.execution-worker.lock")
+
+
 class MCPInstanceLock:
     """Hold an OS-backed, non-blocking lock for one Bridge database.
 
@@ -121,10 +128,49 @@ class MCPInstanceLock:
         self.release()
 
 
+class ExecutionWorkerLockError(RuntimeError):
+    """Raised when the execution-worker lock cannot be opened."""
+
+
+class ExecutionWorkerAlreadyRunningError(ExecutionWorkerLockError):
+    """Raised when another process owns the execution-worker lock."""
+
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(
+            f"Bridge execution worker already active for database: {db_path}"
+        )
+        self.db_path = db_path
+
+
+class ExecutionWorkerLock(MCPInstanceLock):
+    """Hold the lock that owns one persistent execution worker.
+
+    This deliberately uses a different physical lock file from
+    :class:`MCPInstanceLock`; the MCP child and worker are independent owners.
+    """
+
+    def __init__(self, db_path: str | os.PathLike[str]) -> None:
+        super().__init__(db_path)
+        self.lock_path = execution_worker_lock_path_for_db(self.db_path)
+
+    def acquire(self) -> "ExecutionWorkerLock":
+        try:
+            super().acquire()
+        except MCPInstanceLockError as exc:
+            if isinstance(exc, MCPInstanceAlreadyRunningError):
+                raise ExecutionWorkerAlreadyRunningError(self.db_path) from exc
+            raise ExecutionWorkerLockError(str(exc)) from exc
+        return self
+
+
 __all__ = [
     "MCPInstanceAlreadyRunningError",
     "MCPInstanceLock",
     "MCPInstanceLockError",
+    "ExecutionWorkerAlreadyRunningError",
+    "ExecutionWorkerLock",
+    "ExecutionWorkerLockError",
     "canonical_db_path",
+    "execution_worker_lock_path_for_db",
     "lock_path_for_db",
 ]

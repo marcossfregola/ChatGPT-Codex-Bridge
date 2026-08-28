@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -25,6 +26,7 @@ from chatgpt_codex_bridge.core import (  # noqa: E402
     MAX_FINAL_RESPONSE_BYTES,
 )
 from chatgpt_codex_bridge.domain.models import ExecutionStatus  # noqa: E402
+from chatgpt_codex_bridge.execution_worker import ExecutionWorker  # noqa: E402
 from chatgpt_codex_bridge.executors.base import ExecutionResult  # noqa: E402
 from chatgpt_codex_bridge.mcp_adapter import (  # noqa: E402
     DEFAULT_EVENT_LIMIT,
@@ -319,6 +321,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_result_uses_targeted_latest_queries(self) -> None:
         self._create_task()
         await self.adapter.call_tool("run_task", {"task_id": "task-mcp"})
+        await ExecutionWorker(self.store, self.core).run_once()
         with patch.object(
             self.store,
             "list_task_events",
@@ -370,7 +373,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("event_id", result["last_event"])
         self.assertIn("created_at", result["last_event"])
 
-    async def test_cancelled_run_propagates_at_adapter_boundary_and_next_task_runs(self) -> None:
+    async def test_cancelled_core_run_propagates_and_next_worker_task_runs(self) -> None:
         executor = BlockingExecutor()
         self.store.close()
         self.store = SQLiteBridgeStore(self.db_path)
@@ -378,9 +381,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.adapter = MCPAdapter(self.core, self.store)
         self._create_task("task-cancelled")
 
-        running = asyncio.create_task(
-            _call_adapter(self.adapter, "run_task", {"task_id": "task-cancelled"})
-        )
+        running = asyncio.create_task(self.core.run_task("task-cancelled"))
         await executor.started.wait()
         running.cancel()
         with self.assertRaises(asyncio.CancelledError):
@@ -397,18 +398,18 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.core.create_task("project-mcp", "next", task_id="task-next")
         executor.release.set()
-        next_result = await self.adapter.call_tool(
+        accepted = await self.adapter.call_tool(
             "run_task", {"task_id": "task-next"}
+        )
+        self.assertTrue(accepted["accepted"])
+        await ExecutionWorker(self.store, self.core).run_once()
+        next_result = await self.adapter.call_tool(
+            "get_task", {"task_id": "task-next"}
         )
         self.assertEqual(next_result["execution_status"], "FINISHED")
 
-    async def test_official_request_cancellation_keeps_server_operational(self) -> None:
-        executor = BlockingExecutor()
-        self.store.close()
-        self.store = SQLiteBridgeStore(self.db_path)
-        self.core = BridgeCore(self.store, executor)
-        self.adapter = MCPAdapter(self.core, self.store)
-        self._create_task("task-request-cancelled")
+    async def test_official_request_boundary_keeps_server_operational(self) -> None:
+        self._create_task("task-request")
         self.core.create_task("project-mcp", "next", task_id="task-request-next")
 
         server = build_server(self.adapter)
@@ -423,27 +424,31 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
             try:
                 async with ClientSession(client[0], client[1]) as session:
                     await session.initialize()
-                    running = asyncio.create_task(
-                        session.call_tool(
-                            "run_task", {"task_id": "task-request-cancelled"}
-                        )
+                    accepted = await session.call_tool(
+                        "run_task", {"task_id": "task-request"}
                     )
-                    await executor.started.wait()
-                    running.cancel()
-                    with self.assertRaises(asyncio.CancelledError):
-                        await running
-
-                    await asyncio.wait_for(executor.child_closed.wait(), timeout=2)
+                    self.assertFalse(accepted.is_error)
+                    self.assertTrue(accepted.structured_content["accepted"])
                     self.assertEqual(
-                        self.store.get_task("task-request-cancelled").execution_status,
-                        ExecutionStatus.CANCELLED,
+                        accepted.structured_content["execution_status"],
+                        ExecutionStatus.QUEUED.value,
+                    )
+                    self.assertEqual(self.executor.requests, [])
+                    await ExecutionWorker(self.store, self.core).run_once()
+                    self.assertEqual(
+                        self.store.get_task("task-request").execution_status,
+                        ExecutionStatus.FINISHED,
                     )
                     status = await session.call_tool("get_status", {})
                     self.assertFalse(status.is_error)
 
-                    executor.release.set()
-                    next_result = await session.call_tool(
+                    next_accepted = await session.call_tool(
                         "run_task", {"task_id": "task-request-next"}
+                    )
+                    self.assertFalse(next_accepted.is_error)
+                    await ExecutionWorker(self.store, self.core).run_once()
+                    next_result = await session.call_tool(
+                        "get_task", {"task_id": "task-request-next"}
                     )
                     self.assertFalse(next_result.is_error)
                     self.assertEqual(
@@ -455,12 +460,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
                 with suppress(asyncio.CancelledError):
                     await server_task
 
-    async def test_official_global_shutdown_propagates_cancellation(self) -> None:
-        executor = BlockingExecutor()
-        self.store.close()
-        self.store = SQLiteBridgeStore(self.db_path)
-        self.core = BridgeCore(self.store, executor)
-        self.adapter = MCPAdapter(self.core, self.store)
+    async def test_official_server_remains_request_only_during_worker_execution(self) -> None:
         self._create_task("task-global-shutdown")
 
         server = build_server(self.adapter)
@@ -472,32 +472,29 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
                     server._lowlevel_server.create_initialization_options(),
                 )
             )
-            async with ClientSession(client[0], client[1]) as session:
-                await session.initialize()
-                running = asyncio.create_task(
-                    session.call_tool(
+            try:
+                async with ClientSession(client[0], client[1]) as session:
+                    await session.initialize()
+                    accepted = await session.call_tool(
                         "run_task", {"task_id": "task-global-shutdown"}
                     )
-                )
-                await executor.started.wait()
-
+                    self.assertFalse(accepted.is_error)
+                    self.assertTrue(accepted.structured_content["accepted"])
+                    self.assertEqual(self.executor.requests, [])
+                    await ExecutionWorker(self.store, self.core).run_once()
+                    self.assertEqual(
+                        self.store.get_task("task-global-shutdown").execution_status,
+                        ExecutionStatus.FINISHED,
+                    )
+            finally:
                 server_task.cancel()
-                with self.assertRaises(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError):
                     await server_task
-
-                with self.assertRaises(MCPError) as call_error:
-                    await asyncio.wait_for(running, timeout=2)
-                self.assertNotIsInstance(call_error.exception, ToolError)
-                await asyncio.wait_for(executor.child_closed.wait(), timeout=2)
-                self.assertTrue(executor.cancel_active_called.is_set())
-                self.assertEqual(
-                    self.store.get_task("task-global-shutdown").execution_status,
-                    ExecutionStatus.CANCELLED,
-                )
 
     async def test_official_get_result_after_restart(self) -> None:
         self._create_task()
         await self.adapter.call_tool("run_task", {"task_id": "task-mcp"})
+        await ExecutionWorker(self.store, self.core).run_once()
         self.store.close()
 
         reopened = SQLiteBridgeStore(self.db_path)
@@ -538,11 +535,41 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         result = await self._with_official_client(exercise)
 
         self.assertFalse(result.is_error)
-        self.assertEqual(len(self.executor.requests), 1)
-        self.assertEqual(result.structured_content["execution_status"], "FINISHED")
-        self.assertEqual(result.structured_content["final_response"], "MCP_FAKE_OK")
+        self.assertEqual(len(self.executor.requests), 0)
+        self.assertTrue(result.structured_content["accepted"])
+        self.assertEqual(result.structured_content["execution_status"], "QUEUED")
+        self.assertNotIn("final_response", result.structured_content)
+        await ExecutionWorker(self.store, self.core).run_once()
+        final = await self.adapter.call_tool("get_result", {"task_id": "task-mcp"})
+        self.assertTrue(final["available"])
+        self.assertEqual(final["final_response"], "MCP_FAKE_OK")
 
-    async def test_run_task_rejects_non_queued_states_without_executor(self) -> None:
+    async def test_run_task_returns_before_a_slow_worker_finishes(self) -> None:
+        executor = BlockingExecutor()
+        self.store.close()
+        self.store = SQLiteBridgeStore(self.db_path)
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self._create_task("task-fast-return")
+
+        started_at = time.monotonic()
+        accepted = await self.adapter.call_tool(
+            "run_task", {"task_id": "task-fast-return"}
+        )
+        elapsed = time.monotonic() - started_at
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(accepted["execution_status"], ExecutionStatus.QUEUED.value)
+        self.assertLess(elapsed, 1.0)
+
+        worker_task = asyncio.create_task(
+            ExecutionWorker(self.store, self.core).run_once()
+        )
+        await asyncio.wait_for(executor.started.wait(), timeout=2)
+        self.assertFalse(worker_task.done())
+        executor.release.set()
+        await asyncio.wait_for(worker_task, timeout=5)
+
+    async def test_run_task_does_not_relaunch_non_queued_states(self) -> None:
         for status in (
             ExecutionStatus.RUNNING,
             ExecutionStatus.FINISHED,
@@ -555,34 +582,29 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.core.create_task(project_id, "do the task", task_id=task_id)
             self.store.update_task_runtime(task_id, execution_status=status)
 
-            with self.assertRaisesRegex(MCPToolError, f"state {status.value}"):
-                await self.adapter.call_tool("run_task", {"task_id": task_id})
+            result = await self.adapter.call_tool("run_task", {"task_id": task_id})
+            self.assertEqual(result["execution_status"], status.value)
+            self.assertEqual(result["accepted"], status is ExecutionStatus.RUNNING)
 
         self.assertEqual(self.executor.requests, [])
 
-    async def test_concurrent_run_is_rejected(self) -> None:
-        executor = BlockingExecutor()
-        self.store.close()
-        self.store = SQLiteBridgeStore(self.db_path)
-        self.core = BridgeCore(self.store, executor)
-        self.adapter = MCPAdapter(self.core, self.store)
+    async def test_consecutive_requests_are_durable_and_worker_serializes_execution(self) -> None:
         self._create_task("task-one")
         self.core.create_task("project-mcp", "second", task_id="task-two")
 
-        first = asyncio.create_task(
-            self.adapter.call_tool("run_task", {"task_id": "task-one"})
-        )
-        await executor.started.wait()
-        with self.assertRaisesRegex(MCPConcurrencyError, "another task"):
-            await self.adapter.call_tool("run_task", {"task_id": "task-two"})
-        executor.release.set()
-        result = await first
-
-        self.assertEqual(result["execution_status"], "FINISHED")
+        first = await self.adapter.call_tool("run_task", {"task_id": "task-one"})
+        second = await self.adapter.call_tool("run_task", {"task_id": "task-two"})
+        self.assertTrue(first["accepted"])
+        self.assertTrue(second["accepted"])
+        await ExecutionWorker(self.store, self.core).run_once()
+        await ExecutionWorker(self.store, self.core).run_once()
+        self.assertEqual(self.store.get_task("task-one").execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(self.store.get_task("task-two").execution_status, ExecutionStatus.FINISHED)
 
     async def test_restart_preserves_task_and_events(self) -> None:
         self._create_task()
         await self.adapter.call_tool("run_task", {"task_id": "task-mcp"})
+        await ExecutionWorker(self.store, self.core).run_once()
         self.store.close()
         reopened = SQLiteBridgeStore(self.db_path)
         try:
@@ -597,6 +619,36 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(task["execution_status"], "FINISHED")
         self.assertEqual(events["events"][-1]["kind"], "task.finished")
+
+    async def test_mcp_restart_does_not_recover_a_legitimate_running_claim(self) -> None:
+        self._create_task("task-running-mcp-restart")
+        await self.adapter.call_tool(
+            "run_task", {"task_id": "task-running-mcp-restart"}
+        )
+        worker = ExecutionWorker(
+            self.store,
+            self.core,
+            worker_id="mcp-restart-worker",
+            pid=61001,
+        )
+        self.assertIsNotNone(worker.claim_next())
+        self.store.close()
+
+        reopened = SQLiteBridgeStore(self.db_path)
+        try:
+            restarted = MCPAdapter(BridgeCore(reopened), reopened)
+            task = await restarted.call_tool(
+                "get_task", {"task_id": "task-running-mcp-restart"}
+            )
+            events = await restarted.call_tool(
+                "get_task_events", {"task_id": "task-running-mcp-restart"}
+            )
+        finally:
+            reopened.close()
+            self.store = SQLiteBridgeStore(self.db_path)
+
+        self.assertEqual(task["execution_status"], ExecutionStatus.RUNNING.value)
+        self.assertNotIn("task.recovered", [event["kind"] for event in events["events"]])
 
     async def test_default_db_path_is_cwd_independent(self) -> None:
         local_app_data = Path(self.tempdir.name) / "LocalAppData"

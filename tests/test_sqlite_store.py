@@ -72,6 +72,9 @@ from chatgpt_codex_bridge.domain.models import (  # noqa: E402
 )
 from chatgpt_codex_bridge.persistence import sqlite_store as sqlite_store_module  # noqa: E402
 from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
+    D3_R2_CONTRACT,
+    EXECUTION_CLAIM_EVENT,
+    EXECUTION_REQUEST_EVENT,
     SCHEMA_VERSION,
     SQLiteBridgeStore,
     SchemaVersionError,
@@ -239,6 +242,83 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             self.assertEqual(recovered.thread_id, "thread-example")
             self.assertEqual(recovered.turn_id, "turn-example")
             reopened.close()
+
+    def test_d3_r2_request_is_atomic_and_idempotent(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "dispatch.sqlite3")
+            payload = {
+                "contract": D3_R2_CONTRACT,
+                "requested_via": "run_task",
+                "request_id": "request-1",
+                "requested_at": "2026-08-27T00:00:00Z",
+                "requested_by": "mcp",
+            }
+            first_task, first_event, first_created = store.request_task_execution(
+                "task-1", payload
+            )
+            second_task, second_event, second_created = store.request_task_execution(
+                "task-1", {**payload, "request_id": "request-2"}
+            )
+
+            self.assertEqual(first_task.execution_status, ExecutionStatus.QUEUED)
+            self.assertTrue(first_created)
+            self.assertFalse(second_created)
+            self.assertEqual(first_event, second_event)
+            self.assertEqual(second_task, first_task)
+            self.assertEqual(
+                [event.kind for event in store.list_task_events("task-1")],
+                [EXECUTION_REQUEST_EVENT],
+            )
+            store.close()
+
+    def test_d3_r2_claim_requires_request_and_starts_once(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "claim.sqlite3")
+            with self.assertRaises(TaskStateError):
+                store.claim_task_execution(
+                    "task-1",
+                    {
+                        "owner_kind": "persistent_worker",
+                        "owner_id": "worker-1",
+                        "pid": 1,
+                    },
+                )
+            store.request_task_execution(
+                "task-1",
+                {
+                    "contract": D3_R2_CONTRACT,
+                    "requested_via": "run_task",
+                    "request_id": "request-1",
+                    "requested_at": "2026-08-27T00:00:00Z",
+                    "requested_by": "mcp",
+                },
+            )
+            claimed, claim_event = store.claim_task_execution(
+                "task-1",
+                {
+                    "owner_kind": "persistent_worker",
+                    "owner_id": "worker-1",
+                    "pid": 1,
+                    "claimed_at": "caller-value",
+                },
+            )
+            self.assertEqual(claimed.execution_status, ExecutionStatus.RUNNING)
+            self.assertEqual(claim_event.kind, EXECUTION_CLAIM_EVENT)
+            self.assertIsInstance(claim_event.payload["claimed_at"], str)
+            with self.assertRaises(TaskStateError):
+                store.claim_task_execution(
+                    "task-1",
+                    {
+                        "owner_kind": "persistent_worker",
+                        "owner_id": "worker-2",
+                        "pid": 2,
+                    },
+                )
+            self.assertEqual(
+                [event.kind for event in store.list_task_events("task-1")],
+                [EXECUTION_REQUEST_EVENT, EXECUTION_CLAIM_EVENT, "task.started"],
+            )
+            store.close()
 
     def test_runtime_update_distinguishes_omitted_and_none(self) -> None:
         with TemporaryDirectory() as directory:

@@ -17,6 +17,11 @@ El Bridge:
 - rechaza divergencias externas y evidencia truncada;
 - registra una única transición terminal por Task;
 - usa `MCPInstanceLock` para single-instance por base SQLite;
+- usa `ExecutionWorkerLock` para un único owner de ejecución por base;
+- mantiene sidecars de PID/state/stop acotados a la DB y verifica el ejecutable
+  del PID antes de operar sobre él;
+- detiene el worker mediante una señal explícita y grace period, sin kill
+  global ni servidor HTTP de control;
 - mantiene el runtime y los secretos bajo
   `%LOCALAPPDATA%\ChatGPTCodexBridge`;
 - limita profundidad, cantidad y tamaño de evidencia;
@@ -25,6 +30,13 @@ El Bridge:
 
 El runtime nuevo no reutiliza ni modifica carpetas, locks, PIDs, procesos,
 perfiles, MCP, túneles o secretos del ChatGPT–OpenCode Bridge.
+
+El túnel y MCP son transporte/request boundaries, no execution owners. `run_task`
+persiste una solicitud bounded en SQLite; el worker persistente es el único
+componente que reclama y entrega la Task a Codex. Las respuestas se obtienen
+por polling de `get_task`, `get_task_events` y `get_result`. No existe
+`cancel_task` pública, scheduler ni ejecución automática de Tasks históricas
+`QUEUED` sin una solicitud durable.
 
 ## B. Restricción contractual a Codex
 
@@ -114,23 +126,39 @@ Un secreto escrito explícitamente por un usuario dentro del objetivo de una
 Task no puede ser eliminado automáticamente de la fila Task; no deben incluirse
 credenciales en objetivos ni prompts.
 
+Los scripts `start_runtime.ps1` y `stop_runtime.ps1` requieren PowerShell 7 y
+operan únicamente sobre `%LOCALAPPDATA%\ChatGPTCodexBridge`. El wrapper de
+arranque puede dejar un estado parcial (worker vivo, túnel fallido) y lo
+reporta; el wrapper de parada conserva el orden túnel/MCP → worker. El doctor
+del worker es de sólo lectura y no elimina sidecars ni detiene procesos.
+
 ## Tiempos y recuperación
 
 - RPC corto: deadline total de 30 s.
 - Turno: timeout de inactividad de 300 s entre mensajes.
 - No existe timeout total de Task.
 - Cierre del app-server: 5 s y kill sólo del proceso hijo propio si hace falta.
-- Un crash deja Tasks `RUNNING` para recuperación determinista a `FAILED` al
-  siguiente arranque.
+- El stop del worker deja de reclamar, solicita `cancel_active`, espera un
+  grace period acotado y persiste `task.cancelled` si había una Task RUNNING.
+- Un crash deja Tasks `RUNNING` para recuperación determinista fail-closed a
+  `FAILED` al siguiente arranque del worker; las Tasks `QUEUED` sin
+  `task.execution_requested` se ignoran.
+- La prueba aislada con el Codex app-server real clasificó
+  `REAL CHILD TERMINATES RELIABLY` al morir el owner y cerrarse stdin; no se
+  añadió Job Object.
 
 ## Limitaciones conocidas
 
 - No hay E2E real de desconexión ChatGPT/MCP.
-- No se ha probado un crash real del runtime durante Luna.
+- El harness real cubre la terminación del app-server por EOF, pero no un
+  crash productivo del runtime durante Luna ni la desconexión ChatGPT/MCP.
 - `audit_status` permanece `PENDING`; no existe `post_audit`.
 - El Bridge no puede despertar ChatGPT ni iniciar una Task futura.
-- No hay retries complejos ni rollback automático.
+- No hay retries complejos, scheduler ni rollback automático.
+- No hay múltiples workers ni una cancelación pública; el stop operativo es
+  sólo el control local del worker.
 - El stop script conserva un race benigno de proceso ya terminado.
 - El complemento original puede conservar un schema MCP cacheado anterior a
-  `TaskMode`; el complemento operativo es ChatGPT–Codex Bridge D2.
+  `TaskMode`; el runtime operativo de esta etapa es ChatGPT–Codex Bridge
+  D3-R2-B.
 - `WAITING_USER` existe en el modelo, pero no tiene flujo activo.
