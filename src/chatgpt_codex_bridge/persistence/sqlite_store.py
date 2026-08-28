@@ -254,6 +254,10 @@ _TERMINAL_EVENT_KINDS = tuple(_TERMINAL_EVENT_BY_STATUS.values())
 D3_R2_CONTRACT = "D3-R2"
 EXECUTION_REQUEST_EVENT = "task.execution_requested"
 EXECUTION_CLAIM_EVENT = "task.execution_claimed"
+D3_H3_CONTRACT = "D3-H3"
+CANCELLATION_REQUEST_EVENT = "task.cancel_requested"
+CANCELLATION_INTERRUPT_SENT_EVENT = "task.cancel_interrupt_sent"
+CANCELLATION_INTERRUPT_FAILED_EVENT = "task.cancel_interrupt_failed"
 
 
 class SQLiteBridgeStore:
@@ -1396,6 +1400,181 @@ class SQLiteBridgeStore:
         ).fetchone()
         return self._event_from_row(row) if row is not None else None
 
+    def _cancellation_request_in_transaction(
+        self, connection: sqlite3.Connection, task_id: str
+    ) -> TaskEvent | None:
+        """Return the first durable H3 cancellation request for ``task_id``."""
+
+        rows = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ? AND source = 'bridge' AND kind = ?
+            ORDER BY event_id ASC
+            """,
+            (task_id, CANCELLATION_REQUEST_EVENT),
+        ).fetchall()
+        for row in rows:
+            event = self._event_from_row(row)
+            if (
+                isinstance(event.payload, Mapping)
+                and event.payload.get("contract") == D3_H3_CONTRACT
+            ):
+                return event
+        return None
+
+    def get_cancellation_request(self, task_id: str) -> TaskEvent | None:
+        """Return the durable H3 cancellation request, if one exists."""
+
+        connection = self._require_connection()
+        return self._cancellation_request_in_transaction(connection, task_id)
+
+    def get_cancellation_interrupt_sent(self, task_id: str) -> TaskEvent | None:
+        """Return the durable interrupt dispatch evidence, if one exists."""
+
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ? AND source = 'bridge' AND kind = ?
+            ORDER BY event_id ASC
+            LIMIT 1
+            """,
+            (task_id, CANCELLATION_INTERRUPT_SENT_EVENT),
+        ).fetchone()
+        return self._event_from_row(row) if row is not None else None
+
+    def get_cancellation_interrupt_failure(self, task_id: str) -> TaskEvent | None:
+        """Return the durable interrupt failure evidence, if one exists."""
+
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ? AND source = 'bridge' AND kind = ?
+            ORDER BY event_id DESC
+            LIMIT 1
+            """,
+            (task_id, CANCELLATION_INTERRUPT_FAILED_EVENT),
+        ).fetchone()
+        return self._event_from_row(row) if row is not None else None
+
+    def request_task_cancellation(
+        self, task_id: str, payload: Mapping[str, Any]
+    ) -> tuple[Task, TaskEvent | None, bool]:
+        """Durably request cancellation and atomically cancel an untouched queue item.
+
+        A QUEUED task is moved to CANCELLED in the same transaction as the
+        request event, so a worker cannot claim it after cancellation.  A
+        RUNNING task only records the request; its owner must obtain official
+        turn-interruption evidence before writing the terminal event.  Terminal
+        tasks are returned unchanged and never receive a new request event.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise ValueError("cancellation request payload must be an object")
+        normalized_payload = dict(payload)
+        if normalized_payload.get("contract") != D3_H3_CONTRACT:
+            raise ValueError("cancellation request payload must declare contract D3-H3")
+
+        connection = self._require_connection()
+        request_event: TaskEvent | None = None
+        created = False
+        requested_at = utc_now()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT task_id, project_id, objective, executor, model,
+                       mode, execution_status, audit_status, thread_id, turn_id,
+                       created_at, updated_at
+                FROM tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            task = self._task_from_row(row)
+            request_event = self._cancellation_request_in_transaction(
+                connection, task_id
+            )
+            if task.execution_status in {
+                ExecutionStatus.FINISHED,
+                ExecutionStatus.FAILED,
+                ExecutionStatus.CANCELLED,
+            }:
+                connection.commit()
+                return task, request_event, False
+            if task.execution_status not in {
+                ExecutionStatus.QUEUED,
+                ExecutionStatus.RUNNING,
+            }:
+                raise TaskStateError(
+                    f"task {task_id} cannot be cancelled from state "
+                    f"{task.execution_status.value}; only QUEUED or RUNNING tasks may be cancelled"
+                )
+
+            if request_event is None:
+                request_event = self._insert_task_event_in_transaction(
+                    connection,
+                    task_id,
+                    "bridge",
+                    CANCELLATION_REQUEST_EVENT,
+                    normalized_payload,
+                    created_at=requested_at,
+                )
+                created = True
+
+            if task.execution_status is ExecutionStatus.QUEUED:
+                cancelled_at = utc_now()
+                cancel_payload = {
+                    "status": ExecutionStatus.CANCELLED.value,
+                    "reason": "cancel requested before execution",
+                    "requested_via": normalized_payload.get("requested_via", "mcp"),
+                    "cancel_request_id": (
+                        request_event.payload.get("request_id")
+                        if isinstance(request_event.payload, Mapping)
+                        else None
+                    ),
+                }
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET execution_status = ?, audit_status = ?, updated_at = ?
+                    WHERE task_id = ? AND execution_status = ?
+                    """,
+                    (
+                        ExecutionStatus.CANCELLED.value,
+                        AuditStatus.PENDING.value,
+                        timestamp_to_text(cancelled_at),
+                        task_id,
+                        ExecutionStatus.QUEUED.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise TaskStateError(
+                        f"task {task_id} could not be cancelled from QUEUED"
+                    )
+                self._insert_task_event_in_transaction(
+                    connection,
+                    task_id,
+                    "bridge",
+                    "task.cancelled",
+                    cancel_payload,
+                    created_at=cancelled_at,
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise RuntimeError("task disappeared after cancellation request")
+        return updated, request_event, created
+
     def count_task_events(self, task_id: str) -> int:
         connection = self._require_connection()
         row = connection.execute(
@@ -1406,6 +1585,10 @@ class SQLiteBridgeStore:
 
 
 __all__ = [
+    "CANCELLATION_INTERRUPT_FAILED_EVENT",
+    "CANCELLATION_INTERRUPT_SENT_EVENT",
+    "CANCELLATION_REQUEST_EVENT",
+    "D3_H3_CONTRACT",
     "D3_R2_CONTRACT",
     "EXECUTION_CLAIM_EVENT",
     "EXECUTION_REQUEST_EVENT",

@@ -168,6 +168,113 @@ class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_turn_interrupt_demultiplexes_response_while_turn_waits(self) -> None:
+        reader = asyncio.StreamReader()
+
+        class RecordingStdin:
+            def __init__(self) -> None:
+                self.messages: list[dict[str, object]] = []
+
+            def write(self, data: bytes) -> None:
+                self.messages.append(json.loads(data.decode("utf-8")))
+
+            async def drain(self) -> None:
+                await asyncio.sleep(0)
+
+        stdin = RecordingStdin()
+        client = CodexAppServerClient(
+            "codex", ROOT, request_timeout=0.5, turn_timeout=0.5
+        )
+        client.process = SimpleNamespace(stdout=reader, stdin=stdin, returncode=None)
+        waiting = asyncio.create_task(
+            client.wait_for_turn_completed("thread-active", "turn-active")
+        )
+        await asyncio.sleep(0)
+        interrupting = asyncio.create_task(
+            client.turn_interrupt(thread_id="thread-active", turn_id="turn-active")
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(stdin.messages[0]["method"], "turn/interrupt")
+        request_id = stdin.messages[0]["id"]
+        self._feed(
+            reader,
+            {"jsonrpc": "2.0", "id": request_id, "result": {}},
+        )
+        self._feed(
+            reader,
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-active",
+                    "turn": {"id": "turn-active", "status": "interrupted"},
+                },
+            },
+        )
+
+        response = await asyncio.wait_for(interrupting, timeout=2)
+        completed = await asyncio.wait_for(waiting, timeout=2)
+        self.assertEqual(response, {"jsonrpc": "2.0", "id": request_id, "result": {}})
+        self.assertEqual(
+            completed["params"]["turn"]["status"],
+            "interrupted",
+        )
+
+    async def test_late_interrupt_response_is_consumed_after_turn_completion(self) -> None:
+        reader = asyncio.StreamReader()
+
+        class RecordingStdin:
+            def __init__(self) -> None:
+                self.messages: list[dict[str, object]] = []
+
+            def write(self, data: bytes) -> None:
+                self.messages.append(json.loads(data.decode("utf-8")))
+
+            async def drain(self) -> None:
+                await asyncio.sleep(0)
+
+        stdin = RecordingStdin()
+        client = CodexAppServerClient(
+            "codex", ROOT, request_timeout=0.5, turn_timeout=0.5
+        )
+        client.process = SimpleNamespace(stdout=reader, stdin=stdin, returncode=None)
+        waiting = asyncio.create_task(
+            client.wait_for_turn_completed("thread-active", "turn-active")
+        )
+        await asyncio.sleep(0)
+        interrupting = asyncio.create_task(
+            client.turn_interrupt(thread_id="thread-active", turn_id="turn-active")
+        )
+        await asyncio.sleep(0)
+        request_id = stdin.messages[0]["id"]
+        self._feed(
+            reader,
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-active",
+                    "turn": {"id": "turn-active", "status": "completed"},
+                },
+            },
+        )
+
+        await asyncio.wait_for(waiting, timeout=2)
+        # The interrupt RPC response is deliberately delayed until after the
+        # turn terminal notification; it must not poison the next request.
+        self._feed(reader, {"jsonrpc": "2.0", "id": request_id, "result": {}})
+
+        async def next_request() -> dict[str, object]:
+            request_task = asyncio.create_task(client.request("next/request", {}))
+            await asyncio.sleep(0)
+            next_id = stdin.messages[-1]["id"]
+            self._feed(reader, {"jsonrpc": "2.0", "id": next_id, "result": {}})
+            return await request_task
+
+        with self.assertRaises(AppServerError):
+            await asyncio.wait_for(interrupting, timeout=2)
+        following = await asyncio.wait_for(next_request(), timeout=2)
+        self.assertEqual(following["result"], {})
+
     async def test_1fd_source_is_used_for_initialize_and_thread_start(self) -> None:
         client = CodexAppServerClient("codex", ROOT)
         seen: list[tuple[str, dict[str, object]]] = []

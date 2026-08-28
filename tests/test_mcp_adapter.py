@@ -176,7 +176,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_stage_is_1fd(self) -> None:
         self.assertEqual(self.adapter.stage, "1F-D")
 
-    async def test_official_initialize_and_tools_list_expose_exactly_eight_tools(self) -> None:
+    async def test_official_initialize_and_tools_list_expose_exactly_nine_tools(self) -> None:
         async def exercise(session):
             initialized = await session.initialize()
             tools = await session.list_tools()
@@ -192,6 +192,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "create_project",
                 "create_task",
                 "run_task",
+                "cancel_task",
                 "get_task",
                 "get_task_events",
                 "get_result",
@@ -758,6 +759,15 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
             result = await self.adapter.call_tool("get_status", {})
             self.assertEqual(result["turn_status"], expected)
 
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "turn/completed",
+            {"turn": {"id": "turn-mcp", "status": "interrupted"}},
+        )
+        result = await self.adapter.call_tool("get_status", {})
+        self.assertEqual(result["turn_status"], "interrupted")
+
     async def test_get_status_executor_liveness_is_alive_only_with_process_evidence(self) -> None:
         self._create_task()
         self.store.transition_task_running("task-mcp", project_id="project-mcp")
@@ -768,6 +778,143 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.executor.last_pid = 99_999_999
         dead = await self.adapter.call_tool("get_status", {})
         self.assertEqual(dead["executor_liveness"], "dead")
+
+    async def test_cancel_task_unknown_is_a_safe_not_found_error(self) -> None:
+        with self.assertRaises(MCPToolError) as raised:
+            await self.adapter.call_tool("cancel_task", {"task_id": "missing"})
+        self.assertIn("task does not exist", str(raised.exception))
+
+    async def test_cancel_queued_task_is_terminal_and_never_claimed(self) -> None:
+        self._create_task()
+
+        cancelled = await self.adapter.call_tool(
+            "cancel_task", {"task_id": "task-mcp"}
+        )
+
+        self.assertEqual(cancelled["task_id"], "task-mcp")
+        self.assertEqual(cancelled["execution_status"], ExecutionStatus.CANCELLED.value)
+        self.assertTrue(cancelled["accepted"])
+        self.assertFalse(cancelled["already_requested"])
+        self.assertTrue(cancelled["cancel_requested"])
+        self.assertTrue(cancelled["terminal"])
+        self.assertIsNone(
+            ExecutionWorker(self.store, self.core).claim_next()
+        )
+        self.assertEqual(self.executor.requests, [])
+        self.assertEqual(
+            [event.kind for event in self.store.list_task_events("task-mcp")],
+            ["task.created", "task.cancel_requested", "task.cancelled"],
+        )
+
+        result = await self.adapter.call_tool(
+            "get_result", {"task_id": "task-mcp"}
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["execution_status"], ExecutionStatus.CANCELLED.value)
+        self.assertTrue(result["cancel_confirmed"])
+        self.assertEqual(result["cancel_reason"], "cancel requested before execution")
+
+    async def test_cancel_running_is_durable_and_idempotent(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+
+        first = await self.adapter.call_tool(
+            "cancel_task", {"task_id": "task-mcp"}
+        )
+        second = await self.adapter.call_tool(
+            "cancel_task", {"task_id": "task-mcp"}
+        )
+
+        self.assertEqual(first["execution_status"], ExecutionStatus.RUNNING.value)
+        self.assertTrue(first["accepted"])
+        self.assertFalse(first["already_requested"])
+        self.assertFalse(first["terminal"])
+        self.assertTrue(first["cancel_requested"])
+        self.assertTrue(second["accepted"])
+        self.assertTrue(second["already_requested"])
+        self.assertEqual(first["request_id"], second["request_id"])
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in self.store.list_task_events("task-mcp")
+                    if event.kind == "task.cancel_requested"
+                ]
+            ),
+            1,
+        )
+
+        task = await self.adapter.call_tool("get_task", {"task_id": "task-mcp"})
+        status = await self.adapter.call_tool("get_status", {})
+        self.assertTrue(task["cancel_requested"])
+        self.assertTrue(status["cancel_requested"])
+
+    async def test_cancel_request_survives_adapter_restart(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        first = await self.adapter.call_tool(
+            "cancel_task", {"task_id": "task-mcp"}
+        )
+
+        self.store.close()
+        reopened = SQLiteBridgeStore(self.db_path)
+        self.store = reopened
+        restarted = MCPAdapter(BridgeCore(reopened), reopened)
+        task = await restarted.call_tool("get_task", {"task_id": "task-mcp"})
+        result = await restarted.call_tool("get_result", {"task_id": "task-mcp"})
+
+        self.assertTrue(first["cancel_requested"])
+        self.assertEqual(task["execution_status"], ExecutionStatus.RUNNING.value)
+        self.assertTrue(task["cancel_requested"])
+        self.assertTrue(result["cancel_requested"])
+        self.assertFalse(result["cancel_confirmed"])
+        self.assertEqual(result["cancel_request_id"], first["request_id"])
+
+    async def test_cancel_terminal_tasks_does_not_change_results(self) -> None:
+        self._create_project()
+        for status, event_kind in (
+            (ExecutionStatus.FINISHED, "task.finished"),
+            (ExecutionStatus.FAILED, "task.failed"),
+            (ExecutionStatus.CANCELLED, "task.cancelled"),
+        ):
+            task_id = f"task-{status.value.lower()}"
+            self.core.create_task(
+                "project-mcp", "cancel terminal task", task_id=task_id
+            )
+            self.store.transition_task_running(task_id, project_id="project-mcp")
+            payload = (
+                {"final_response": "done"}
+                if status is ExecutionStatus.FINISHED
+                else {"error_type": "TestError"}
+                if status is ExecutionStatus.FAILED
+                else {"reason": "prior cancellation"}
+            )
+            self.store.transition_task_terminal(
+                task_id,
+                execution_status=status,
+                event_kind=event_kind,
+                payload=payload,
+            )
+            before = self.store.list_task_events(task_id)
+
+            result = await self.adapter.call_tool(
+                "cancel_task", {"task_id": task_id}
+            )
+
+            self.assertFalse(result["accepted"])
+            self.assertTrue(result["terminal"])
+            self.assertFalse(result["cancel_requested"])
+            self.assertEqual(self.store.list_task_events(task_id), before)
+
+    async def test_official_cancel_task_schema_exposes_required_task_id(self) -> None:
+        async def exercise(session):
+            await session.initialize()
+            tools = await session.list_tools()
+            return next(tool for tool in tools.tools if tool.name == "cancel_task")
+
+        tool = await self._with_official_client(exercise)
+        self.assertEqual(set(tool.input_schema["required"]), {"task_id"})
+        self.assertEqual(tool.input_schema["properties"]["task_id"]["type"], "string")
 
     async def test_official_get_status_serializes_h2_observability_fields(self) -> None:
         self._create_task()
@@ -1410,7 +1557,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
                 stderr_text = stderr.read()
 
             self.assertTrue(initialized.protocol_version)
-            self.assertEqual(len(tools.tools), 8)
+            self.assertEqual(len(tools.tools), 9)
             self.assertTrue(db_path.exists())
             self.assertIn("pid=", stderr_text)
             reopened = SQLiteBridgeStore(db_path)

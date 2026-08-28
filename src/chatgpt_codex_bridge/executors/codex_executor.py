@@ -21,6 +21,9 @@ from .codex_app_server import (
 
 
 ClientFactory = Callable[..., CodexAppServerClient]
+_INTERRUPTED_TURN_STATUSES = frozenset(
+    {"interrupted", "cancelled", "canceled", "aborted"}
+)
 
 
 class CodexExecutor:
@@ -98,7 +101,7 @@ class CodexExecutor:
             raise AppServerError(
                 f"turn/completed returned unexpected turn ID: {turn_id!r}"
             )
-        if status != "completed":
+        if status != "completed" and status not in _INTERRUPTED_TURN_STATUSES:
             raise AppServerError(f"turn completed with unexpected status: {status!r}")
         return turn
 
@@ -163,6 +166,13 @@ class CodexExecutor:
             )
             completed_turn = self._completed_turn(completed, client_turn_id(completed))
             turn_id = completed_turn["id"]
+            if completed_turn.get("status") in _INTERRUPTED_TURN_STATUSES:
+                return ExecutionResult(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    status=ExecutionStatus.CANCELLED,
+                    final_response=extract_final_agent_message(completed),
+                )
             return ExecutionResult(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -188,23 +198,37 @@ class CodexExecutor:
             self._active_thread_id = None
             self._active_turn_id = None
 
-    async def cancel_active(self) -> bool:
+    async def cancel_active(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
         """Best-effort interrupt for the currently active turn."""
 
         if self._cancel_requested:
             return False
         client = self.last_client
-        thread_id = self._active_thread_id
-        turn_id = self._active_turn_id
+        active_thread_id = self._active_thread_id
+        active_turn_id = self._active_turn_id
         interrupt = getattr(client, "turn_interrupt", None) if client is not None else None
         process = getattr(client, "process", object()) if client is not None else None
-        if client is None or process is None or not thread_id or not turn_id:
+        if (
+            client is None
+            or process is None
+            or not active_thread_id
+            or not active_turn_id
+        ):
+            return False
+        if thread_id is not None and thread_id != active_thread_id:
+            return False
+        if turn_id is not None and turn_id != active_turn_id:
             return False
         if not callable(interrupt):
             return False
         self._cancel_requested = True
         try:
-            await interrupt(thread_id=thread_id, turn_id=turn_id)
+            await interrupt(thread_id=active_thread_id, turn_id=active_turn_id)
         except BaseException:
             return False
         return True

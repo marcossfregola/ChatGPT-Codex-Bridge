@@ -40,6 +40,7 @@ MAX_EVENT_RESPONSE_BYTES = 512 * 1024
 MAX_EVENT_CURSOR = (1 << 63) - 1
 _RESULT_EVENT_KINDS = (
     "task.finished",
+    "task.cancelled",
     "policy.git_checkpoint",
     "policy.postflight",
     "policy.violation",
@@ -141,7 +142,7 @@ def _project_dict(project: Project) -> dict[str, Any]:
     }
 
 
-def _task_dict(task: Task) -> dict[str, Any]:
+def _task_dict(task: Task, *, cancel_requested: bool = False) -> dict[str, Any]:
     return {
         "task_id": task.task_id,
         "project_id": task.project_id,
@@ -150,6 +151,7 @@ def _task_dict(task: Task) -> dict[str, Any]:
         "model": task.model,
         "mode": task.mode.value,
         "execution_status": task.execution_status.value,
+        "cancel_requested": bool(cancel_requested),
         "audit_status": task.audit_status.value,
         "thread_id": task.thread_id,
         "turn_id": task.turn_id,
@@ -206,9 +208,15 @@ class MCPAdapter:
             if event.source == "bridge"
         }
         finished_event = by_kind.get("task.finished")
+        cancelled_event = by_kind.get("task.cancelled")
         payload = finished_event.payload if finished_event is not None else {}
         if not isinstance(payload, dict):
             payload = {}
+        cancelled_payload = (
+            cancelled_event.payload if cancelled_event is not None else {}
+        )
+        if not isinstance(cancelled_payload, dict):
+            cancelled_payload = {}
         checkpoint_event = by_kind.get("policy.git_checkpoint")
         postflight_event = by_kind.get("policy.postflight")
         violation_event = by_kind.get("policy.violation")
@@ -218,6 +226,12 @@ class MCPAdapter:
             checkpoint = {}
         if not isinstance(postflight, dict):
             postflight = {}
+        cancellation_request = self.store.get_cancellation_request(task.task_id)
+        cancellation_request_payload = (
+            cancellation_request.payload if cancellation_request is not None else {}
+        )
+        if not isinstance(cancellation_request_payload, Mapping):
+            cancellation_request_payload = {}
         return {
             "task_id": task.task_id,
             "mode": task.mode.value,
@@ -225,9 +239,29 @@ class MCPAdapter:
             "audit_status": task.audit_status.value,
             "thread_id": task.thread_id,
             "turn_id": task.turn_id,
-            "available": finished_event is not None,
-            "final_response": _bounded_final_response(payload.get("final_response")),
-            "event_id": finished_event.event_id if finished_event is not None else None,
+            "available": finished_event is not None or cancelled_event is not None,
+            "final_response": _bounded_final_response(
+                payload.get("final_response")
+                if finished_event is not None
+                else cancelled_payload.get("final_response")
+            ),
+            "event_id": (
+                finished_event.event_id
+                if finished_event is not None
+                else cancelled_event.event_id
+                if cancelled_event is not None
+                else None
+            ),
+            "cancel_requested": cancellation_request is not None,
+            "cancel_confirmed": cancelled_event is not None,
+            "cancel_request_id": (
+                cancelled_payload.get("cancel_request_id")
+                if cancelled_event is not None
+                else cancellation_request_payload.get("request_id")
+            ),
+            "cancel_reason": cancelled_payload.get("reason")
+            if cancelled_event is not None
+            else None,
             "baseline_branch": checkpoint.get("baseline_branch"),
             "baseline_head": checkpoint.get("baseline_head"),
             "final_branch": postflight.get("final_branch"),
@@ -250,6 +284,9 @@ class MCPAdapter:
             "task.finished",
             "task.failed",
             "task.cancelled",
+            "task.cancel_requested",
+            "task.cancel_interrupt_sent",
+            "task.cancel_interrupt_failed",
             "task.recovered",
             "policy.git_checkpoint",
             "policy.postflight",
@@ -453,9 +490,19 @@ class MCPAdapter:
         events = self.store.get_latest_task_events(task_id, _TURN_EVENT_KINDS)
         for event in reversed(events):
             by_kind = _TURN_STATUS_BY_KIND.get(event.kind)
+            payload = event.payload
+            # Codex may report an interrupted turn using the ordinary
+            # ``turn/completed`` notification with a terminal ``turn.status``.
+            # Prefer that explicit status for this event; otherwise retain the
+            # established kind-based mapping used by H2.
+            if event.kind == "turn/completed" and isinstance(payload, Mapping):
+                status = self._normalize_turn_status(payload.get("status"))
+                if status is None and isinstance(payload.get("turn"), Mapping):
+                    status = self._normalize_turn_status(payload["turn"].get("status"))
+                if status is not None:
+                    return status
             if by_kind is not None:
                 return by_kind
-            payload = event.payload
             if not isinstance(payload, Mapping):
                 continue
             status = self._normalize_turn_status(payload.get("status"))
@@ -674,12 +721,20 @@ class MCPAdapter:
             age_seconds = (utc_now() - last_event.created_at).total_seconds()
             if age_seconds >= 0:
                 last_event_age_seconds = age_seconds
+        cancel_requested = (
+            active_task is not None
+            and self.store.get_cancellation_request(active_task.task_id) is not None
+        )
         return {
             "bridge_version": self.bridge_version,
             "stage": self.stage,
             "executor": self.executor_name,
             "active_project": _project_dict(project) if project is not None else None,
-            "active_task": _task_dict(active_task) if active_task is not None else None,
+            "active_task": (
+                _task_dict(active_task, cancel_requested=cancel_requested)
+                if active_task is not None
+                else None
+            ),
             "active_task_source": active_source if active_task is not None else None,
             "worker_active": worker_active,
             "worker_status": worker_status,
@@ -698,6 +753,7 @@ class MCPAdapter:
             "execution_status": (
                 active_task.execution_status.value if active_task is not None else None
             ),
+            "cancel_requested": cancel_requested,
             "audit_status": active_task.audit_status.value if active_task is not None else None,
             "thread_id": active_task.thread_id if active_task is not None else None,
             "turn_id": active_task.turn_id if active_task is not None else None,
@@ -737,6 +793,8 @@ class MCPAdapter:
         except TaskStateError as exc:
             raise MCPToolError(str(exc)) from exc
         except PolicyError as exc:
+            raise MCPToolError(str(exc)) from exc
+        except KeyError as exc:
             raise MCPToolError(str(exc)) from exc
         except MCPToolError:
             raise
@@ -789,7 +847,12 @@ class MCPAdapter:
             task = self.store.get_task(_required_text(args, "task_id"))
             if task is None:
                 raise MCPToolError(f"task does not exist: {args.get('task_id')}")
-            return _task_dict(task)
+            return _task_dict(
+                task,
+                cancel_requested=(
+                    self.store.get_cancellation_request(task.task_id) is not None
+                ),
+            )
         if name == "get_task_events":
             task_id = _required_text(args, "task_id")
             if self.store.get_task(task_id) is None:
@@ -860,12 +923,37 @@ class MCPAdapter:
         if name == "run_task":
             task_id = _required_text(args, "task_id")
             dispatch = self.core.request_execution(task_id)
-            result = _task_dict(dispatch.task)
+            result = _task_dict(
+                dispatch.task,
+                cancel_requested=(
+                    self.store.get_cancellation_request(dispatch.task.task_id)
+                    is not None
+                ),
+            )
             result.update(
                 {
                     "accepted": dispatch.accepted,
                     "already_requested": dispatch.already_requested,
                     "request_id": dispatch.request_id,
+                }
+            )
+            return result
+        if name == "cancel_task":
+            task_id = _required_text(args, "task_id")
+            dispatch = self.core.request_cancellation(task_id)
+            result = _task_dict(
+                dispatch.task,
+                cancel_requested=(
+                    self.store.get_cancellation_request(dispatch.task.task_id)
+                    is not None
+                ),
+            )
+            result.update(
+                {
+                    "accepted": dispatch.accepted,
+                    "already_requested": dispatch.already_requested,
+                    "request_id": dispatch.request_id,
+                    "terminal": dispatch.terminal,
                 }
             )
             return result

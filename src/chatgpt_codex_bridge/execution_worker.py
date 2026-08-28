@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Mapping
 from pathlib import Path
 import json
 import os
@@ -21,7 +22,11 @@ from .domain.models import (
     timestamp_to_text,
     utc_now,
 )
-from .persistence.sqlite_store import SQLiteBridgeStore
+from .persistence.sqlite_store import (
+    CANCELLATION_INTERRUPT_FAILED_EVENT,
+    CANCELLATION_INTERRUPT_SENT_EVENT,
+    SQLiteBridgeStore,
+)
 from .single_instance import (
     ExecutionWorkerAlreadyRunningError,
     ExecutionWorkerLock,
@@ -182,6 +187,155 @@ class ExecutionWorker:
             # Core may have persisted the terminal transition concurrently.
             pass
 
+    def _claim_belongs_to_worker(self, task_id: str) -> bool:
+        claim = self.store.get_execution_claim(task_id)
+        payload = claim.payload if claim is not None else None
+        return (
+            isinstance(payload, Mapping)
+            and payload.get("owner_kind") == "persistent_worker"
+            and payload.get("owner_id") == self.worker_id
+            and payload.get("pid") == self.pid
+        )
+
+    def _turn_terminal_evidence_exists(self, task_id: str) -> bool:
+        """Return true when this task already has a durable terminal turn event."""
+
+        terminal_events = self.store.get_latest_task_events(
+            task_id,
+            (
+                "turn/completed",
+                "turn/failed",
+                "turn/interrupted",
+                "turn/cancelled",
+                "turn/aborted",
+            ),
+        )
+        return any(event.source == "codex" for event in terminal_events)
+
+    async def _observe_cancellation(self, task_id: str) -> None:
+        """Observe one durable H3 request while the owned task is executing."""
+
+        request = self.store.get_cancellation_request(task_id)
+        if request is None:
+            return
+        if (
+            self.store.get_cancellation_interrupt_sent(task_id) is not None
+            or self.store.get_cancellation_interrupt_failure(task_id) is not None
+        ):
+            return
+        task = self.store.get_task(task_id)
+        if (
+            task is None
+            or task.execution_status is not ExecutionStatus.RUNNING
+            or self._active_task_id != task_id
+            or not self._claim_belongs_to_worker(task_id)
+            or not isinstance(task.thread_id, str)
+            or not task.thread_id.strip()
+            or not isinstance(task.turn_id, str)
+            or not task.turn_id.strip()
+        ):
+            # Missing or stale correlation is deliberately not an interrupt
+            # target.  The request remains durable for a later observation.
+            return
+
+        if self._turn_terminal_evidence_exists(task_id):
+            # The executor may still be unwinding after it persisted a terminal
+            # turn notification.  A late interrupt would target a turn that has
+            # already finished (or was already interrupted), so let Core win
+            # the terminal race instead.
+            return
+
+        thread_id = task.thread_id
+        turn_id = task.turn_id
+        request_id = (
+            request.payload.get("request_id")
+            if isinstance(request.payload, Mapping)
+            else None
+        )
+        self._write_state("stopping", active_task_id=task_id)
+        try:
+            sent = await asyncio.wait_for(
+                self.core._cancel_active_execution(  # noqa: SLF001
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                ),
+                timeout=self.cancel_timeout,
+            )
+        except asyncio.TimeoutError as error:
+            self.store.append_task_event(
+                task_id,
+                "bridge",
+                CANCELLATION_INTERRUPT_FAILED_EVENT,
+                {
+                    "request_id": request_id,
+                    "error_type": type(error).__name__,
+                    "message": "executor interrupt timed out",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                },
+            )
+            return
+        except Exception as error:
+            self.store.append_task_event(
+                task_id,
+                "bridge",
+                CANCELLATION_INTERRUPT_FAILED_EVENT,
+                {
+                    "request_id": request_id,
+                    "error_type": type(error).__name__,
+                    "message": str(error)[:500],
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                },
+            )
+            return
+
+        if sent:
+            self.store.append_task_event(
+                task_id,
+                "bridge",
+                CANCELLATION_INTERRUPT_SENT_EVENT,
+                {
+                    "request_id": request_id,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "owner_kind": "persistent_worker",
+                    "owner_id": self.worker_id,
+                    "pid": self.pid,
+                },
+            )
+        else:
+            self.store.append_task_event(
+                task_id,
+                "bridge",
+                CANCELLATION_INTERRUPT_FAILED_EVENT,
+                {
+                    "request_id": request_id,
+                    "error_type": "InterruptNotAccepted",
+                    "message": "executor did not accept the interrupt",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                },
+            )
+
+    async def _execute_claimed_with_observation(self, task_id: str) -> Task:
+        """Run a claimed task while cheaply observing durable cancellation."""
+
+        execution_task = asyncio.create_task(
+            self.core.execute_claimed_task(task_id)
+        )
+        try:
+            while not execution_task.done():
+                await self._observe_cancellation(task_id)
+                if execution_task.done():
+                    break
+                await asyncio.sleep(self.poll_interval)
+            return await execution_task
+        except asyncio.CancelledError:
+            if not execution_task.done():
+                await self._cancel_execution_task(execution_task)
+            raise
+
     def claim_next(self) -> Task | None:
         """Atomically claim the oldest explicit request, if one is ready."""
 
@@ -210,7 +364,7 @@ class ExecutionWorker:
             self._write_state("idle")
             return None
         try:
-            await self.core.execute_claimed_task(claimed.task_id)
+            await self._execute_claimed_with_observation(claimed.task_id)
             return self.store.get_task(claimed.task_id)
         except asyncio.CancelledError:
             self._ensure_cancelled(

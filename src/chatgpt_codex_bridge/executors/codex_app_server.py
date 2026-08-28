@@ -184,11 +184,13 @@ class CloseResult:
 
 
 class CodexAppServerClient:
-    """Sequential JSON-line client for the small 1B app-server surface.
+    """JSON-line client for the small 1B app-server surface.
 
     ``request_timeout`` is a total deadline for one short RPC request.
     ``turn_timeout`` is an inactivity timeout between messages while waiting
-    for one turn; it is intentionally not a total deadline for the turn.
+    for one turn; it is intentionally not a total deadline for the turn. A
+    single turn reader also demultiplexes control-request responses such as
+    ``turn/interrupt``.
     """
 
     def __init__(
@@ -224,6 +226,12 @@ class CodexAppServerClient:
         # Each queued notification carries an explicit marker indicating that
         # it was already observed when it first arrived in request().
         self._pending_notifications: Deque[tuple[JsonObject, bool]] = deque(maxlen=16)
+        # A turn completion reader remains active while a control request such
+        # as turn/interrupt is sent.  Its response is demultiplexed here so a
+        # second coroutine never reads the same StreamReader concurrently.
+        self._turn_waiting = False
+        self._pending_response_futures: dict[int, asyncio.Future[JsonObject]] = {}
+        self._orphan_response_ids: set[int] = set()
         self._stderr_task: asyncio.Task[None] | None = None
 
     def set_notification_observer(
@@ -358,30 +366,70 @@ class CodexAppServerClient:
         """Send one request and correlate its response while recording events."""
 
         loop = asyncio.get_running_loop()
+        if self._turn_waiting:
+            request_id = self._next_request_id
+            response_future: asyncio.Future[JsonObject] = loop.create_future()
+            self._pending_response_futures[request_id] = response_future
+            try:
+                written_id = await self._write_request(method, params)
+                if written_id != request_id:
+                    raise ProtocolError("app-server request ID allocation drifted")
+                return await asyncio.wait_for(
+                    response_future, timeout=self.request_timeout
+                )
+            except asyncio.TimeoutError as exc:
+                self._orphan_response_ids.add(request_id)
+                raise AppServerError(
+                    f"timed out waiting for response to {method}"
+                ) from exc
+            except asyncio.CancelledError:
+                # The worker's bounded cancel timeout can cancel this waiter
+                # while the app-server still emits its response. Preserve the
+                # request ID so the active turn reader can discard that late
+                # response safely.
+                self._orphan_response_ids.add(request_id)
+                raise
+            finally:
+                self._pending_response_futures.pop(request_id, None)
+                if not response_future.done():
+                    response_future.cancel()
+
         deadline = loop.time() + self.request_timeout
         request_id = await self._write_request(method, params)
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise AppServerError(f"timed out waiting for response to {method}")
-            # A request deadline is shared by every read. Notifications do not
-            # restart the full request timeout.
-            message = await self._read_message(timeout=remaining)
-            kind = classify_message(message)
-            if kind == "response":
-                if is_response_for(message, request_id):
-                    if "error" in message:
-                        raise ProtocolError(f"app-server returned an error for {method}")
-                    return message
-                raise ProtocolError(
-                    f"unexpected app-server response id={message.get('id')!r} "
-                    f"while waiting for {method} id={request_id}"
-                )
-            if kind == "server_request":
-                self._reject_server_request(message)
-            self._record_notification(message)
-            if message.get("method") == "turn/completed":
-                self._pending_notifications.append((message, True))
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise AppServerError(f"timed out waiting for response to {method}")
+                # A request deadline is shared by every read. Notifications do not
+                # restart the full request timeout.
+                message = await self._read_message(timeout=remaining)
+                kind = classify_message(message)
+                if kind == "response":
+                    if is_response_for(message, request_id):
+                        if "error" in message:
+                            raise ProtocolError(f"app-server returned an error for {method}")
+                        return message
+                    response_id = message.get("id")
+                    if (
+                        isinstance(response_id, int)
+                        and not isinstance(response_id, bool)
+                        and response_id in self._orphan_response_ids
+                    ):
+                        self._orphan_response_ids.discard(response_id)
+                        continue
+                    raise ProtocolError(
+                        f"unexpected app-server response id={message.get('id')!r} "
+                        f"while waiting for {method} id={request_id}"
+                    )
+                if kind == "server_request":
+                    self._reject_server_request(message)
+                self._record_notification(message)
+                if message.get("method") == "turn/completed":
+                    self._pending_notifications.append((message, True))
+        except asyncio.CancelledError:
+            self._orphan_response_ids.add(request_id)
+            raise
 
     async def initialize(self) -> JsonObject:
         return await self.request(
@@ -475,10 +523,17 @@ class CodexAppServerClient:
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if not isinstance(turn_id, str):
             raise ProtocolError("turn/start response did not contain a turn ID")
-        if on_turn_started is not None:
-            on_turn_started(turn_id)
-        completed = await self.wait_for_turn_completed(thread_id, turn_id)
-        return response, completed
+        # Publish the turn-waiting state before the callback exposes the
+        # correlation to another coroutine that may issue turn/interrupt.
+        self._turn_waiting = True
+        try:
+            if on_turn_started is not None:
+                on_turn_started(turn_id)
+            completed = await self.wait_for_turn_completed(thread_id, turn_id)
+            return response, completed
+        finally:
+            if not self._pending_response_futures:
+                self._turn_waiting = False
 
     async def turn_interrupt(self, *, thread_id: str, turn_id: str) -> JsonObject:
         """Request interruption of one active turn without auto-approving anything."""
@@ -502,35 +557,86 @@ class CodexAppServerClient:
         turn that continues to emit messages.
         """
 
-        while True:
-            pending = self._pending_notifications.popleft() if self._pending_notifications else None
-            if pending is None:
-                message = await self._read_message(
-                    timeout=self.turn_timeout if timeout is None else timeout
-                )
-                message_already_observed = False
-            else:
-                message, message_already_observed = pending
-            kind = classify_message(message)
-            if kind == "response":
-                raise ProtocolError(
-                    f"unexpected app-server response id={message.get('id')!r} "
-                    f"while waiting for turn/completed id={turn_id}"
-                )
-            if kind == "server_request":
-                self._reject_server_request(message)
-            if not message_already_observed:
-                self._record_notification(message)
-            if message.get("method") != "turn/completed":
-                continue
-            params = message.get("params")
-            if not isinstance(params, dict):
-                continue
-            if params.get("threadId") != thread_id:
-                continue
-            completed_turn = params.get("turn")
-            if isinstance(completed_turn, dict) and completed_turn.get("id") == turn_id:
-                return message
+        self._turn_waiting = True
+        terminal_status: str | None = None
+        try:
+            while True:
+                pending = self._pending_notifications.popleft() if self._pending_notifications else None
+                if pending is None:
+                    message = await self._read_message(
+                        timeout=self.turn_timeout if timeout is None else timeout
+                    )
+                    message_already_observed = False
+                else:
+                    message, message_already_observed = pending
+                kind = classify_message(message)
+                if kind == "response":
+                    response_id = message.get("id")
+                    response_future = (
+                        self._pending_response_futures.pop(response_id, None)
+                        if isinstance(response_id, int) and not isinstance(response_id, bool)
+                        else None
+                    )
+                    if response_future is not None:
+                        if "error" in message:
+                            if not response_future.done():
+                                response_future.set_exception(
+                                    ProtocolError(
+                                        "app-server returned an error for control request"
+                                    )
+                                )
+                        elif not response_future.done():
+                            response_future.set_result(message)
+                        continue
+                    if (
+                        isinstance(response_id, int)
+                        and not isinstance(response_id, bool)
+                        and response_id in self._orphan_response_ids
+                    ):
+                        self._orphan_response_ids.discard(response_id)
+                        continue
+                    raise ProtocolError(
+                        f"unexpected app-server response id={message.get('id')!r} "
+                        f"while waiting for turn/completed id={turn_id}"
+                    )
+                if kind == "server_request":
+                    self._reject_server_request(message)
+                if not message_already_observed:
+                    self._record_notification(message)
+                if message.get("method") != "turn/completed":
+                    continue
+                params = message.get("params")
+                if not isinstance(params, dict):
+                    continue
+                if params.get("threadId") != thread_id:
+                    continue
+                completed_turn = params.get("turn")
+                if isinstance(completed_turn, dict) and completed_turn.get("id") == turn_id:
+                    status = completed_turn.get("status")
+                    terminal_status = status if isinstance(status, str) else None
+                    return message
+        finally:
+            self._turn_waiting = False
+            pending_response_ids = tuple(self._pending_response_futures)
+            pending_responses = tuple(self._pending_response_futures.values())
+            self._pending_response_futures.clear()
+            for response_future in pending_responses:
+                if not response_future.done():
+                    if terminal_status in {
+                        "interrupted",
+                        "cancelled",
+                        "canceled",
+                        "aborted",
+                    }:
+                        response_future.set_result({"result": {}})
+                    else:
+                        response_future.set_exception(
+                            AppServerError("turn wait ended before control response")
+                        )
+            # A control response can arrive after the turn terminal event. It
+            # must be consumed as an orphan by the next request instead of
+            # being mistaken for an unrelated JSON-RPC response.
+            self._orphan_response_ids.update(pending_response_ids)
 
     async def close(self) -> CloseResult:
         """Close stdin, wait, and kill only this client-owned process on timeout."""

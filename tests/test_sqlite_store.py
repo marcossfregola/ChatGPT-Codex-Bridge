@@ -72,6 +72,8 @@ from chatgpt_codex_bridge.domain.models import (  # noqa: E402
 )
 from chatgpt_codex_bridge.persistence import sqlite_store as sqlite_store_module  # noqa: E402
 from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
+    CANCELLATION_REQUEST_EVENT,
+    D3_H3_CONTRACT,
     D3_R2_CONTRACT,
     EXECUTION_CLAIM_EVENT,
     EXECUTION_REQUEST_EVENT,
@@ -317,6 +319,66 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             self.assertEqual(
                 [event.kind for event in store.list_task_events("task-1")],
                 [EXECUTION_REQUEST_EVENT, EXECUTION_CLAIM_EVENT, "task.started"],
+            )
+            store.close()
+
+    def test_d3_h3_queued_cancellation_is_atomic_and_idempotent(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "cancel.sqlite3")
+            payload = {
+                "contract": D3_H3_CONTRACT,
+                "requested_via": "cancel_task",
+                "request_id": "cancel-1",
+                "requested_at": "2026-08-27T00:00:00Z",
+                "requested_by": "mcp",
+            }
+
+            first_task, first_event, first_created = store.request_task_cancellation(
+                "task-1", payload
+            )
+            second_task, second_event, second_created = store.request_task_cancellation(
+                "task-1", {**payload, "request_id": "cancel-2"}
+            )
+
+            self.assertEqual(first_task.execution_status, ExecutionStatus.CANCELLED)
+            self.assertTrue(first_created)
+            self.assertFalse(second_created)
+            self.assertEqual(first_event, second_event)
+            self.assertEqual(second_task, first_task)
+            self.assertEqual(
+                [event.kind for event in store.list_task_events("task-1")],
+                [CANCELLATION_REQUEST_EVENT, "task.cancelled"],
+            )
+            self.assertIsNotNone(store.get_cancellation_request("task-1"))
+            store.close()
+
+    def test_d3_h3_running_cancellation_only_records_one_request(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "cancel-running.sqlite3")
+            store.transition_task_running("task-1", project_id="project-1")
+            payload = {
+                "contract": D3_H3_CONTRACT,
+                "requested_via": "cancel_task",
+                "request_id": "cancel-1",
+                "requested_at": "2026-08-27T00:00:00Z",
+                "requested_by": "mcp",
+            }
+
+            first_task, first_event, first_created = store.request_task_cancellation(
+                "task-1", payload
+            )
+            second_task, second_event, second_created = store.request_task_cancellation(
+                "task-1", {**payload, "request_id": "cancel-2"}
+            )
+
+            self.assertEqual(first_task.execution_status, ExecutionStatus.RUNNING)
+            self.assertEqual(second_task.execution_status, ExecutionStatus.RUNNING)
+            self.assertTrue(first_created)
+            self.assertFalse(second_created)
+            self.assertEqual(first_event, second_event)
+            self.assertEqual(
+                [event.kind for event in store.list_task_events("task-1")],
+                ["task.started", CANCELLATION_REQUEST_EVENT],
             )
             store.close()
 

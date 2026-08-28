@@ -64,6 +64,138 @@ class BlockingCancelableExecutor(FakeExecutor):
         return True
 
 
+class ControlledCancellationExecutor(FakeExecutor):
+    def __init__(
+        self,
+        *,
+        accept_interrupt: bool = True,
+        publish_turn: bool = True,
+    ) -> None:
+        super().__init__()
+        self.accept_interrupt = accept_interrupt
+        self.publish_turn = publish_turn
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.interrupt_called = asyncio.Event()
+        self.interrupts: list[tuple[str | None, str | None]] = []
+        self.cancel_requested = False
+
+    async def run(self, request, *, on_correlation=None, on_notification=None):
+        self.requests.append(request)
+        if on_correlation is not None:
+            on_correlation(
+                "cancel-thread", "cancel-turn" if self.publish_turn else None
+            )
+        self.started.set()
+        await self.release.wait()
+        status = (
+            ExecutionStatus.CANCELLED
+            if self.cancel_requested
+            else ExecutionStatus.FINISHED
+        )
+        if on_notification is not None:
+            on_notification(
+                "turn/completed",
+                {
+                    "threadId": "cancel-thread",
+                    "turn": {"id": "cancel-turn", "status": status.value.lower()},
+                },
+            )
+        return ExecutionResult(
+            thread_id="cancel-thread",
+            turn_id="cancel-turn",
+            status=status,
+            final_response=None if status is ExecutionStatus.CANCELLED else "WORKER_OK",
+        )
+
+    async def cancel_active(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        self.interrupts.append((thread_id, turn_id))
+        self.interrupt_called.set()
+        if not self.accept_interrupt:
+            return False
+        self.cancel_requested = True
+        self.release.set()
+        return True
+
+
+class NaturalFinishRaceExecutor(FakeExecutor):
+    """Publish turn completion before returning so cancellation races are deterministic."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.completion_persisted = asyncio.Event()
+        self.release_return = asyncio.Event()
+        self.interrupts: list[tuple[str | None, str | None]] = []
+
+    async def run(self, request, *, on_correlation=None, on_notification=None):
+        self.requests.append(request)
+        if on_correlation is not None:
+            on_correlation("race-thread", "race-turn")
+        self.started.set()
+        if on_notification is not None:
+            on_notification(
+                "turn/completed",
+                {
+                    "threadId": "race-thread",
+                    "turn": {"id": "race-turn", "status": "completed"},
+                },
+            )
+        self.completion_persisted.set()
+        await self.release_return.wait()
+        return ExecutionResult(
+            thread_id="race-thread",
+            turn_id="race-turn",
+            status=ExecutionStatus.FINISHED,
+            final_response="NATURAL_FINISH",
+        )
+
+    async def cancel_active(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        self.interrupts.append((thread_id, turn_id))
+        return True
+
+
+class UnconfirmedCancellationExecutor(ControlledCancellationExecutor):
+    """Return CANCELLED without any interrupt/turn evidence."""
+
+    def __init__(self) -> None:
+        super().__init__(accept_interrupt=False)
+
+    async def cancel_active(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        self.interrupts.append((thread_id, turn_id))
+        self.interrupt_called.set()
+        self.release.set()
+        return False
+
+    async def run(self, request, *, on_correlation=None, on_notification=None):
+        self.requests.append(request)
+        if on_correlation is not None:
+            on_correlation("unconfirmed-thread", "unconfirmed-turn")
+        self.started.set()
+        await self.release.wait()
+        return ExecutionResult(
+            thread_id="unconfirmed-thread",
+            turn_id="unconfirmed-turn",
+            status=ExecutionStatus.CANCELLED,
+            final_response=None,
+        )
+
+
 class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -377,6 +509,216 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(state)
         assert state is not None
         self.assertEqual(state["status"], "stopped")
+
+    async def test_h3_running_cancel_interrupts_exact_turn_and_confirms_cancelled(self) -> None:
+        executor = ControlledCancellationExecutor()
+        self.executor = executor
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self.create_task("task-h3-running")
+        await self.adapter.call_tool("run_task", {"task_id": "task-h3-running"})
+
+        worker = ExecutionWorker(
+            self.store,
+            self.core,
+            worker_id="worker-h3",
+            pid=54321,
+            poll_interval=0.01,
+            cancel_timeout=0.5,
+        )
+        running = asyncio.create_task(worker.run_once())
+        await asyncio.wait_for(executor.started.wait(), timeout=2)
+
+        requested = await self.adapter.call_tool(
+            "cancel_task", {"task_id": "task-h3-running"}
+        )
+        result = await asyncio.wait_for(running, timeout=3)
+
+        self.assertTrue(requested["accepted"])
+        self.assertFalse(requested["terminal"])
+        self.assertTrue(requested["cancel_requested"])
+        self.assertEqual(executor.interrupts, [("cancel-thread", "cancel-turn")])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.execution_status, ExecutionStatus.CANCELLED)
+        self.assertEqual(
+            [event.kind for event in self.store.list_task_events("task-h3-running")],
+            [
+                "task.created",
+                "task.execution_requested",
+                "task.execution_claimed",
+                "task.started",
+                "task.cancel_requested",
+                "task.cancel_interrupt_sent",
+                "turn/completed",
+                "task.cancelled",
+            ],
+        )
+        durable_result = await self.adapter.call_tool(
+            "get_result", {"task_id": "task-h3-running"}
+        )
+        self.assertEqual(
+            durable_result["execution_status"], ExecutionStatus.CANCELLED.value
+        )
+        self.assertTrue(durable_result["cancel_confirmed"])
+        self.assertFalse(durable_result["policy_violation"])
+
+    async def test_h3_missing_turn_does_not_issue_an_interrupt(self) -> None:
+        executor = ControlledCancellationExecutor(publish_turn=False)
+        self.executor = executor
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self.create_task("task-h3-missing-turn")
+        await self.adapter.call_tool(
+            "run_task", {"task_id": "task-h3-missing-turn"}
+        )
+        worker = ExecutionWorker(
+            self.store,
+            self.core,
+            worker_id="worker-h3-missing",
+            pid=54322,
+            poll_interval=0.01,
+            cancel_timeout=0.5,
+        )
+        running = asyncio.create_task(worker.run_once())
+        await asyncio.wait_for(executor.started.wait(), timeout=2)
+
+        requested = await self.adapter.call_tool(
+            "cancel_task", {"task_id": "task-h3-missing-turn"}
+        )
+        await asyncio.sleep(0.05)
+        self.assertTrue(requested["cancel_requested"])
+        self.assertEqual(executor.interrupts, [])
+        executor.release.set()
+        result = await asyncio.wait_for(running, timeout=3)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+
+    async def test_h3_interrupt_failure_does_not_fake_cancelled(self) -> None:
+        executor = ControlledCancellationExecutor(accept_interrupt=False)
+        self.executor = executor
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self.create_task("task-h3-failure")
+        await self.adapter.call_tool("run_task", {"task_id": "task-h3-failure"})
+        worker = ExecutionWorker(
+            self.store,
+            self.core,
+            worker_id="worker-h3-failure",
+            pid=54323,
+            poll_interval=0.01,
+            cancel_timeout=0.5,
+        )
+        running = asyncio.create_task(worker.run_once())
+        await asyncio.wait_for(executor.started.wait(), timeout=2)
+        await self.adapter.call_tool("cancel_task", {"task_id": "task-h3-failure"})
+        await asyncio.wait_for(executor.interrupt_called.wait(), timeout=2)
+        executor.release.set()
+        result = await asyncio.wait_for(running, timeout=3)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in self.store.list_task_events("task-h3-failure")
+                    if event.kind == "task.cancelled"
+                ]
+            ),
+            0,
+        )
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in self.store.list_task_events("task-h3-failure")
+                    if event.kind == "task.cancel_interrupt_failed"
+                ]
+            ),
+            1,
+        )
+
+    async def test_h3_natural_finish_wins_before_late_interrupt(self) -> None:
+        executor = NaturalFinishRaceExecutor()
+        self.executor = executor
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self.create_task("task-h3-natural-race")
+        await self.adapter.call_tool("run_task", {"task_id": "task-h3-natural-race"})
+
+        worker = ExecutionWorker(
+            self.store,
+            self.core,
+            worker_id="worker-h3-race",
+            pid=54324,
+            poll_interval=0.01,
+            cancel_timeout=0.5,
+        )
+        running = asyncio.create_task(worker.run_once())
+        await asyncio.wait_for(executor.started.wait(), timeout=2)
+        await asyncio.wait_for(executor.completion_persisted.wait(), timeout=2)
+
+        requested = await self.adapter.call_tool(
+            "cancel_task", {"task_id": "task-h3-natural-race"}
+        )
+        self.assertTrue(requested["accepted"])
+        self.assertFalse(requested["terminal"])
+        self.assertEqual(executor.interrupts, [])
+
+        executor.release_return.set()
+        result = await asyncio.wait_for(running, timeout=3)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(executor.interrupts, [])
+        self.assertEqual(
+            [event.kind for event in self.store.list_task_events("task-h3-natural-race")],
+            [
+                "task.created",
+                "task.execution_requested",
+                "task.execution_claimed",
+                "task.started",
+                "turn/completed",
+                "task.cancel_requested",
+                "task.finished",
+            ],
+        )
+
+    async def test_h3_unconfirmed_cancelled_result_is_not_terminal_cancel(self) -> None:
+        executor = UnconfirmedCancellationExecutor()
+        self.executor = executor
+        self.core = BridgeCore(self.store, executor)
+        self.adapter = MCPAdapter(self.core, self.store)
+        self.create_task("task-h3-unconfirmed")
+        await self.adapter.call_tool("run_task", {"task_id": "task-h3-unconfirmed"})
+
+        worker = ExecutionWorker(
+            self.store,
+            self.core,
+            worker_id="worker-h3-unconfirmed",
+            pid=54325,
+            poll_interval=0.01,
+            cancel_timeout=0.5,
+        )
+        running = asyncio.create_task(worker.run_once())
+        await asyncio.wait_for(executor.started.wait(), timeout=2)
+        await self.adapter.call_tool(
+            "cancel_task", {"task_id": "task-h3-unconfirmed"}
+        )
+        await asyncio.wait_for(executor.interrupt_called.wait(), timeout=2)
+        with self.assertRaises(RuntimeError):
+            await asyncio.wait_for(running, timeout=3)
+
+        task = self.store.get_task("task-h3-unconfirmed")
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task.execution_status, ExecutionStatus.FAILED)
+        kinds = [event.kind for event in self.store.list_task_events("task-h3-unconfirmed")]
+        self.assertNotIn("task.cancelled", kinds)
+        self.assertIn("task.cancel_interrupt_failed", kinds)
 
     @staticmethod
     def _git(repo: Path, *args: str) -> str:

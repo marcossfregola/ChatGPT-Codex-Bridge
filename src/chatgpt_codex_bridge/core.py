@@ -44,7 +44,11 @@ from .policy import (
     git_preflight,
     postflight_payload,
 )
-from .persistence.sqlite_store import D3_R2_CONTRACT, SQLiteBridgeStore
+from .persistence.sqlite_store import (
+    D3_H3_CONTRACT,
+    D3_R2_CONTRACT,
+    SQLiteBridgeStore,
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,17 @@ class ExecutionDispatch:
     request_id: str | None
     accepted: bool
     already_requested: bool
+
+
+@dataclass(frozen=True)
+class CancellationDispatch:
+    """Durable acceptance returned by the cancellation boundary."""
+
+    task: Task
+    request_id: str | None
+    accepted: bool
+    already_requested: bool
+    terminal: bool
 
 
 _MAX_NOTIFICATION_DEPTH = 4
@@ -336,6 +351,114 @@ class BridgeCore:
         # observable but never relaunchable.
         return self._dispatch_for_nonqueued_task(task)
 
+    def request_cancellation(self, task_id: str) -> CancellationDispatch:
+        """Durably request one safe cancellation for a queued/running task."""
+
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        original_status = task.execution_status
+        request_id = str(uuid.uuid4())
+        requested_at = timestamp_to_text(utc_now())
+        updated, event, created = self.store.request_task_cancellation(
+            task_id,
+            {
+                "contract": D3_H3_CONTRACT,
+                "requested_via": "cancel_task",
+                "request_id": request_id,
+                "requested_at": requested_at,
+                "requested_by": "mcp",
+            },
+        )
+        durable_request_id = self._request_id_from_event(event)
+        accepted = updated.execution_status is ExecutionStatus.RUNNING or (
+            original_status is ExecutionStatus.QUEUED
+            and created
+            and updated.execution_status is ExecutionStatus.CANCELLED
+        )
+        return CancellationDispatch(
+            task=updated,
+            request_id=durable_request_id,
+            accepted=accepted,
+            already_requested=(not created and event is not None),
+            terminal=updated.execution_status
+            in {
+                ExecutionStatus.FINISHED,
+                ExecutionStatus.FAILED,
+                ExecutionStatus.CANCELLED,
+            },
+        )
+
+    def _has_cancellation_confirmation(
+        self,
+        task_id: str,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        """Require durable interrupt or Codex terminal-turn evidence."""
+
+        task = self.store.get_task(task_id)
+        expected_thread_id = thread_id or (task.thread_id if task is not None else None)
+        expected_turn_id = turn_id or (task.turn_id if task is not None else None)
+        sent = self.store.get_cancellation_interrupt_sent(task_id)
+        if sent is not None:
+            payload = sent.payload if sent is not None else None
+            if not isinstance(payload, Mapping):
+                return False
+            sent_thread_id = payload.get("thread_id")
+            sent_turn_id = payload.get("turn_id")
+            if (
+                expected_thread_id is not None
+                and sent_thread_id != expected_thread_id
+            ) or (
+                expected_turn_id is not None
+                and sent_turn_id != expected_turn_id
+            ):
+                return False
+            return True
+        terminal_events = self.store.get_latest_task_events(
+            task_id,
+            ("turn/completed", "turn/interrupted", "turn/cancelled", "turn/aborted"),
+        )
+        for event in terminal_events:
+            if event.source != "codex":
+                continue
+            payload = event.payload
+            event_thread_id = event_turn_id = None
+            status: Any = None
+            if isinstance(payload, Mapping):
+                event_thread_id = payload.get("threadId", payload.get("thread_id"))
+                event_turn_id = payload.get("turnId", payload.get("turn_id"))
+                status = payload.get("status")
+                turn = payload.get("turn")
+                if isinstance(turn, Mapping):
+                    if event_turn_id is None:
+                        event_turn_id = turn.get("id")
+                    status = turn.get("status", status)
+                if (
+                    expected_thread_id is not None
+                    and event_thread_id is not None
+                    and event_thread_id != expected_thread_id
+                ) or (
+                    expected_turn_id is not None
+                    and event_turn_id is not None
+                    and event_turn_id != expected_turn_id
+                ):
+                    continue
+            if event.kind in {"turn/interrupted", "turn/cancelled", "turn/aborted"}:
+                return True
+            if not isinstance(payload, Mapping):
+                continue
+            if isinstance(status, str) and status.lower() in {
+                "interrupted",
+                "cancelled",
+                "canceled",
+                "aborted",
+            }:
+                return True
+        return False
+
     def recover_orphaned_tasks(self) -> list[Task]:
         """Fail closed for RUNNING tasks left by an earlier Bridge process."""
 
@@ -538,15 +661,47 @@ class BridgeCore:
         )
         return payload
 
-    async def _cancel_active_execution(self) -> None:
+    async def _cancel_active_execution(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        """Ask the injected executor to interrupt its current operation.
+
+        The optional correlation IDs let a worker pass the durable target
+        without making Core depend on app-server protocol details.  Legacy
+        test/executor implementations with a zero-argument ``cancel_active``
+        remain supported.
+        """
+
         if self.executor is None:
-            return
+            return False
         cancel_active = getattr(self.executor, "cancel_active", None)
         if not callable(cancel_active):
-            return
-        result = cancel_active()
+            return False
+        kwargs: dict[str, Any] = {}
+        try:
+            parameters = inspect.signature(cancel_active).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "thread_id" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            kwargs["thread_id"] = thread_id
+        if "turn_id" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            kwargs["turn_id"] = turn_id
+        result = cancel_active(**kwargs) if kwargs else cancel_active()
         if inspect.isawaitable(result):
-            await result
+            result = await result
+        # A successful call with no explicit boolean is still evidence that
+        # the executor accepted the dispatch; terminality is decided later by
+        # the executor's confirmed result, never by this return value alone.
+        return result is not False
 
     def _require_executor(self) -> Executor:
         if self.executor is None:
@@ -717,6 +872,38 @@ class BridgeCore:
                 on_correlation=on_correlation,
                 on_notification=on_notification,
             )
+            if result.status is ExecutionStatus.CANCELLED:
+                cancellation = self.store.get_cancellation_request(task_id)
+                if cancellation is None:
+                    raise RuntimeError(
+                        "executor returned CANCELLED without a durable cancellation request"
+                    )
+                if not self._has_cancellation_confirmation(
+                    task_id,
+                    thread_id=result.thread_id,
+                    turn_id=result.turn_id,
+                ):
+                    raise RuntimeError(
+                        "executor returned CANCELLED without interrupt confirmation"
+                    )
+                cancellation_payload: dict[str, Any] = {
+                    "status": ExecutionStatus.CANCELLED.value,
+                    "reason": "cancel request confirmed by executor",
+                    "requested_via": "cancel_task",
+                    "cancel_request_id": self._request_id_from_event(cancellation),
+                    "thread_id": result.thread_id,
+                    "turn_id": result.turn_id,
+                }
+                if result.final_response is not None:
+                    cancellation_payload["final_response"] = _bounded_final_response(
+                        result.final_response
+                    )
+                return self.store.transition_task_terminal(
+                    task_id,
+                    execution_status=ExecutionStatus.CANCELLED,
+                    event_kind="task.cancelled",
+                    payload=cancellation_payload,
+                )
             if result.status != ExecutionStatus.FINISHED:
                 raise RuntimeError(
                     f"executor returned non-finished status: {result.status!r}"
@@ -909,4 +1096,9 @@ class BridgeCore:
         return postflight
 
 
-__all__ = ["BridgeCore", "ExecutionDispatch", "TaskStateError"]
+__all__ = [
+    "BridgeCore",
+    "CancellationDispatch",
+    "ExecutionDispatch",
+    "TaskStateError",
+]

@@ -120,6 +120,14 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
         return await _call_adapter(adapter, "run_task", {"task_id": task_id})
 
     @server.tool(
+        name="cancel_task",
+        description="Request safe, durable cancellation of one queued or running Bridge task.",
+        structured_output=True,
+    )
+    async def cancel_task(task_id: str) -> dict[str, Any]:
+        return await _call_adapter(adapter, "cancel_task", {"task_id": task_id})
+
+    @server.tool(
         name="get_task",
         description="Read one durable Bridge task.",
         structured_output=True,
