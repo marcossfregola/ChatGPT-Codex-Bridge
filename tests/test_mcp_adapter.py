@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 import inspect
+import json
 import os
 from pathlib import Path
 import sys
@@ -39,7 +41,10 @@ from chatgpt_codex_bridge.mcp_server import (  # noqa: E402
     build_server,
     default_db_path,
 )
-from chatgpt_codex_bridge.persistence.sqlite_store import SQLiteBridgeStore  # noqa: E402
+from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
+    D3_R2_CONTRACT,
+    SQLiteBridgeStore,
+)
 
 
 class ImmediateExecutor:
@@ -205,6 +210,587 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.is_error)
         self.assertEqual(result.structured_content["executor"], "codex")
         self.assertIsNone(result.structured_content["active_task"])
+
+    async def test_get_status_queued_preserves_shape_and_reports_no_result(self) -> None:
+        self._create_task()
+
+        result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["execution_status"], ExecutionStatus.QUEUED.value)
+        self.assertEqual(result["last_event_kind"], "task.created")
+        self.assertEqual(result["last_event_at"], result["last_event"]["created_at"])
+        self.assertIsInstance(result["last_event_age_seconds"], float)
+        self.assertGreaterEqual(result["last_event_age_seconds"], 0.0)
+        self.assertFalse(result["result_available"])
+        self.assertFalse(result["approval_pending"])
+        self.assertIsNone(result["turn_status"])
+        self.assertIsNone(result["worker_alive"])
+        self.assertEqual(result["executor_liveness"], "unknown")
+        self.assertTrue(
+            {
+                "bridge_version",
+                "stage",
+                "executor",
+                "active_project",
+                "active_task",
+                "active_task_source",
+                "worker_active",
+                "worker_status",
+                "worker_pid",
+                "worker_owner",
+                "requested_task_id",
+                "running_task_id",
+                "owner",
+                "owner_kind",
+                "owner_id",
+                "pid",
+                "claimed_at",
+                "project_id",
+                "task_id",
+                "model",
+                "execution_status",
+                "audit_status",
+                "thread_id",
+                "turn_id",
+                "last_event",
+            }.issubset(result)
+        )
+
+    async def test_get_status_running_recent_event_reports_objective_activity(self) -> None:
+        self._create_task()
+        task = self.store.transition_task_running(
+            "task-mcp", project_id="project-mcp"
+        )
+        observed_at = datetime(2026, 8, 28, 12, 0, 30, tzinfo=timezone.utc)
+        event_at = observed_at - timedelta(seconds=30)
+        self.store.append_task_event(
+            task.task_id,
+            "codex",
+            "turn/started",
+            {"threadId": "thread-status", "turnId": "turn-status"},
+            created_at=event_at,
+        )
+
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.utc_now", return_value=observed_at
+        ):
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["execution_status"], ExecutionStatus.RUNNING.value)
+        self.assertEqual(result["last_event_kind"], "turn/started")
+        self.assertEqual(result["last_event_at"], "2026-08-28T12:00:00.000000Z")
+        self.assertEqual(result["last_event_age_seconds"], 30.0)
+        self.assertEqual(result["turn_status"], "inProgress")
+        self.assertFalse(result["approval_pending"])
+        self.assertFalse(result["result_available"])
+        self.assertEqual(result["executor_liveness"], "unknown")
+
+    async def test_get_status_running_old_event_shows_age_without_hang_claim(self) -> None:
+        self._create_task()
+        task = self.store.transition_task_running(
+            "task-mcp", project_id="project-mcp"
+        )
+        observed_at = datetime(2026, 8, 28, 12, 5, tzinfo=timezone.utc)
+        event_at = observed_at - timedelta(minutes=5)
+        self.store.append_task_event(
+            task.task_id,
+            "codex",
+            "item/commandExecution/completed",
+            {"itemId": "item-old"},
+            created_at=event_at,
+        )
+
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.utc_now", return_value=observed_at
+        ):
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["execution_status"], ExecutionStatus.RUNNING.value)
+        self.assertEqual(result["last_event_age_seconds"], 300.0)
+        self.assertFalse(result["approval_pending"])
+        self.assertNotIn("stalled", result)
+        self.assertNotIn("hung", result)
+        self.assertNotIn("QUIET", result.values())
+
+    async def test_get_status_worker_alive_requires_owned_live_claim(self) -> None:
+        self._create_task()
+        live_state = {
+            "status": "idle",
+            "owner_kind": "persistent_worker",
+            "worker_id": "worker-status",
+            "pid": os.getpid(),
+        }
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=live_state,
+        ):
+            insufficient = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(insufficient["worker_alive"])
+
+        dead_state = {**live_state, "pid": 99_999_999}
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=dead_state,
+        ):
+            dead = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(dead["worker_alive"])
+
+        invalid_pid_state = {**live_state, "pid": 0}
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=invalid_pid_state,
+        ):
+            invalid = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(invalid["worker_alive"])
+
+        missing_id_state = {
+            key: value for key, value in live_state.items() if key != "worker_id"
+        }
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=missing_id_state,
+        ):
+            missing_id = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(missing_id["worker_alive"])
+
+        stopped_state = {**live_state, "status": "stopped"}
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=stopped_state,
+        ):
+            stopped = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(stopped["worker_alive"])
+
+        for ambiguous_status in ("stopping", "error"):
+            ambiguous_state = {**live_state, "status": ambiguous_status}
+            with patch(
+                "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+                return_value=ambiguous_state,
+            ):
+                ambiguous = await self.adapter.call_tool("get_status", {})
+            self.assertIsNone(ambiguous["worker_alive"])
+
+        self.store.request_task_execution(
+            "task-mcp", {"contract": D3_R2_CONTRACT}
+        )
+        self.store.claim_task_execution(
+            "task-mcp",
+            {
+                "owner_kind": "persistent_worker",
+                "owner_id": "worker-status",
+                "pid": os.getpid(),
+            },
+        )
+        running_state = {
+            **live_state,
+            "status": "running",
+            "active_task_id": "task-mcp",
+        }
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=running_state,
+        ):
+            verified = await self.adapter.call_tool("get_status", {})
+        self.assertTrue(verified["worker_alive"])
+
+        stopped_linked = {
+            **running_state,
+            "status": "stopped",
+            "active_task_id": None,
+        }
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=stopped_linked,
+        ):
+            stopped_linked_result = await self.adapter.call_tool("get_status", {})
+        self.assertFalse(stopped_linked_result["worker_alive"])
+
+        invalid_stopped = {**stopped_linked, "pid": 0}
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=invalid_stopped,
+        ):
+            invalid_stopped_result = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(invalid_stopped_result["worker_alive"])
+
+        mismatched_task = {**running_state, "active_task_id": "another-task"}
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=mismatched_task,
+        ):
+            task_mismatch = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(task_mismatch["worker_alive"])
+
+        mismatched_identity = {**running_state, "worker_id": "different-worker"}
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=mismatched_identity,
+        ):
+            mismatch = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(mismatch["worker_alive"])
+
+        mismatched_pid = {**running_state, "pid": 99_999_999}
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=mismatched_pid,
+        ):
+            pid_mismatch = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(pid_mismatch["worker_alive"])
+
+        with (
+            patch(
+                "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+                return_value=running_state,
+            ),
+            patch.object(self.adapter, "_pid_liveness", return_value=None),
+        ):
+            permission_unknown = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(permission_unknown["worker_alive"])
+
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=None,
+        ):
+            absent = await self.adapter.call_tool("get_status", {})
+        self.assertIsNone(absent["worker_alive"])
+
+    async def test_get_status_worker_dead_pid_requires_matching_claim(self) -> None:
+        self._create_task()
+        self.store.request_task_execution(
+            "task-mcp", {"contract": D3_R2_CONTRACT}
+        )
+        self.store.claim_task_execution(
+            "task-mcp",
+            {
+                "owner_kind": "persistent_worker",
+                "owner_id": "worker-dead",
+                "pid": 99_999_999,
+            },
+        )
+        dead_state = {
+            "status": "running",
+            "owner_kind": "persistent_worker",
+            "worker_id": "worker-dead",
+            "pid": 99_999_999,
+            "active_task_id": "task-mcp",
+        }
+
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=dead_state,
+        ):
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["execution_status"], ExecutionStatus.RUNNING.value)
+        self.assertFalse(result["worker_alive"])
+
+    async def test_get_status_historical_task_does_not_inherit_live_worker(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.FINISHED,
+            event_kind="task.finished",
+            payload={"final_response": "HISTORICAL"},
+        )
+        current_worker_state = {
+            "status": "running",
+            "owner_kind": "persistent_worker",
+            "worker_id": "worker-current",
+            "pid": os.getpid(),
+            "active_task_id": "another-task",
+        }
+
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=current_worker_state,
+        ):
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["active_task_source"], "historical")
+        self.assertIsNone(result["worker_alive"])
+
+    async def test_get_status_historical_task_with_stopped_global_worker_is_unknown(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.FINISHED,
+            event_kind="task.finished",
+            payload={"final_response": "HISTORICAL_STOPPED"},
+        )
+        stopped_worker_state = {
+            "status": "stopped",
+            "owner_kind": "persistent_worker",
+            "worker_id": "worker-current",
+            "pid": os.getpid(),
+            "active_task_id": None,
+        }
+
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+            return_value=stopped_worker_state,
+        ):
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["active_task_source"], "historical")
+        self.assertIsNone(result["worker_alive"])
+
+    async def test_get_status_worker_state_executor_metadata_cannot_override_unknown(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+
+        for declared in ("alive", "dead"):
+            with patch(
+                "chatgpt_codex_bridge.mcp_adapter.read_worker_state",
+                return_value={"executor_liveness": declared},
+            ):
+                result = await self.adapter.call_tool("get_status", {})
+            self.assertEqual(result["executor_liveness"], "unknown")
+
+    async def test_get_status_finished_result_and_turn_are_durable(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "turn/completed",
+            {"turn": {"id": "turn-status", "status": "completed"}},
+        )
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.FINISHED,
+            event_kind="task.finished",
+            payload={"final_response": "STATUS_OK"},
+        )
+
+        result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["execution_status"], ExecutionStatus.FINISHED.value)
+        self.assertEqual(result["last_event_kind"], "task.finished")
+        self.assertTrue(result["result_available"])
+        self.assertEqual(result["turn_status"], "completed")
+        self.assertFalse(result["approval_pending"])
+        self.assertEqual(result["executor_liveness"], "unknown")
+
+    async def test_get_status_terminal_without_result_is_not_available(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.FAILED,
+            event_kind="task.failed",
+            payload={"error_type": "RuntimeError", "message": "failed"},
+        )
+
+        result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["execution_status"], ExecutionStatus.FAILED.value)
+        self.assertFalse(result["result_available"])
+        self.assertFalse(result["approval_pending"])
+        self.assertEqual(result["executor_liveness"], "unknown")
+
+    async def test_get_status_cancelled_without_executor_evidence_is_unknown(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.CANCELLED,
+            event_kind="task.cancelled",
+            payload={"reason": "test"},
+        )
+
+        result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["execution_status"], ExecutionStatus.CANCELLED.value)
+        self.assertEqual(result["executor_liveness"], "unknown")
+
+    async def test_get_status_terminal_executor_uses_objective_pid_probe(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.FINISHED,
+            event_kind="task.finished",
+            payload={"final_response": "STATUS_OK"},
+        )
+        self.executor.last_pid = os.getpid()
+
+        result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["executor_liveness"], "alive")
+
+    async def test_get_status_future_event_age_is_unknown_not_zero(self) -> None:
+        self._create_task()
+        task = self.store.transition_task_running(
+            "task-mcp", project_id="project-mcp"
+        )
+        observed_at = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        future_event_at = observed_at + timedelta(seconds=30)
+        self.store.append_task_event(
+            task.task_id,
+            "codex",
+            "item/agentMessage/delta",
+            {"text": "future"},
+            created_at=future_event_at,
+        )
+
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter.utc_now", return_value=observed_at
+        ):
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["last_event_kind"], "item/agentMessage/delta")
+        self.assertEqual(result["last_event_at"], "2026-08-28T12:00:30.000000Z")
+        self.assertIsNone(result["last_event_age_seconds"])
+
+    async def test_get_status_approval_pending_and_resolution_are_explicit(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "item/fileChange/requestApproval",
+            {
+                "requestId": "approval-1",
+                "threadId": "thread-status",
+                "turnId": "turn-status",
+            },
+        )
+
+        pending = await self.adapter.call_tool("get_status", {})
+        self.assertTrue(pending["approval_pending"])
+
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "item/fileChange/approvalResponse",
+            {"requestId": "approval-1", "decision": "reject"},
+        )
+        resolved = await self.adapter.call_tool("get_status", {})
+        self.assertFalse(resolved["approval_pending"])
+
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "item/commandExecution/requestApproval",
+            {"requestId": "approval-2"},
+        )
+        self.store.transition_task_terminal(
+            "task-mcp",
+            execution_status=ExecutionStatus.FAILED,
+            event_kind="task.failed",
+            payload={"error_type": "ServerRequestError", "message": "rejected"},
+        )
+        terminal = await self.adapter.call_tool("get_status", {})
+        self.assertFalse(terminal["approval_pending"])
+
+    async def test_get_status_waiting_user_requires_explicit_approval_evidence(self) -> None:
+        self._create_task()
+        self.store.connection.execute(
+            "UPDATE tasks SET execution_status = ? WHERE task_id = ?",
+            (ExecutionStatus.WAITING_USER.value, "task-mcp"),
+        )
+        self.store.connection.commit()
+
+        no_evidence = await self.adapter.call_tool("get_status", {})
+        self.assertEqual(
+            no_evidence["execution_status"], ExecutionStatus.WAITING_USER.value
+        )
+        self.assertFalse(no_evidence["approval_pending"])
+
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "approval/requested",
+            {"requestId": "approval-waiting"},
+        )
+        explicit = await self.adapter.call_tool("get_status", {})
+        self.assertTrue(explicit["approval_pending"])
+
+    async def test_get_status_approval_decision_payload_controls_pending_state(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "approval/decision",
+            {"decision": "pending"},
+        )
+        pending = await self.adapter.call_tool("get_status", {})
+        self.assertTrue(pending["approval_pending"])
+
+        self.store.append_task_event(
+            "task-mcp",
+            "codex",
+            "approval/decision",
+            {"decision": "accepted"},
+        )
+        resolved = await self.adapter.call_tool("get_status", {})
+        self.assertFalse(resolved["approval_pending"])
+
+    async def test_get_status_turn_status_tracks_real_turn_events(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.store.append_task_event(
+            "task-mcp", "codex", "turn/started", {"status": "inProgress"}
+        )
+        started = await self.adapter.call_tool("get_status", {})
+        self.assertEqual(started["turn_status"], "inProgress")
+
+        self.store.append_task_event(
+            "task-mcp", "codex", "turn/completed", {"status": "completed"}
+        )
+        completed = await self.adapter.call_tool("get_status", {})
+        self.assertEqual(completed["turn_status"], "completed")
+
+    async def test_get_status_turn_status_tracks_interruption_kinds(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+
+        for kind, expected in (
+            ("turn/failed", "failed"),
+            ("turn/interrupted", "interrupted"),
+            ("turn/cancelled", "interrupted"),
+            ("turn/aborted", "interrupted"),
+        ):
+            self.store.append_task_event("task-mcp", "codex", kind, {})
+            result = await self.adapter.call_tool("get_status", {})
+            self.assertEqual(result["turn_status"], expected)
+
+    async def test_get_status_executor_liveness_is_alive_only_with_process_evidence(self) -> None:
+        self._create_task()
+        self.store.transition_task_running("task-mcp", project_id="project-mcp")
+        self.executor.last_pid = os.getpid()
+        live = await self.adapter.call_tool("get_status", {})
+        self.assertEqual(live["executor_liveness"], "alive")
+
+        self.executor.last_pid = 99_999_999
+        dead = await self.adapter.call_tool("get_status", {})
+        self.assertEqual(dead["executor_liveness"], "dead")
+
+    async def test_official_get_status_serializes_h2_observability_fields(self) -> None:
+        self._create_task()
+
+        async def exercise(session):
+            await session.initialize()
+            return await session.call_tool("get_status", {})
+
+        result = await self._with_official_client(exercise)
+
+        self.assertFalse(result.is_error)
+        self.assertIsInstance(result.structured_content["result_available"], bool)
+        for field in (
+            "last_event_kind",
+            "last_event_at",
+            "last_event_age_seconds",
+            "approval_pending",
+            "turn_status",
+            "worker_alive",
+            "executor_liveness",
+        ):
+            self.assertIn(field, result.structured_content)
+        json.dumps(result.structured_content)
 
     async def test_commit_checkpoint_tool_has_exact_schema(self) -> None:
         async def exercise(session):

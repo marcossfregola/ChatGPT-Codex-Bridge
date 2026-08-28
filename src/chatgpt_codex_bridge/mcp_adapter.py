@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import errno
 import json
+import os
 from typing import Any
 
 from . import BRIDGE_STAGE, __version__
@@ -16,7 +18,14 @@ from .core import (
     _bounded_response_text,
 )
 from .domain.events import TaskEvent
-from .domain.models import ExecutionStatus, Project, Task, TaskMode, timestamp_to_text
+from .domain.models import (
+    ExecutionStatus,
+    Project,
+    Task,
+    TaskMode,
+    timestamp_to_text,
+    utc_now,
+)
 from .execution_worker import read_worker_state
 from .persistence.sqlite_store import SQLiteBridgeStore
 from .policy import PolicyError
@@ -34,6 +43,67 @@ _RESULT_EVENT_KINDS = (
     "policy.git_checkpoint",
     "policy.postflight",
     "policy.violation",
+)
+_TURN_EVENT_KINDS = (
+    "turn/started",
+    "turn/completed",
+    "turn/failed",
+    "turn/interrupted",
+    "turn/cancelled",
+    "turn/aborted",
+    "turn/status/changed",
+)
+_APPROVAL_EVENT_KINDS = (
+    "item/fileChange/requestApproval",
+    "item/commandExecution/requestApproval",
+    "item/permissions/requestApproval",
+    "item/fileChange/approvalResponse",
+    "item/commandExecution/approvalResponse",
+    "approval/requested",
+    "approval/request",
+    "approval/pending",
+    "approval/responded",
+    "approval/response",
+    "approval/resolved",
+    "approval/accepted",
+    "approval/rejected",
+    "approval/denied",
+    "approval/decision",
+    "approval/complete",
+    "server_request",
+)
+_EXECUTOR_LIVENESS_STATUSES = frozenset(
+    {
+        ExecutionStatus.RUNNING,
+        ExecutionStatus.FINISHED,
+        ExecutionStatus.FAILED,
+        ExecutionStatus.CANCELLED,
+    }
+)
+_TURN_STATUS_VALUES = frozenset({"inProgress", "completed", "failed", "interrupted"})
+_TURN_STATUS_BY_KIND = {
+    "turn/started": "inProgress",
+    "turn/completed": "completed",
+    "turn/failed": "failed",
+    "turn/interrupted": "interrupted",
+    "turn/cancelled": "interrupted",
+    "turn/aborted": "interrupted",
+}
+_APPROVAL_REQUEST_MARKERS = (
+    "requestapproval",
+    "approval/requested",
+    "approval/request",
+    "approval/pending",
+)
+_APPROVAL_RESOLUTION_MARKERS = (
+    "approvalresponse",
+    "approval/responded",
+    "approval/response",
+    "approval/resolved",
+    "approval/accepted",
+    "approval/rejected",
+    "approval/denied",
+    "approval/complete",
 )
 
 
@@ -275,6 +345,213 @@ class MCPAdapter:
             )
         return value
 
+    @staticmethod
+    def _pid_liveness(pid: Any) -> bool | None:
+        """Probe one PID without terminating or otherwise changing it."""
+
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return None
+        except OverflowError:
+            return None
+        except OSError as exc:
+            # Windows reports a missing PID as ERROR_INVALID_PARAMETER rather
+            # than ProcessLookupError.  Other errors are deliberately unknown.
+            if exc.errno == errno.ESRCH or getattr(exc, "winerror", None) in {
+                87,
+                1168,
+            }:
+                return False
+            return None
+        return True
+
+    def _worker_liveness(
+        self,
+        worker_state: Mapping[str, Any] | None,
+        claim_owner: Mapping[str, Any] | None = None,
+        *,
+        selected_task_id: str | None = None,
+        active_source: str | None = None,
+    ) -> bool | None:
+        """Return liveness only when the sidecar and current task claim agree.
+
+        A historical or otherwise non-current task has no task-to-worker link,
+        so even a stopped/live global sidecar is inconclusive.  For a current
+        task require the claim to corroborate owner kind, owner ID, and PID;
+        for a running worker also require its active task ID to match.
+        This is current coherent evidence, not cryptographic process identity.
+        """
+
+        if active_source != "running" or not isinstance(selected_task_id, str):
+            return None
+        if not isinstance(worker_state, Mapping):
+            return None
+        status = worker_state.get("status")
+        if status not in {"running", "stopped"}:
+            return None
+        sidecar_task_id = worker_state.get("active_task_id")
+        if sidecar_task_id is not None and sidecar_task_id != selected_task_id:
+            return None
+        if worker_state.get("owner_kind") != "persistent_worker":
+            return None
+        worker_id = worker_state.get("worker_id")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            return None
+        worker_pid = worker_state.get("pid")
+        if (
+            isinstance(worker_pid, bool)
+            or not isinstance(worker_pid, int)
+            or worker_pid <= 0
+        ):
+            return None
+        if not isinstance(claim_owner, Mapping):
+            return None
+        if claim_owner.get("owner_kind") != "persistent_worker":
+            return None
+        if claim_owner.get("owner_id") != worker_id:
+            return None
+        claim_pid = claim_owner.get("pid")
+        if (
+            isinstance(claim_pid, bool)
+            or not isinstance(claim_pid, int)
+            or claim_pid <= 0
+            or claim_pid != worker_pid
+        ):
+            return None
+        if status == "stopped":
+            return False
+        if "active_task_id" not in worker_state or sidecar_task_id != selected_task_id:
+            return None
+        return self._pid_liveness(worker_pid)
+
+    @staticmethod
+    def _normalize_turn_status(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.replace("_", "").replace("-", "").lower()
+        aliases = {
+            "inprogress": "inProgress",
+            "started": "inProgress",
+            "completed": "completed",
+            "failed": "failed",
+            "interrupted": "interrupted",
+            "cancelled": "interrupted",
+            "canceled": "interrupted",
+            "aborted": "interrupted",
+        }
+        status = aliases.get(normalized)
+        return status if status in _TURN_STATUS_VALUES else None
+
+    def _turn_status(self, task_id: str) -> str | None:
+        """Derive only statuses represented by durable turn events."""
+
+        events = self.store.get_latest_task_events(task_id, _TURN_EVENT_KINDS)
+        for event in reversed(events):
+            by_kind = _TURN_STATUS_BY_KIND.get(event.kind)
+            if by_kind is not None:
+                return by_kind
+            payload = event.payload
+            if not isinstance(payload, Mapping):
+                continue
+            status = self._normalize_turn_status(payload.get("status"))
+            if status is None and isinstance(payload.get("turn"), Mapping):
+                status = self._normalize_turn_status(payload["turn"].get("status"))
+            if status is not None:
+                return status
+        return None
+
+    @staticmethod
+    def _approval_event_role(event: TaskEvent) -> str | None:
+        """Classify explicit approval request/resolution evidence only."""
+
+        payload = event.payload
+        method = payload.get("method") if isinstance(payload, Mapping) else None
+        text = event.kind.lower()
+        if isinstance(method, str):
+            text = f"{text} {method.lower()}"
+        if any(marker in text for marker in _APPROVAL_REQUEST_MARKERS):
+            return "requested"
+        if any(marker in text for marker in _APPROVAL_RESOLUTION_MARKERS):
+            return "resolved"
+        if "approval" not in text or not isinstance(payload, Mapping):
+            return None
+        decision = payload.get("decision")
+        if decision is None:
+            decision = payload.get("status")
+        if isinstance(decision, str) and decision.lower() in {
+            "accept",
+            "accepted",
+            "approve",
+            "approved",
+            "deny",
+            "denied",
+            "reject",
+            "rejected",
+            "cancel",
+            "cancelled",
+            "canceled",
+            "resolved",
+            "completed",
+        }:
+            return "resolved"
+        if isinstance(decision, str) and decision.lower() in {
+            "ask",
+            "awaiting",
+            "pending",
+            "requested",
+        }:
+            return "requested"
+        return None
+
+    def _approval_pending(self, task: Task | None) -> bool:
+        """Report true only while explicit, unresolved approval evidence exists."""
+
+        if task is None or task.execution_status not in {
+            ExecutionStatus.RUNNING,
+            ExecutionStatus.WAITING_USER,
+        }:
+            return False
+        events = self.store.get_latest_task_events(task.task_id, _APPROVAL_EVENT_KINDS)
+        pending = False
+        for event in events:
+            role = self._approval_event_role(event)
+            if role == "requested":
+                pending = True
+            elif role == "resolved":
+                pending = False
+        return pending
+
+    def _executor_liveness(
+        self,
+        task: Task | None,
+        worker_state: Mapping[str, Any] | None,
+    ) -> str:
+        """Return an executor process fact, or ``unknown`` without one."""
+
+        if task is None:
+            return "unknown"
+        candidate_pid = (
+            worker_state.get("executor_pid")
+            if isinstance(worker_state, Mapping)
+            else None
+        )
+        if candidate_pid is None:
+            executor = getattr(self.core, "executor", None)
+            candidate_pid = getattr(executor, "last_pid", None)
+        if task.execution_status not in _EXECUTOR_LIVENESS_STATUSES:
+            return "unknown"
+        probe = self._pid_liveness(candidate_pid)
+        if probe is True:
+            return "alive"
+        if probe is False:
+            return "dead"
+        return "unknown"
+
     def _status(self) -> dict[str, Any]:
         worker_state = read_worker_state(self.store.db_path)
         worker_status = (
@@ -384,6 +661,19 @@ class MCPAdapter:
         running_task_id = (
             active_task.task_id if active_source == "running" and active_task else None
         )
+        result_available = (
+            bool(self._result_for_task(active_task)["available"])
+            if active_task is not None
+            else False
+        )
+        last_event_at = (
+            timestamp_to_text(last_event.created_at) if last_event is not None else None
+        )
+        last_event_age_seconds = None
+        if last_event is not None:
+            age_seconds = (utc_now() - last_event.created_at).total_seconds()
+            if age_seconds >= 0:
+                last_event_age_seconds = age_seconds
         return {
             "bridge_version": self.bridge_version,
             "stage": self.stage,
@@ -412,6 +702,23 @@ class MCPAdapter:
             "thread_id": active_task.thread_id if active_task is not None else None,
             "turn_id": active_task.turn_id if active_task is not None else None,
             "last_event": _event_dict(last_event) if last_event is not None else None,
+            "last_event_kind": last_event.kind if last_event is not None else None,
+            "last_event_at": last_event_at,
+            "last_event_age_seconds": last_event_age_seconds,
+            "result_available": result_available,
+            "approval_pending": self._approval_pending(active_task),
+            "turn_status": (
+                self._turn_status(active_task.task_id)
+                if active_task is not None
+                else None
+            ),
+            "worker_alive": self._worker_liveness(
+                worker_state,
+                owner,
+                selected_task_id=active_task.task_id if active_task is not None else None,
+                active_source=active_source,
+            ),
+            "executor_liveness": self._executor_liveness(active_task, worker_state),
         }
 
     async def call_tool(
