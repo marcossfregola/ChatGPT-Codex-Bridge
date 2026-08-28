@@ -142,7 +142,13 @@ def _project_dict(project: Project) -> dict[str, Any]:
     }
 
 
-def _task_dict(task: Task, *, cancel_requested: bool = False) -> dict[str, Any]:
+def _task_dict(
+    task: Task,
+    *,
+    cancel_requested: bool = False,
+    reconciliation_required: bool = False,
+    reconciliation_id: str | None = None,
+) -> dict[str, Any]:
     return {
         "task_id": task.task_id,
         "project_id": task.project_id,
@@ -152,6 +158,8 @@ def _task_dict(task: Task, *, cancel_requested: bool = False) -> dict[str, Any]:
         "mode": task.mode.value,
         "execution_status": task.execution_status.value,
         "cancel_requested": bool(cancel_requested),
+        "reconciliation_required": bool(reconciliation_required),
+        "reconciliation_id": reconciliation_id,
         "audit_status": task.audit_status.value,
         "thread_id": task.thread_id,
         "turn_id": task.turn_id,
@@ -195,6 +203,18 @@ class MCPAdapter:
             tasks.extend(self.store.list_tasks(project.project_id))
         return tasks
 
+    def _task_view(self, task: Task, *, cancel_requested: bool = False) -> dict[str, Any]:
+        reconciliation = self.store.get_reconciliation_state(task.task_id)
+        pending = reconciliation is not None and not reconciliation.get("resolved", False)
+        return _task_dict(
+            task,
+            cancel_requested=cancel_requested,
+            reconciliation_required=pending,
+            reconciliation_id=(
+                reconciliation.get("reconciliation_id") if pending else None
+            )
+        )
+
     def _latest_event(self, task_id: str) -> TaskEvent | None:
         return self.store.get_last_task_event(task_id)
 
@@ -226,6 +246,7 @@ class MCPAdapter:
             checkpoint = {}
         if not isinstance(postflight, dict):
             postflight = {}
+        reconciliation = self.store.get_reconciliation_state(task.task_id)
         cancellation_request = self.store.get_cancellation_request(task.task_id)
         cancellation_request_payload = (
             cancellation_request.payload if cancellation_request is not None else {}
@@ -272,6 +293,15 @@ class MCPAdapter:
                 violation_event is not None
                 or postflight.get("policy_violation", False)
             ),
+            "reconciliation_required": bool(
+                reconciliation is not None and not reconciliation.get("resolved", False)
+            ),
+            "reconciliation_id": (
+                reconciliation.get("reconciliation_id")
+                if reconciliation is not None
+                and not reconciliation.get("resolved", False)
+                else None
+            ),
         }
 
     @staticmethod
@@ -288,13 +318,22 @@ class MCPAdapter:
             "task.cancel_interrupt_sent",
             "task.cancel_interrupt_failed",
             "task.recovered",
+            "task.reconciliation_required",
+            "task.reconciliation_resolved",
             "policy.git_checkpoint",
             "policy.postflight",
             "policy.violation",
             "checkpoint.commit.created",
+            "checkpoint.commit.started",
+            "checkpoint.commit.ref_updated",
+            "checkpoint.commit.failed",
             "thread/started",
             "turn/started",
             "turn/completed",
+            "turn/failed",
+            "turn/interrupted",
+            "turn/cancelled",
+            "turn/aborted",
         }
 
     @staticmethod
@@ -731,7 +770,7 @@ class MCPAdapter:
             "executor": self.executor_name,
             "active_project": _project_dict(project) if project is not None else None,
             "active_task": (
-                _task_dict(active_task, cancel_requested=cancel_requested)
+                self._task_view(active_task, cancel_requested=cancel_requested)
                 if active_task is not None
                 else None
             ),
@@ -842,12 +881,12 @@ class MCPAdapter:
                 task_id=_optional_text(args, "task_id"),
                 mode=mode,
             )
-            return _task_dict(task)
+            return self._task_view(task)
         if name == "get_task":
             task = self.store.get_task(_required_text(args, "task_id"))
             if task is None:
                 raise MCPToolError(f"task does not exist: {args.get('task_id')}")
-            return _task_dict(
+            return self._task_view(
                 task,
                 cancel_requested=(
                     self.store.get_cancellation_request(task.task_id) is not None
@@ -915,6 +954,15 @@ class MCPAdapter:
             if task is None:
                 raise MCPToolError(f"task does not exist: {args.get('task_id')}")
             return self._result_for_task(task)
+        if name == "resolve_task_reconciliation":
+            task_id = _required_text(args, "task_id")
+            reconciliation_id = _required_text(args, "reconciliation_id")
+            resolution = _required_text(args, "resolution")
+            if resolution != ExecutionStatus.FAILED.value:
+                raise MCPToolError("resolution must be FAILED")
+            return self.core.resolve_task_reconciliation(
+                task_id, reconciliation_id, resolution
+            )
         if name == "commit_checkpoint":
             return self.core.commit_checkpoint(
                 _required_text(args, "task_id"),
@@ -923,7 +971,7 @@ class MCPAdapter:
         if name == "run_task":
             task_id = _required_text(args, "task_id")
             dispatch = self.core.request_execution(task_id)
-            result = _task_dict(
+            result = self._task_view(
                 dispatch.task,
                 cancel_requested=(
                     self.store.get_cancellation_request(dispatch.task.task_id)
@@ -941,7 +989,7 @@ class MCPAdapter:
         if name == "cancel_task":
             task_id = _required_text(args, "task_id")
             dispatch = self.core.request_cancellation(task_id)
-            result = _task_dict(
+            result = self._task_view(
                 dispatch.task,
                 cancel_requested=(
                     self.store.get_cancellation_request(dispatch.task.task_id)

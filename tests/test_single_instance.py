@@ -310,10 +310,10 @@ with MCPInstanceLock(db):
             finally:
                 final.close()
             self.assertIsNotNone(task)
-            self.assertEqual(task.execution_status.value, "FAILED")
+            self.assertEqual(task.execution_status.value, "RUNNING")
             self.assertEqual(
                 [event.kind for event in events],
-                ["task.created", "task.started", "task.recovered", "task.failed"],
+                ["task.created", "task.started", "task.reconciliation_required"],
             )
 
 

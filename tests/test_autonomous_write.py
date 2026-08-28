@@ -369,7 +369,7 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["untracked_files"], ["untracked.txt"])
         self.assertFalse(result["policy_violation"])
 
-    def test_orphaned_autonomous_task_attempts_postflight_before_recovery(self) -> None:
+    def test_orphaned_autonomous_task_requires_reconciliation_without_postflight_rerun(self) -> None:
         repo = make_git_repo(self.root)
         executor = ControlledExecutor()
         core, task = self._task(executor, repo)
@@ -393,13 +393,14 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
 
         recovered = core.recover_orphaned_tasks()
 
-        self.assertEqual(recovered[0].execution_status, ExecutionStatus.FAILED)
-        self.assertTrue(
+        self.assertEqual(recovered[0].execution_status, ExecutionStatus.RUNNING)
+        self.assertFalse(
             any(
                 event.kind == "policy.postflight"
                 for event in self.store.list_task_events(task.task_id)
             )
         )
+        self.assertIsNotNone(self.store.get_reconciliation_state(task.task_id))
 
     async def test_mode_is_persisted_and_adapter_accepts_optional_mode(self) -> None:
         repo = make_git_repo(self.root)

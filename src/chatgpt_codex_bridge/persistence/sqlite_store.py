@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 import json
+import hashlib
 import sqlite3
+import uuid
 from typing import Any
 
 from ..domain.events import TaskEvent
@@ -24,6 +27,7 @@ from ..domain.models import (
 
 
 SCHEMA_VERSION = 3
+SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 
 
 class SchemaVersionError(RuntimeError):
@@ -258,6 +262,13 @@ D3_H3_CONTRACT = "D3-H3"
 CANCELLATION_REQUEST_EVENT = "task.cancel_requested"
 CANCELLATION_INTERRUPT_SENT_EVENT = "task.cancel_interrupt_sent"
 CANCELLATION_INTERRUPT_FAILED_EVENT = "task.cancel_interrupt_failed"
+RECONCILIATION_REQUIRED_EVENT = "task.reconciliation_required"
+RECONCILIATION_RESOLVED_EVENT = "task.reconciliation_resolved"
+
+CHECKPOINT_STARTED_EVENT = "checkpoint.commit.started"
+CHECKPOINT_REF_UPDATED_EVENT = "checkpoint.commit.ref_updated"
+CHECKPOINT_CREATED_EVENT = "checkpoint.commit.created"
+CHECKPOINT_FAILED_EVENT = "checkpoint.commit.failed"
 
 
 class SQLiteBridgeStore:
@@ -265,10 +276,15 @@ class SQLiteBridgeStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
-        self._connection: sqlite3.Connection | None = sqlite3.connect(str(self.db_path))
+        self._connection: sqlite3.Connection | None = sqlite3.connect(
+            str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS
+        )
         self._connection.row_factory = sqlite3.Row
         try:
             self._enable_foreign_keys()
+            self._connection.execute(
+                f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}"
+            )
             self._ensure_schema()
         except Exception:
             self.close()
@@ -284,6 +300,55 @@ class SQLiteBridgeStore:
         if self._connection is None:
             raise RuntimeError("SQLiteBridgeStore is closed")
         return self._connection
+
+    @contextmanager
+    def immediate_transaction(self):
+        """Run one bounded SQLite writer transaction.
+
+        ``BEGIN IMMEDIATE`` is intentionally explicit here.  Callers that
+        need to close a Bridge-side race can hold the writer reservation only
+        for the small decision window and rely on this context manager to
+        rollback and release it on every failure path.
+        """
+
+        connection = self._require_connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield connection
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            try:
+                connection.commit()
+            except BaseException:
+                # A failed COMMIT may leave the connection in a writable
+                # transaction (notably under injected crash/fault tests).
+                # Roll it back before the caller retries so the writer lock
+                # cannot leak into the next operation.
+                connection.rollback()
+                raise
+
+    def insert_task_event_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        source: str,
+        kind: str,
+        payload: Any,
+        *,
+        created_at: datetime | None = None,
+    ) -> TaskEvent:
+        """Public transaction-scoped event insertion for Core protocols."""
+
+        return self._insert_task_event_in_transaction(
+            connection,
+            task_id,
+            source,
+            kind,
+            payload,
+            created_at=created_at,
+        )
 
     def _enable_foreign_keys(self) -> None:
         connection = self._require_connection()
@@ -596,6 +661,53 @@ class SQLiteBridgeStore:
             (status.value,),
         ).fetchall()
         return [self._task_from_row(row) for row in rows]
+
+    def latest_task_identity_in_transaction(
+        self, connection: sqlite3.Connection, project_id: str
+    ) -> tuple[str | None, int, int]:
+        """Return latest task id, its creation event id, and non-checkpoint HWM."""
+
+        rows = connection.execute(
+            "SELECT task_id, created_at FROM tasks WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        latest: tuple[tuple[Any, ...], str, int] | None = None
+        high_water = 0
+        for row in rows:
+            task_id = str(row["task_id"])
+            event_rows = connection.execute(
+                "SELECT event_id, kind FROM task_events WHERE task_id = ? ORDER BY event_id",
+                (task_id,),
+            ).fetchall()
+            creation_ids: list[int] = []
+            for event_row in event_rows:
+                event_id = int(event_row["event_id"])
+                kind = str(event_row["kind"])
+                if kind == "task.created":
+                    creation_ids.append(event_id)
+                if not kind.startswith("checkpoint.commit."):
+                    high_water = max(high_water, event_id)
+            creation_id = min(creation_ids) if creation_ids else 0
+            key: tuple[Any, ...]
+            if creation_id:
+                key = (0, creation_id, task_id)
+            else:
+                key = (1, str(row["created_at"]), task_id)
+            if latest is None or key > latest[0]:
+                latest = (key, task_id, creation_id)
+        if latest is None:
+            return None, 0, high_water
+        return latest[1], latest[2], high_water
+
+    def project_task_high_water(
+        self, connection: sqlite3.Connection, project_id: str
+    ) -> int:
+        """Return the maximum non-checkpoint event id for a project."""
+
+        _, _, high_water = self.latest_task_identity_in_transaction(
+            connection, project_id
+        )
+        return high_water
 
     @staticmethod
     def _terminal_event_query() -> str:
@@ -1252,6 +1364,430 @@ class SQLiteBridgeStore:
             )
 
     @staticmethod
+    def _reconciliation_fingerprint(payload: Mapping[str, Any]) -> str:
+        """Return a stable digest for durable reconciliation evidence."""
+
+        def stable(value: Any, *, parent_key: str | None = None) -> Any:
+            if isinstance(value, Mapping):
+                result: dict[str, Any] = {}
+                for key, item in value.items():
+                    key_text = str(key)
+                    # Process identity is deliberately correlation-only.  It
+                    # may change or become unavailable after a crash and must
+                    # never alter the durable reconciliation identity.
+                    if key_text.lower() in {
+                        "pid",
+                        "process_id",
+                        "command_line",
+                        "sidecar",
+                    }:
+                        continue
+                    result[key_text] = stable(item, parent_key=key_text)
+                return result
+            if isinstance(value, (list, tuple)):
+                return [stable(item, parent_key=parent_key) for item in value]
+            return value
+
+        material = stable(
+            {
+                key: value
+                for key, value in payload.items()
+                if key not in {"reconciliation_id", "evidence_fingerprint"}
+            }
+        )
+        encoded = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _reconciliation_state_from_events(
+        cls, events: Iterable[TaskEvent]
+    ) -> dict[str, Any] | None:
+        """Derive the latest pending/resolved reconciliation from the journal."""
+
+        required: TaskEvent | None = None
+        resolved: dict[str, TaskEvent] = {}
+        for event in sorted(events, key=lambda item: item.event_id or 0):
+            payload = event.payload
+            if not isinstance(payload, Mapping):
+                continue
+            reconciliation_id = payload.get("reconciliation_id")
+            if not isinstance(reconciliation_id, str) or not reconciliation_id:
+                continue
+            if event.source != "bridge":
+                continue
+            if event.kind == RECONCILIATION_REQUIRED_EVENT:
+                required = event
+            elif event.kind == RECONCILIATION_RESOLVED_EVENT:
+                resolved[reconciliation_id] = event
+        if required is None:
+            return None
+        required_payload = (
+            dict(required.payload) if isinstance(required.payload, Mapping) else {}
+        )
+        reconciliation_id = required_payload.get("reconciliation_id")
+        if not isinstance(reconciliation_id, str) or not reconciliation_id:
+            return None
+        resolved_event = resolved.get(reconciliation_id)
+        return {
+            "required": True,
+            "resolved": resolved_event is not None,
+            "reconciliation_id": reconciliation_id,
+            "evidence_fingerprint": required_payload.get("evidence_fingerprint"),
+            "required_event_id": required.event_id,
+            "required_event": required,
+            "required_payload": required_payload,
+            "resolved_event": resolved_event,
+        }
+
+    def get_reconciliation_state(self, task_id: str) -> dict[str, Any] | None:
+        """Return the journal-derived reconciliation projection for one task."""
+
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events
+            WHERE task_id = ? AND source = 'bridge'
+              AND kind IN (?, ?)
+            ORDER BY event_id ASC
+            """,
+            (task_id, RECONCILIATION_REQUIRED_EVENT, RECONCILIATION_RESOLVED_EVENT),
+        ).fetchall()
+        return self._reconciliation_state_from_events(
+            [self._event_from_row(row) for row in rows]
+        )
+
+    def ensure_reconciliation_required(
+        self,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[Task, TaskEvent | None, bool]:
+        """Append one idempotent reconciliation marker while the task is RUNNING."""
+
+        if not isinstance(payload, Mapping):
+            raise ValueError("reconciliation payload must be an object")
+        normalized = dict(payload)
+        reconciliation_id = normalized.get("reconciliation_id")
+        if reconciliation_id is None:
+            reconciliation_id = str(uuid.uuid4())
+        if not isinstance(reconciliation_id, str) or not reconciliation_id.strip():
+            raise ValueError("reconciliation_id must be non-empty text")
+        normalized["reconciliation_id"] = reconciliation_id
+        fingerprint = normalized.get("evidence_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            normalized["evidence_fingerprint"] = self._reconciliation_fingerprint(
+                normalized
+            )
+
+        connection = self._require_connection()
+        marker: TaskEvent | None = None
+        created = False
+        marked_at = utc_now()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT task_id, project_id, objective, executor, model, mode, "
+                "execution_status, audit_status, thread_id, turn_id, created_at, updated_at "
+                "FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            task = self._task_from_row(row)
+            events = self._events_in_transaction(connection, task_id)
+            state = self._reconciliation_state_from_events(events)
+            if task.execution_status is not ExecutionStatus.RUNNING:
+                connection.commit()
+                return task, None, False
+            if self._has_bridge_terminal_event(events):
+                connection.commit()
+                return task, None, False
+            if state is not None and not state["resolved"]:
+                connection.commit()
+                return task, state["required_event"], False
+            marker = self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                RECONCILIATION_REQUIRED_EVENT,
+                normalized,
+                created_at=marked_at,
+            )
+            created = True
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+        updated = self.get_task(task_id)
+        if updated is None or marker is None:
+            raise RuntimeError("task disappeared after reconciliation marker")
+        return updated, marker, created
+
+    @staticmethod
+    def _has_bridge_terminal_event(events: Iterable[TaskEvent]) -> bool:
+        return any(
+            event.source == "bridge" and event.kind in _TERMINAL_EVENT_KINDS
+            for event in events
+        )
+
+    @staticmethod
+    def _codex_event_matches_task(task: Task, event: TaskEvent) -> bool:
+        """Return whether a Codex event is exactly correlated to ``task``.
+
+        Missing IDs are intentionally *not* treated as a match.  Recovery may
+        therefore leave the task pending, but a malformed/unrelated terminal
+        notification cannot block the narrow manual FAILED resolver.
+        """
+
+        if event.source != "codex" or not isinstance(event.payload, Mapping):
+            return False
+        payload = event.payload
+        thread_id = payload.get("thread_id", payload.get("threadId"))
+        turn_id = payload.get("turn_id", payload.get("turnId"))
+        turn = payload.get("turn")
+        if isinstance(turn, Mapping):
+            if turn_id is None:
+                turn_id = turn.get("id")
+        return (
+            isinstance(task.thread_id, str)
+            and isinstance(task.turn_id, str)
+            and thread_id == task.thread_id
+            and turn_id == task.turn_id
+        )
+
+    def _events_in_transaction(
+        self, connection: sqlite3.Connection, task_id: str
+    ) -> list[TaskEvent]:
+        rows = connection.execute(
+            """
+            SELECT event_id, task_id, source, kind, payload_json, created_at
+            FROM task_events WHERE task_id = ? ORDER BY event_id ASC
+            """,
+            (task_id,),
+        ).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    def transition_task_recovered_terminal(
+        self,
+        task_id: str,
+        *,
+        execution_status: ExecutionStatus | str,
+        event_kind: str,
+        payload: Mapping[str, Any],
+        recovery_payload: Mapping[str, Any],
+    ) -> tuple[Task, bool]:
+        """Apply one evidence-backed terminal transition during startup recovery."""
+
+        try:
+            status = (
+                execution_status
+                if isinstance(execution_status, ExecutionStatus)
+                else ExecutionStatus(execution_status)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid execution_status: {execution_status!r}") from exc
+        expected_kind = _TERMINAL_EVENT_BY_STATUS.get(status)
+        if expected_kind != event_kind:
+            raise ValueError("recovery event does not match terminal status")
+        connection = self._require_connection()
+        recovered_at = utc_now()
+        changed = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT task_id, project_id, objective, executor, model, mode, "
+                "execution_status, audit_status, thread_id, turn_id, created_at, updated_at "
+                "FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            task = self._task_from_row(row)
+            events = self._events_in_transaction(connection, task_id)
+            if task.execution_status is not ExecutionStatus.RUNNING:
+                connection.commit()
+                return task, False
+            if self._has_bridge_terminal_event(events):
+                connection.commit()
+                return task, False
+            cursor = connection.execute(
+                "UPDATE tasks SET execution_status = ?, audit_status = ?, updated_at = ? "
+                "WHERE task_id = ? AND execution_status = ?",
+                (
+                    status.value,
+                    AuditStatus.PENDING.value,
+                    timestamp_to_text(recovered_at),
+                    task_id,
+                    ExecutionStatus.RUNNING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TaskStateError(f"task {task_id} could not be recovered")
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                "task.recovered",
+                dict(recovery_payload),
+                created_at=recovered_at,
+            )
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                event_kind,
+                dict(payload),
+                created_at=recovered_at,
+            )
+            changed = True
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise RuntimeError("task disappeared after recovery")
+        return updated, changed
+
+    def resolve_task_reconciliation(
+        self,
+        task_id: str,
+        reconciliation_id: str,
+        *,
+        resolution: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve one pending reconciliation atomically to FAILED only."""
+
+        if resolution != ExecutionStatus.FAILED.value:
+            raise ValueError("only FAILED reconciliation resolution is supported")
+        if not isinstance(reconciliation_id, str) or not reconciliation_id.strip():
+            raise ValueError("reconciliation_id must be non-empty text")
+        if not isinstance(payload, Mapping):
+            raise ValueError("reconciliation payload must be an object")
+
+        connection = self._require_connection()
+        reason = "execution outcome could not be recovered after execution owner loss"
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT task_id, project_id, objective, executor, model, mode, "
+                "execution_status, audit_status, thread_id, turn_id, created_at, updated_at "
+                "FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"task does not exist: {task_id}")
+            task = self._task_from_row(row)
+            events = self._events_in_transaction(connection, task_id)
+            state = self._reconciliation_state_from_events(events)
+            if state is not None and state["resolved"] and state["reconciliation_id"] == reconciliation_id:
+                connection.commit()
+                return {
+                    "task_id": task_id,
+                    "execution_status": task.execution_status.value,
+                    "reconciliation_id": reconciliation_id,
+                    "resolved": True,
+                    "already_resolved": True,
+                    "resolution": resolution,
+                    "terminal": task.execution_status in _TERMINAL_EVENT_BY_STATUS,
+                }
+            if state is None or not state["required"]:
+                raise TaskStateError(f"task {task_id} has no pending reconciliation")
+            if state["reconciliation_id"] != reconciliation_id or state["resolved"]:
+                raise TaskStateError("reconciliation_id is stale or already resolved")
+            if task.execution_status is not ExecutionStatus.RUNNING:
+                raise TaskStateError(
+                    f"task {task_id} cannot be resolved from state {task.execution_status.value}"
+                )
+            required_event_id = state.get("required_event_id") or 0
+            for event in events:
+                if (event.event_id or 0) <= required_event_id:
+                    continue
+                if event.source == "bridge" and event.kind in {
+                    RECONCILIATION_REQUIRED_EVENT,
+                    "task.execution_claimed",
+                    "task.started",
+                    "task.finished",
+                    "task.failed",
+                    "task.cancelled",
+                }:
+                    raise TaskStateError(
+                        "reconciliation changed after the required marker"
+                    )
+                if event.kind in {
+                    "turn/completed",
+                    "turn/failed",
+                    "turn/interrupted",
+                    "turn/cancelled",
+                    "turn/aborted",
+                } and self._codex_event_matches_task(task, event):
+                    raise TaskStateError(
+                        "new Codex terminal evidence requires automatic reconciliation"
+                    )
+            now = utc_now()
+            resolved_payload = dict(payload)
+            resolved_payload.update(
+                {
+                    "reconciliation_id": reconciliation_id,
+                    "evidence_fingerprint": state.get("evidence_fingerprint"),
+                    "resolution": resolution,
+                    "reason": reason,
+                }
+            )
+            cursor = connection.execute(
+                "UPDATE tasks SET execution_status = ?, audit_status = ?, updated_at = ? "
+                "WHERE task_id = ? AND execution_status = ?",
+                (
+                    ExecutionStatus.FAILED.value,
+                    AuditStatus.PENDING.value,
+                    timestamp_to_text(now),
+                    task_id,
+                    ExecutionStatus.RUNNING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TaskStateError(f"task {task_id} could not be resolved")
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                RECONCILIATION_RESOLVED_EVENT,
+                resolved_payload,
+                created_at=now,
+            )
+            failed_payload = dict(resolved_payload)
+            failed_payload["recovered_from"] = ExecutionStatus.RUNNING.value
+            self._insert_task_event_in_transaction(
+                connection,
+                task_id,
+                "bridge",
+                "task.failed",
+                failed_payload,
+                created_at=now,
+            )
+            connection.commit()
+            return {
+                "task_id": task_id,
+                "execution_status": ExecutionStatus.FAILED.value,
+                "reconciliation_id": reconciliation_id,
+                "resolved": True,
+                "already_resolved": False,
+                "resolution": resolution,
+                "terminal": True,
+            }
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
     def _validate_event_limit(limit: int) -> None:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("event limit must be a positive integer")
@@ -1585,6 +2121,10 @@ class SQLiteBridgeStore:
 
 
 __all__ = [
+    "CHECKPOINT_CREATED_EVENT",
+    "CHECKPOINT_FAILED_EVENT",
+    "CHECKPOINT_REF_UPDATED_EVENT",
+    "CHECKPOINT_STARTED_EVENT",
     "CANCELLATION_INTERRUPT_FAILED_EVENT",
     "CANCELLATION_INTERRUPT_SENT_EVENT",
     "CANCELLATION_REQUEST_EVENT",
@@ -1592,7 +2132,10 @@ __all__ = [
     "D3_R2_CONTRACT",
     "EXECUTION_CLAIM_EVENT",
     "EXECUTION_REQUEST_EVENT",
+    "RECONCILIATION_REQUIRED_EVENT",
+    "RECONCILIATION_RESOLVED_EVENT",
     "SCHEMA_VERSION",
+    "SQLITE_BUSY_TIMEOUT_SECONDS",
     "SQLiteBridgeStore",
     "SchemaVersionError",
 ]

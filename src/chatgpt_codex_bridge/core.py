@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 import inspect
 import json
+import sqlite3
 import uuid
 from typing import Any
 
@@ -36,15 +38,28 @@ from .policy import (
     PolicyViolationError,
     augment_objective,
     checkpoint_payload,
-    CheckpointAlreadyCommittedError,
+    CheckpointCommitError,
+    CheckpointPreconditionError,
+    CHECKPOINT_PHASE_PRE_CAS,
+    CHECKPOINT_PHASE_CREATED,
+    CHECKPOINT_PHASE_REF_UPDATED,
+    PreparedCheckpoint,
     ensure_autonomous_workspace,
     git_continuation_preflight,
-    git_checkpoint_commit,
+    git_checkpoint_cas,
+    git_checkpoint_finalize,
+    git_checkpoint_head_relation,
+    git_checkpoint_prepare,
+    _h4_rehydrate_prepared,
     git_postflight,
     git_preflight,
     postflight_payload,
 )
 from .persistence.sqlite_store import (
+    CHECKPOINT_CREATED_EVENT,
+    CHECKPOINT_FAILED_EVENT,
+    CHECKPOINT_REF_UPDATED_EVENT,
+    CHECKPOINT_STARTED_EVENT,
     D3_H3_CONTRACT,
     D3_R2_CONTRACT,
     SQLiteBridgeStore,
@@ -368,6 +383,11 @@ class BridgeCore:
                 "request_id": request_id,
                 "requested_at": requested_at,
                 "requested_by": "mcp",
+                # Keep the H3 target durable so recovery can distinguish a
+                # cancellation for this exact thread/turn from unrelated
+                # terminal Codex evidence.
+                "thread_id": task.thread_id,
+                "turn_id": task.turn_id,
             },
         )
         durable_request_id = self._request_id_from_event(event)
@@ -459,36 +479,302 @@ class BridgeCore:
                 return True
         return False
 
+    @staticmethod
+    def _event_correlation(event: Any) -> tuple[str | None, str | None, str | None]:
+        """Extract exact thread/turn/status evidence from one Codex event."""
+
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, Mapping):
+            return None, None, None
+        thread_id = payload.get("thread_id", payload.get("threadId"))
+        turn_id = payload.get("turn_id", payload.get("turnId"))
+        status = payload.get("status")
+        turn = payload.get("turn")
+        if isinstance(turn, Mapping):
+            if turn_id is None:
+                turn_id = turn.get("id")
+            if status is None:
+                status = turn.get("status")
+        if not isinstance(thread_id, str):
+            thread_id = None
+        if not isinstance(turn_id, str):
+            turn_id = None
+        if not isinstance(status, str):
+            status = None
+        return thread_id, turn_id, status
+
+    @classmethod
+    def _correlated_turn_events(
+        cls, task: Task, events: list[Any]
+    ) -> list[Any]:
+        """Return only Codex terminal events with exact task correlation."""
+
+        if not task.thread_id or not task.turn_id:
+            return []
+        terminal_kinds = {
+            "turn/completed",
+            "turn/failed",
+            "turn/interrupted",
+            "turn/cancelled",
+            "turn/aborted",
+        }
+        correlated: list[Any] = []
+        for event in events:
+            if getattr(event, "source", None) != "codex":
+                continue
+            if getattr(event, "kind", None) not in terminal_kinds:
+                continue
+            thread_id, turn_id, _ = cls._event_correlation(event)
+            if thread_id == task.thread_id and turn_id == task.turn_id:
+                correlated.append(event)
+        return correlated
+
+    @classmethod
+    def _recovery_classification(
+        cls, task: Task, events: list[Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Classify one RUNNING task from durable Codex evidence only."""
+
+        correlated = cls._correlated_turn_events(task, events)
+        if not correlated:
+            return None
+        latest = correlated[-1]
+        kind = latest.kind
+        thread_id, turn_id, status = cls._event_correlation(latest)
+        effective_kind = kind
+        if kind == "turn/completed" and isinstance(status, str):
+            normalized_status = status.replace("_", "").replace("-", "").lower()
+            if normalized_status in {"interrupted", "cancelled", "canceled", "aborted"}:
+                effective_kind = "turn/interrupted"
+            elif normalized_status == "failed":
+                effective_kind = "turn/failed"
+        evidence_ids = [event.event_id for event in correlated if event.event_id is not None]
+        base = {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "evidence_event_ids": evidence_ids,
+            "evidence_kind": effective_kind,
+        }
+        if effective_kind in {"turn/interrupted", "turn/cancelled", "turn/aborted"}:
+            def compatible_cancel_request(event: Any) -> bool:
+                if (
+                    event.source != "bridge"
+                    or event.kind != "task.cancel_requested"
+                    or not isinstance(event.payload, Mapping)
+                    or event.payload.get("contract") != D3_H3_CONTRACT
+                    or (event.event_id or 0) >= (latest.event_id or 0)
+                ):
+                    return False
+                request_thread = event.payload.get(
+                    "thread_id", event.payload.get("threadId")
+                )
+                request_turn = event.payload.get(
+                    "turn_id", event.payload.get("turnId")
+                )
+                return (
+                    (request_thread is None or request_thread == thread_id)
+                    and (request_turn is None or request_turn == turn_id)
+                )
+
+            cancellation = next(
+                (
+                    event
+                    for event in events
+                    if compatible_cancel_request(event)
+                ),
+                None,
+            )
+            if cancellation is not None:
+                payload = {
+                    **base,
+                    "status": ExecutionStatus.CANCELLED.value,
+                    "reason": "cancel request confirmed by durable Codex interruption",
+                    "cancel_request_id": cls._request_id_from_event(cancellation),
+                }
+                return ExecutionStatus.CANCELLED.value, payload
+            return ExecutionStatus.FAILED.value, {
+                **base,
+                "status": ExecutionStatus.FAILED.value,
+                "reason": "unexpected execution interruption",
+                "error_type": "UnexpectedExecutionInterruption",
+            }
+        if effective_kind == "turn/failed" and (
+            status is not None
+            or (
+                isinstance(latest.payload, Mapping)
+                and any(key in latest.payload for key in ("error", "error_type", "message"))
+            )
+        ):
+            return ExecutionStatus.FAILED.value, {
+                **base,
+                "status": ExecutionStatus.FAILED.value,
+                "reason": "Codex turn failed",
+                "error": latest.payload if isinstance(latest.payload, Mapping) else None,
+            }
+        # A completed Codex turn is deliberately not enough to reconstruct the
+        # Bridge result after a crash.  The caller creates a durable
+        # reconciliation_required marker instead.
+        return None
+
+    @staticmethod
+    def _reconciliation_payload(task: Task, events: list[Any]) -> dict[str, Any]:
+        """Build stable evidence for a reconciliation marker."""
+
+        relevant = []
+        for event in events:
+            if event.source not in {"bridge", "codex"}:
+                continue
+            if not (
+                event.kind.startswith("turn/")
+                or event.kind
+                in {
+                    "task.execution_claimed",
+                    "task.started",
+                    "task.cancel_requested",
+                    "task.cancel_interrupt_sent",
+                    "task.cancel_interrupt_failed",
+                }
+            ):
+                continue
+            payload = event.payload if isinstance(event.payload, Mapping) else {}
+            # Owner PID/sidecar values are correlation hints, not authority;
+            # deliberately exclude them from the stable fingerprint.
+            if event.kind == "task.execution_claimed":
+                fingerprint_payload = {
+                    key: payload.get(key)
+                    for key in ("owner_kind", "owner_id", "claimed_at")
+                    if key in payload
+                }
+            elif event.kind.startswith("turn/"):
+                fingerprint_payload = {
+                    key: payload.get(key)
+                    for key in ("threadId", "thread_id", "turnId", "turn_id", "status")
+                    if key in payload
+                }
+            else:
+                fingerprint_payload = {
+                    key: payload.get(key)
+                    for key in ("request_id", "contract", "thread_id", "turn_id")
+                    if key in payload
+                }
+            relevant.append(
+                {
+                    "event_id": event.event_id,
+                    "source": event.source,
+                    "kind": event.kind,
+                    "payload": fingerprint_payload,
+                }
+            )
+        material = {
+            "task_id": task.task_id,
+            "thread_id": task.thread_id,
+            "turn_id": task.turn_id,
+            "events": relevant,
+        }
+        encoded = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return {
+            "reason": "durable execution outcome is insufficient to recover safely",
+            "thread_id": task.thread_id,
+            "turn_id": task.turn_id,
+            "claim": next(
+                (
+                    event.payload
+                    for event in reversed(events)
+                    if event.source == "bridge" and event.kind == "task.execution_claimed"
+                ),
+                None,
+            ),
+            "cancel_requested": any(
+                event.source == "bridge" and event.kind == "task.cancel_requested"
+                for event in events
+            ),
+            "evidence_event_ids": [
+                item["event_id"] for item in relevant if item["event_id"] is not None
+            ],
+            "evidence_fingerprint": hashlib.sha256(encoded).hexdigest(),
+        }
+
     def recover_orphaned_tasks(self) -> list[Task]:
-        """Fail closed for RUNNING tasks left by an earlier Bridge process."""
+        """Reconcile RUNNING tasks conservatively after worker loss."""
 
         recovered: list[Task] = []
         for task in self.store.list_tasks_by_execution_status(ExecutionStatus.RUNNING):
-            checkpoint = self._checkpoint_for_task(task.task_id)
-            if checkpoint is not None:
-                try:
-                    self._persist_postflight(task.task_id, checkpoint)
-                except BaseException:
-                    # Recovery must remain deterministic even when the project
-                    # was removed or Git evidence is no longer available.
-                    pass
-            recovered.append(
-                self.store.transition_task_terminal(
+            events = self.store.list_task_events(task.task_id)
+            classification = self._recovery_classification(task, events)
+            if classification is not None:
+                status_value, payload = classification
+                event_kind = {
+                    ExecutionStatus.FAILED.value: "task.failed",
+                    ExecutionStatus.CANCELLED.value: "task.cancelled",
+                }[status_value]
+                updated, _ = self.store.transition_task_recovered_terminal(
                     task.task_id,
-                    execution_status=ExecutionStatus.FAILED,
-                    event_kind="task.failed",
-                    payload={
-                        "error_type": "OrphanedTaskRecovery",
-                        "message": "task recovered after an interrupted Bridge execution",
-                        "recovered_from": ExecutionStatus.RUNNING.value,
-                    },
+                    execution_status=status_value,
+                    event_kind=event_kind,
+                    payload=payload,
                     recovery_payload={
                         "previous_status": ExecutionStatus.RUNNING.value,
-                        "reason": "bridge_startup_recovery",
+                        "reason": "durable_codex_terminal_evidence",
+                        "evidence_event_ids": payload.get("evidence_event_ids", []),
                     },
                 )
+                recovered.append(updated)
+                continue
+            _, marker, _ = self.store.ensure_reconciliation_required(
+                task.task_id, self._reconciliation_payload(task, events)
             )
+            updated = self.store.get_task(task.task_id)
+            if updated is not None:
+                recovered.append(updated)
         return recovered
+
+    def resolve_task_reconciliation(
+        self,
+        task_id: str,
+        reconciliation_id: str,
+        resolution: str,
+    ) -> dict[str, Any]:
+        """Resolve an unknown execution outcome to FAILED, and nothing else."""
+
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        if resolution != ExecutionStatus.FAILED.value:
+            raise ValueError("only FAILED reconciliation resolution is supported")
+        events = self.store.list_task_events(task_id)
+        claim = next(
+            (
+                event.payload
+                for event in reversed(events)
+                if event.source == "bridge" and event.kind == "task.execution_claimed"
+            ),
+            None,
+        )
+        cancel_request = self.store.get_cancellation_request(task_id)
+        payload = {
+            "reconciliation_id": reconciliation_id,
+            "thread_id": task.thread_id,
+            "turn_id": task.turn_id,
+            "claim": claim,
+            "cancel_requested": cancel_request is not None,
+            "cancel_request_id": self._request_id_from_event(cancel_request),
+            "evidence_event_ids": [
+                event.event_id for event in events if event.event_id is not None
+            ],
+            "resolver": "mcp",
+        }
+        return self.store.resolve_task_reconciliation(
+            task_id,
+            reconciliation_id,
+            resolution=resolution,
+            payload=payload,
+        )
 
     def _checkpoint_for_task(self, task_id: str) -> GitCheckpoint | None:
         """Rehydrate the last autonomous checkpoint for orphan recovery."""
@@ -594,7 +880,7 @@ class BridgeCore:
             raise PolicyError("checkpoint task is not the last applicable task")
 
     def commit_checkpoint(self, task_id: str, message: str) -> dict[str, Any]:
-        """Create one local checkpoint for a finished autonomous task."""
+        """Create or forward-repair one durable local checkpoint attempt."""
 
         task = self.store.get_task(task_id)
         if task is None:
@@ -609,13 +895,17 @@ class BridgeCore:
         if project is None:
             raise PolicyError(f"project does not exist: {task.project_id}")
         events = self.store.list_task_events(task_id)
-        if any(
-            event.source == "bridge" and event.kind == "checkpoint.commit.created"
+
+        created_events = [
+            event
             for event in events
-        ):
-            raise CheckpointAlreadyCommittedError(
-                "checkpoint commit already exists for task"
-            )
+            if event.source == "bridge" and event.kind == CHECKPOINT_CREATED_EVENT
+        ]
+        if created_events:
+            payload = created_events[-1].payload
+            if isinstance(payload, dict):
+                return dict(payload)
+            raise CheckpointCommitError("stored checkpoint.created payload is invalid")
         if any(
             event.source == "bridge" and event.kind == "policy.violation"
             for event in events
@@ -635,31 +925,358 @@ class BridgeCore:
             )
         self._require_last_task(task)
         safe_repo = ensure_autonomous_workspace(project.repo_path)
-        result = git_checkpoint_commit(
-            safe_repo,
-            postflight=postflight,
-            message=message,
-        )
-        payload = {
+
+        started_events = [
+            event
+            for event in events
+            if event.source == "bridge" and event.kind == CHECKPOINT_STARTED_EVENT
+        ]
+        failed_events = [
+            event
+            for event in events
+            if event.source == "bridge" and event.kind == CHECKPOINT_FAILED_EVENT
+        ]
+        prepared: PreparedCheckpoint
+
+        def persist_attempt_failed(
+            payload: Mapping[str, Any] | None,
+            *,
+            reason: str,
+            error: BaseException,
+        ) -> None:
+            """Best-effort durable classification for pre-CAS failures.
+
+            STARTED is intentionally the authority before CAS.  If its
+            rehydration or an early retry probe fails, retain that attempt's
+            identity and classify it once instead of leaving an unbounded
+            STARTED-only record.  A persistence failure is left to the next
+            retry, which can still use the immutable STARTED payload.
+            """
+
+            normalized = dict(payload) if isinstance(payload, Mapping) else {}
+            attempt_id = normalized.get("attempt_id")
+            normalized.update(
+                {
+                    "phase": CHECKPOINT_PHASE_PRE_CAS,
+                    "classification": "FAILED_PRE_CAS",
+                    "reason": reason,
+                    "error_type": type(error).__name__,
+                    "message": str(error)[:500],
+                }
+            )
+            try:
+                with self.store.immediate_transaction() as connection:
+                    existing = connection.execute(
+                        "SELECT payload_json FROM task_events "
+                        "WHERE task_id = ? AND source = 'bridge' AND kind = ?",
+                        (task_id, CHECKPOINT_FAILED_EVENT),
+                    ).fetchall()
+                    for row in existing:
+                        try:
+                            existing_payload = json.loads(row["payload_json"])
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        if (
+                            isinstance(existing_payload, Mapping)
+                            and existing_payload.get("attempt_id") == attempt_id
+                        ):
+                            return
+                    self.store.insert_task_event_in_transaction(
+                        connection,
+                        task_id,
+                        "bridge",
+                        CHECKPOINT_FAILED_EVENT,
+                        normalized,
+                    )
+            except Exception:
+                # The durable STARTED record remains available for a bounded
+                # retry; never mask the original pre-CAS failure here.
+                pass
+
+        if started_events:
+            started_payload = started_events[-1].payload
+            if not isinstance(started_payload, Mapping):
+                error = CheckpointCommitError(
+                    "stored checkpoint.started payload is invalid"
+                )
+                persist_attempt_failed(
+                    None, reason="STARTED_PAYLOAD_INVALID", error=error
+                )
+                raise error
+            attempt_id = started_payload.get("attempt_id")
+            matching_failure = next(
+                (
+                    event
+                    for event in reversed(failed_events)
+                    if isinstance(event.payload, Mapping)
+                    and event.payload.get("attempt_id") == attempt_id
+                ),
+                None,
+            )
+            if matching_failure is not None:
+                raise CheckpointCommitError(
+                    "checkpoint attempt is terminally classified before CAS"
+                )
+            try:
+                prepared = _h4_rehydrate_prepared(started_payload)
+            except BaseException as error:
+                persist_attempt_failed(
+                    started_payload,
+                    reason="STARTED_REHYDRATION_FAILED",
+                    error=error,
+                )
+                raise
+        else:
+            # Capture the task high-water before STARTED.  The immediate
+            # transaction below revalidates both values immediately before CAS.
+            connection = self.store.connection
+            latest_id, latest_creation_id, high_water = (
+                self.store.latest_task_identity_in_transaction(
+                    connection, task.project_id
+                )
+            )
+            prepared = git_checkpoint_prepare(
+                safe_repo,
+                postflight=postflight,
+                message=message,
+                task_id=task.task_id,
+                project_id=project.project_id,
+            )
+            prepared.snapshot["latest_task_identity"] = {
+                "task_id": latest_id,
+                "creation_event_id": latest_creation_id,
+            }
+            prepared.snapshot["task_event_high_water"] = high_water
+            prepared.snapshot["task_execution_status"] = task.execution_status.value
+            prepared.snapshot["task_audit_status"] = task.audit_status.value
+            try:
+                self.store.append_task_event(
+                    task.task_id,
+                    "bridge",
+                    CHECKPOINT_STARTED_EVENT,
+                    prepared.started_payload(),
+                )
+            except BaseException:
+                prepared.cleanup()
+                raise
+
+        def reject_incompatible_attempt(events_to_check: list[Any]) -> None:
+            for event in events_to_check:
+                if event.source != "bridge" or event.kind not in {
+                    CHECKPOINT_STARTED_EVENT,
+                    CHECKPOINT_REF_UPDATED_EVENT,
+                    CHECKPOINT_CREATED_EVENT,
+                }:
+                    continue
+                payload = event.payload
+                if not isinstance(payload, Mapping):
+                    raise CheckpointCommitError(
+                        "stored checkpoint attempt payload is invalid"
+                    )
+                event_attempt = payload.get("attempt_id")
+                if event_attempt != prepared.attempt_id:
+                    raise CheckpointCommitError(
+                        "another checkpoint attempt exists for this task"
+                    )
+
+        # A concurrent caller may have appended a different STARTED attempt
+        # between our initial read and candidate preparation.  Do not let
+        # either attempt silently incorporate the other's authorization.
+        try:
+            reject_incompatible_attempt(self.store.list_task_events(task_id))
+        except BaseException as error:
+            persist_attempt_failed(
+                prepared.started_payload(),
+                reason="CHECKPOINT_INCOMPATIBLE",
+                error=error,
+            )
+            prepared.cleanup()
+            raise
+
+        attempt_payload = {
+            "attempt_id": prepared.attempt_id,
+            "snapshot_id": prepared.snapshot_id,
             "task_id": task.task_id,
             "project_id": project.project_id,
-            "previous_head": result.previous_head,
-            "commit_head": result.commit_head,
-            "branch": result.branch,
-            "message": result.message,
-            "paths": list(result.paths),
-            "clean": result.clean,
+            "branch_ref": prepared.branch_ref,
+            "expected_head": prepared.expected_head,
+            "candidate_commit": prepared.candidate_commit,
+            "candidate_parent": prepared.candidate_parent,
+            "candidate_tree": prepared.candidate_tree,
+            "paths": list(prepared.paths),
+            "message_digest": prepared.message_digest,
+            "task_execution_status": prepared.snapshot.get("task_execution_status"),
+            "task_audit_status": prepared.snapshot.get("task_audit_status"),
         }
-        # Do not attempt a Git rollback if SQLite persistence fails here.  The
-        # new HEAD remains the durable proof and a retry is rejected by the
-        # branch/HEAD and idempotency preconditions.
-        self.store.append_task_event(
-            task_id,
-            "bridge",
-            "checkpoint.commit.created",
-            payload,
-        )
-        return payload
+
+        def persist_created(finalization: Any) -> dict[str, Any]:
+            payload = {
+                "task_id": task.task_id,
+                "project_id": project.project_id,
+                "phase": CHECKPOINT_PHASE_CREATED,
+                "previous_head": prepared.expected_head,
+                "commit_head": prepared.candidate_commit,
+                "branch": prepared.branch,
+                "message": prepared.message,
+                "paths": list(prepared.paths),
+                "clean": finalization.clean,
+                "attempt_id": prepared.attempt_id,
+                "snapshot_id": prepared.snapshot_id,
+                "commit_created": True,
+                "finalization_status": finalization.finalization_status,
+                "post_state": finalization.finalization_status,
+                "conflict": finalization.conflict,
+                "repaired": bool(started_events),
+            }
+            try:
+                self.store.append_task_event(
+                    task_id,
+                    "bridge",
+                    CHECKPOINT_CREATED_EVENT,
+                    payload,
+                )
+            except Exception as error:
+                raise CheckpointCommitError(
+                    "checkpoint commit created but durable created event failed"
+                ) from error
+            return payload
+
+        if started_events:
+            try:
+                relation, _ = git_checkpoint_head_relation(prepared)
+            except BaseException as error:
+                persist_attempt_failed(
+                    attempt_payload,
+                    reason="CHECKPOINT_OUTCOME_NOT_PROVABLE",
+                    error=error,
+                )
+                prepared.cleanup()
+                raise
+            if relation in {"candidate", "descendant"}:
+                try:
+                    return persist_created(git_checkpoint_finalize(prepared))
+                finally:
+                    prepared.cleanup()
+            if relation == "unknown":
+                try:
+                    with self.store.immediate_transaction() as connection:
+                        self.store.insert_task_event_in_transaction(
+                            connection,
+                            task_id,
+                            "bridge",
+                            CHECKPOINT_FAILED_EVENT,
+                            {
+                                **attempt_payload,
+                                "phase": CHECKPOINT_PHASE_PRE_CAS,
+                                "classification": "FAILED_PRE_CAS",
+                                "reason": "CHECKPOINT_OUTCOME_NOT_PROVABLE",
+                            },
+                        )
+                finally:
+                    prepared.cleanup()
+                raise CheckpointCommitError("checkpoint outcome is not provable")
+
+        cas_completed = False
+        try:
+            failure: CheckpointPreconditionError | None = None
+            try:
+                with self.store.immediate_transaction() as connection:
+                    try:
+                        reject_incompatible_attempt(self.store.list_task_events(task_id))
+                    except CheckpointCommitError as error:
+                        failure = CheckpointPreconditionError(
+                            str(error), reason="CHECKPOINT_INCOMPATIBLE"
+                        )
+                    if failure is None:
+                        current = self.store.get_task(task_id)
+                        if current is None:
+                            raise PolicyError(f"task does not exist: {task_id}")
+                        if current.execution_status is not ExecutionStatus.FINISHED:
+                            raise CheckpointPreconditionError(
+                                "task changed before checkpoint CAS",
+                                reason="TASK_STATE_CHANGED",
+                            )
+                        if current.audit_status is AuditStatus.CORRECTION_REQUIRED:
+                            raise CheckpointPreconditionError(
+                                "audit correction appeared before checkpoint CAS",
+                                reason="AUDIT_CORRECTION_REQUIRED",
+                            )
+                        latest_id, latest_creation_id, high_water = (
+                            self.store.latest_task_identity_in_transaction(
+                                connection, project.project_id
+                            )
+                        )
+                        expected_latest = prepared.snapshot.get("latest_task_identity")
+                        expected_high_water = prepared.snapshot.get("task_event_high_water")
+                        if (
+                            latest_id != task.task_id
+                            or (
+                                isinstance(expected_latest, Mapping)
+                                and (
+                                    expected_latest.get("task_id") != latest_id
+                                    or expected_latest.get("creation_event_id")
+                                    != latest_creation_id
+                                )
+                            )
+                            or (
+                                expected_high_water is not None
+                                and high_water != expected_high_water
+                            )
+                        ):
+                            failure = CheckpointPreconditionError(
+                                "checkpoint task is no longer the latest applicable task",
+                                reason="LATEST_TASK_CHANGED",
+                            )
+                        else:
+                            try:
+                                git_checkpoint_cas(prepared)
+                                cas_completed = True
+                                self.store.insert_task_event_in_transaction(
+                                    connection,
+                                    task_id,
+                                    "bridge",
+                                    CHECKPOINT_REF_UPDATED_EVENT,
+                                    {
+                                        **attempt_payload,
+                                        "phase": CHECKPOINT_PHASE_REF_UPDATED,
+                                        "cas_result": "success",
+                                    },
+                                )
+                            except CheckpointPreconditionError as error:
+                                failure = error
+                            except CheckpointCommitError as error:
+                                failure = CheckpointPreconditionError(
+                                    str(error), reason="PRE_CAS_VALIDATION_FAILED"
+                                )
+                    if failure is not None:
+                        self.store.insert_task_event_in_transaction(
+                            connection,
+                            task_id,
+                            "bridge",
+                            CHECKPOINT_FAILED_EVENT,
+                            {
+                                **attempt_payload,
+                                "phase": CHECKPOINT_PHASE_PRE_CAS,
+                                "classification": "FAILED_PRE_CAS",
+                                "reason": failure.reason,
+                            },
+                        )
+            except Exception as error:
+                if cas_completed:
+                    raise CheckpointCommitError(
+                        "CAS succeeded but SQLite could not commit ref_updated; forward repair required"
+                    ) from error
+                if isinstance(error, sqlite3.OperationalError):
+                    raise CheckpointCommitError(
+                        "SQLite writer lock could not be acquired within the configured timeout"
+                    ) from error
+                raise
+            if failure is not None:
+                raise failure
+
+            return persist_created(git_checkpoint_finalize(prepared))
+        finally:
+            prepared.cleanup()
 
     async def _cancel_active_execution(
         self,

@@ -164,6 +164,26 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
         return await _call_adapter(adapter, "get_result", {"task_id": task_id})
 
     @server.tool(
+        name="resolve_task_reconciliation",
+        description="Resolve one unknown task outcome to FAILED without rerunning it.",
+        structured_output=True,
+    )
+    async def resolve_task_reconciliation(
+        task_id: str,
+        reconciliation_id: str,
+        resolution: str,
+    ) -> dict[str, Any]:
+        return await _call_adapter(
+            adapter,
+            "resolve_task_reconciliation",
+            {
+                "task_id": task_id,
+                "reconciliation_id": reconciliation_id,
+                "resolution": resolution,
+            },
+        )
+
+    @server.tool(
         name="commit_checkpoint",
         description="Create one verified local checkpoint commit for a finished autonomous task.",
         structured_output=True,

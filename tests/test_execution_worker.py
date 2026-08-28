@@ -343,7 +343,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    def test_worker_recovery_fails_running_task_closed_by_previous_owner(self) -> None:
+    def test_worker_recovery_requires_reconciliation_for_unknown_running_task(self) -> None:
         task = self.create_task("task-recovery")
         self.store.transition_task_running(task.task_id, project_id=task.project_id)
         recovered = self.core.recover_orphaned_tasks()
@@ -351,11 +351,11 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.task_id for item in recovered], [task.task_id])
         self.assertEqual(
             self.store.get_task(task.task_id).execution_status,
-            ExecutionStatus.FAILED,
+            ExecutionStatus.RUNNING,
         )
         self.assertEqual(
             [event.kind for event in self.store.list_task_events(task.task_id)],
-            ["task.created", "task.started", "task.recovered", "task.failed"],
+            ["task.created", "task.started", "task.reconciliation_required"],
         )
 
     async def test_worker_runs_autonomous_write_contract_and_persists_postflight(self) -> None:

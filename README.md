@@ -60,10 +60,11 @@ ChatGPT
   → ChatGPT
 ```
 
-Las ocho tools actuales son:
+Las tools actuales son:
 
 `get_status`, `create_project`, `create_task`, `run_task`, `get_task`,
-`get_task_events`, `get_result` y `commit_checkpoint`.
+`get_task_events`, `get_result`, `resolve_task_reconciliation` y
+`commit_checkpoint`.
 
 `create_task` acepta `READ_ONLY` (default) y `AUTONOMOUS_WRITE`. El modo
 `AUTONOMOUS_WRITE` requiere autorización explícita y auditoría postflight; no
@@ -75,6 +76,12 @@ revisado y la auditoría de ChatGPT aprobó el checkpoint. La autorización se
 concede por etapa lógica: una cadena `A → A-R1 → A-R2` produce como máximo un
 checkpoint sobre la última Task aprobada. No realiza push, tag, release,
 merge, rebase, reset ni clean.
+
+Una ejecución cuyo resultado no puede demostrarse después de una pérdida del
+worker permanece `RUNNING` con `task.reconciliation_required`; no se convierte
+automáticamente en `FINISHED`. La única resolución administrativa disponible es
+`resolve_task_reconciliation(..., resolution="FAILED")`, que no reanuda ni
+re-ejecuta la Task.
 
 Flujo aprobado: `AUTONOMOUS_WRITE → FINISHED → postflight durable → auditoría
 ChatGPT → commit_checkpoint → commit local → repo clean → siguiente Task`.
@@ -109,8 +116,9 @@ consulta `get_task`, `get_task_events` y `get_result`; no hay long-polling ni
 una tool pública `cancel_task`.
 
 Una Task histórica que quedó `QUEUED` sin `task.execution_requested` es un
-zombie y no se ejecuta automáticamente. Una Task `RUNNING` sin dueño vivo se
-recupera fail-closed como `FAILED` al arrancar un worker nuevo.
+zombie y no se ejecuta automáticamente. Una Task `RUNNING` sin evidencia
+terminal durable suficiente queda pendiente de reconciliación; no se infiere el
+resultado por PID, silencio o desaparición del lock.
 
 ## Runtime D3-R2-B
 

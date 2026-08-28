@@ -176,7 +176,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_stage_is_1fd(self) -> None:
         self.assertEqual(self.adapter.stage, "1F-D")
 
-    async def test_official_initialize_and_tools_list_expose_exactly_nine_tools(self) -> None:
+    async def test_official_initialize_and_tools_list_expose_exactly_ten_tools(self) -> None:
         async def exercise(session):
             initialized = await session.initialize()
             tools = await session.list_tools()
@@ -196,6 +196,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "get_task",
                 "get_task_events",
                 "get_result",
+                "resolve_task_reconciliation",
                 "commit_checkpoint",
             ],
         )
@@ -1557,7 +1558,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
                 stderr_text = stderr.read()
 
             self.assertTrue(initialized.protocol_version)
-            self.assertEqual(len(tools.tools), 9)
+            self.assertEqual(len(tools.tools), 10)
             self.assertTrue(db_path.exists())
             self.assertIn("pid=", stderr_text)
             reopened = SQLiteBridgeStore(db_path)

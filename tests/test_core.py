@@ -211,7 +211,7 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("task.failed", kinds)
         self.assertNotIn("task.finished", kinds)
 
-    def test_recover_orphaned_running_task_is_failed_once(self) -> None:
+    def test_recover_orphaned_running_task_requires_reconciliation_once(self) -> None:
         core = self._core()
         core.create_project("Bridge", "C:/workspace/bridge", project_id="project-1")
         core.create_task("project-1", "do the task", task_id="task-1")
@@ -226,13 +226,24 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([task.task_id for task in recovered], ["task-1"])
         task = self.store.get_task("task-1")
         assert task is not None
-        self.assertEqual(task.execution_status, ExecutionStatus.FAILED)
+        self.assertEqual(task.execution_status, ExecutionStatus.RUNNING)
         events = self.store.list_task_events("task-1")
         self.assertEqual(
             [event.kind for event in events],
-            ["task.created", "task.started", "task.recovered", "task.failed"],
+            ["task.created", "task.started", "task.reconciliation_required"],
         )
-        self.assertEqual(events[-1].payload["recovered_from"], "RUNNING")
+        reconciliation = self.store.get_reconciliation_state("task-1")
+        self.assertIsNotNone(reconciliation)
+        assert reconciliation is not None
+        self.assertFalse(reconciliation["resolved"])
+        self.assertEqual(
+            core.recover_orphaned_tasks()[0].execution_status,
+            ExecutionStatus.RUNNING,
+        )
+        self.assertEqual(
+            self.store.count_task_events("task-1"),
+            len(events),
+        )
 
     async def test_success_has_one_terminal_event_after_turn_completed(self) -> None:
         core = self._core()

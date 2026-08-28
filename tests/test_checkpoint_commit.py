@@ -165,13 +165,15 @@ class CheckpointCommitTests(unittest.TestCase):
         repo, _, _, _, _ = self._commit()
         self.assertEqual(git(repo, "show", "-s", "--format=%s", "HEAD"), "checkpoint D3")
 
-    def test_10_duplicate_call_rejects_stably(self) -> None:
+    def test_10_duplicate_call_returns_same_checkpoint_stably(self) -> None:
         repo, core, task, _, _ = self._commit()
         before = self.store.count_task_events(task.task_id)
-        with self.assertRaises(CheckpointCommitError):
-            core.commit_checkpoint(task.task_id, "checkpoint D3")
+        first_head = git(repo, "rev-parse", "HEAD")
+        repeated = core.commit_checkpoint(task.task_id, "checkpoint D3")
         self.assertEqual(self.store.count_task_events(task.task_id), before)
         self.assertEqual(git(repo, "rev-list", "--count", "HEAD~1..HEAD"), "1")
+        self.assertEqual(repeated["commit_head"], first_head)
+        self.assertTrue(repeated["commit_created"])
 
     def test_11_queued_rejects(self) -> None:
         repo, core, task, _ = self._prepare()
@@ -394,7 +396,7 @@ class CheckpointCommitTests(unittest.TestCase):
         original = policy._git_with_env
 
         def fail_commit(repo_arg, *args, **kwargs):
-            if "commit" in args:
+            if "commit-tree" in args:
                 raise CheckpointCommitError("commit failure")
             return original(repo_arg, *args, **kwargs)
 
@@ -431,12 +433,20 @@ class CheckpointCommitTests(unittest.TestCase):
             return original(task_id, source, kind, payload, **kwargs)
 
         with patch.object(self.store, "append_task_event", side_effect=fail_event):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(CheckpointCommitError):
                 core.commit_checkpoint(task.task_id, "checkpoint D3")
         head = git(repo, "rev-parse", "HEAD")
-        with self.assertRaises(CheckpointCommitError):
-            core.commit_checkpoint(task.task_id, "checkpoint D3")
+        repaired = core.commit_checkpoint(task.task_id, "checkpoint D3")
         self.assertEqual(git(repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(repaired["commit_head"], head)
+        self.assertTrue(repaired["repaired"])
+        self.assertEqual(
+            sum(
+                event.kind == "checkpoint.commit.created"
+                for event in self.store.list_task_events(task.task_id)
+            ),
+            1,
+        )
 
     def test_33_no_remote_operations(self) -> None:
         repo, core, task, _ = self._finished()
@@ -488,13 +498,15 @@ class CheckpointCommitTests(unittest.TestCase):
         index_before = (repo / ".git" / "index").read_bytes()
         previous_head = git(repo, "rev-parse", "HEAD")
         with patch("chatgpt_codex_bridge.policy.os.replace", side_effect=OSError("index install failure")):
-            with self.assertRaises(CheckpointCommitError):
-                core.commit_checkpoint(task.task_id, "checkpoint D3")
+            result = core.commit_checkpoint(task.task_id, "checkpoint D3")
         new_head = git(repo, "rev-parse", "HEAD")
         self.assertNotEqual(new_head, previous_head)
         self.assertEqual((repo / ".git" / "index").read_bytes(), index_before)
-        with self.assertRaises(CheckpointCommitError):
-            core.commit_checkpoint(task.task_id, "checkpoint D3")
+        self.assertEqual(result["commit_head"], new_head)
+        self.assertEqual(result["finalization_status"], "EXTERNAL_STATE_CONFLICT")
+        repeated = core.commit_checkpoint(task.task_id, "checkpoint D3")
+        self.assertTrue(repeated["commit_created"])
+        self.assertEqual(repeated["commit_head"], new_head)
         self.assertEqual(git(repo, "rev-parse", "HEAD"), new_head)
 
     def test_37_large_postflight_survives_sqlite_continuation_and_checkpoint(self) -> None:
