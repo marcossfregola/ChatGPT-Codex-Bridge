@@ -129,17 +129,22 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
 
     @server.tool(
         name="get_task_events",
-        description="Read a task journal in event_id order.",
+        description="Read a task journal in event_id order, optionally after an event_id cursor.",
         structured_output=True,
     )
     async def get_task_events(
         task_id: str,
         limit: int | None = None,
+        since_event_id: int | None = None,
     ) -> dict[str, Any]:
         return await _call_adapter(
             adapter,
             "get_task_events",
-            {"task_id": task_id, "limit": limit},
+            {
+                "task_id": task_id,
+                "limit": limit,
+                "since_event_id": since_event_id,
+            },
         )
 
     @server.tool(

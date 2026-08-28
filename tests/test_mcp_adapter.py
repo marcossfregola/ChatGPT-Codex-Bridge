@@ -293,6 +293,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["count"], 10_002)
         self.assertTrue(result["truncated"])
+        self.assertIsNone(result["next_cursor"])
         self.assertLessEqual(len(result["events"]), DEFAULT_EVENT_LIMIT)
         self.assertLessEqual(decode.call_count, DEFAULT_EVENT_LIMIT + 64)
 
@@ -313,10 +314,146 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["count"], 10_004)
         self.assertTrue(result["truncated"])
+        self.assertIsNone(result["next_cursor"])
         kinds = {event["kind"] for event in result["events"]}
         self.assertIn("task.created", kinds)
         self.assertIn("task.finished", kinds)
         self.assertLessEqual(len(result["events"]), 100 + 64)
+
+    async def test_get_task_events_legacy_shape_includes_stable_cursor(self) -> None:
+        self._create_task()
+
+        result = await self.adapter.call_tool(
+            "get_task_events", {"task_id": "task-mcp"}
+        )
+
+        self.assertEqual(result["count"], 1)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["next_cursor"], result["events"][-1]["event_id"])
+
+    async def test_get_task_events_since_event_id_is_exclusive_and_ordered(self) -> None:
+        self._create_task()
+        created = self.store.get_last_task_event("task-mcp")
+        self.assertIsNotNone(created)
+        appended = [
+            self.store.append_task_event(
+                "task-mcp", "codex", "incremental", {"index": index}
+            )
+            for index in range(4)
+        ]
+        assert created is not None
+
+        result = await self.adapter.call_tool(
+            "get_task_events",
+            {"task_id": "task-mcp", "since_event_id": created.event_id},
+        )
+
+        ids = [event["event_id"] for event in result["events"]]
+        self.assertEqual(ids, [event.event_id for event in appended])
+        self.assertTrue(all(event_id > created.event_id for event_id in ids))
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(result["count"], len(appended))
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["next_cursor"], appended[-1].event_id)
+
+    async def test_get_task_events_empty_page_keeps_cursor(self) -> None:
+        self._create_task()
+        last = self.store.get_last_task_event("task-mcp")
+        self.assertIsNotNone(last)
+        assert last is not None
+
+        result = await self.adapter.call_tool(
+            "get_task_events",
+            {"task_id": "task-mcp", "since_event_id": last.event_id},
+        )
+
+        self.assertEqual(result["events"], [])
+        self.assertEqual(result["count"], 0)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["next_cursor"], last.event_id)
+
+    async def test_get_task_events_incremental_pages_continue_without_gaps(self) -> None:
+        self._create_task()
+        initial = [
+            self.store.get_last_task_event("task-mcp"),
+            *(
+                self.store.append_task_event(
+                    "task-mcp", "codex", "incremental", {"index": index}
+                )
+                for index in range(4)
+            ),
+        ]
+        expected_initial = [event.event_id for event in initial if event is not None]
+        page_one = await self.adapter.call_tool(
+            "get_task_events",
+            {"task_id": "task-mcp", "since_event_id": 0, "limit": 2},
+        )
+        ids_one = [event["event_id"] for event in page_one["events"]]
+        self.assertEqual(ids_one, expected_initial[:2])
+        self.assertTrue(page_one["truncated"])
+        self.assertEqual(page_one["next_cursor"], ids_one[-1])
+
+        appended = [
+            self.store.append_task_event(
+                "task-mcp", "codex", "incremental", {"index": index}
+            )
+            for index in range(4, 6)
+        ]
+        expected_all = [*expected_initial, *(event.event_id for event in appended)]
+
+        page_two = await self.adapter.call_tool(
+            "get_task_events",
+            {
+                "task_id": "task-mcp",
+                "since_event_id": page_one["next_cursor"],
+                "limit": 3,
+            },
+        )
+        ids_two = [event["event_id"] for event in page_two["events"]]
+        self.assertEqual(ids_two, expected_all[2:5])
+        self.assertTrue(page_two["truncated"])
+
+        page_three = await self.adapter.call_tool(
+            "get_task_events",
+            {
+                "task_id": "task-mcp",
+                "since_event_id": page_two["next_cursor"],
+                "limit": 3,
+            },
+        )
+        ids_three = [event["event_id"] for event in page_three["events"]]
+        self.assertEqual(ids_three, expected_all[5:])
+        self.assertFalse(page_three["truncated"])
+
+        all_ids = [*ids_one, *ids_two, *ids_three]
+        self.assertEqual(all_ids, expected_all)
+        self.assertEqual(len(all_ids), len(set(all_ids)))
+
+    async def test_get_task_events_rejects_invalid_since_event_id(self) -> None:
+        self._create_task()
+        for value in (-1, True, "1", 1.5):
+            with self.assertRaises(MCPToolError):
+                await self.adapter.call_tool(
+                    "get_task_events",
+                    {"task_id": "task-mcp", "since_event_id": value},
+                )
+
+    async def test_official_get_task_events_schema_exposes_since_event_id(self) -> None:
+        async def exercise(session):
+            await session.initialize()
+            tools = await session.list_tools()
+            return next(tool for tool in tools.tools if tool.name == "get_task_events")
+
+        tool = await self._with_official_client(exercise)
+        cursor_schema = tool.input_schema["properties"]["since_event_id"]
+        schema_types = {cursor_schema.get("type")}
+        schema_types.update(
+            part.get("type")
+            for part in cursor_schema.get("anyOf", [])
+            if isinstance(part, dict)
+        )
+        self.assertIn("integer", schema_types)
+        self.assertNotIn("since_event_id", tool.input_schema.get("required", []))
 
     async def test_get_result_uses_targeted_latest_queries(self) -> None:
         self._create_task()

@@ -1252,6 +1252,15 @@ class SQLiteBridgeStore:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("event limit must be a positive integer")
 
+    @staticmethod
+    def _validate_event_cursor(since_event_id: int) -> None:
+        if (
+            isinstance(since_event_id, bool)
+            or not isinstance(since_event_id, int)
+            or since_event_id < 0
+        ):
+            raise ValueError("since_event_id must be a non-negative integer")
+
     def list_task_events(
         self, task_id: str, limit: int | None = None
     ) -> list[TaskEvent]:
@@ -1275,20 +1284,49 @@ class SQLiteBridgeStore:
         task_id: str,
         limit: int,
         *,
+        since_event_id: int | None = None,
         critical_kinds: Iterable[str] = (),
         critical_limit: int = 64,
     ) -> tuple[list[TaskEvent], int]:
-        """Read a bounded head plus recent critical events.
+        """Read a bounded event window in durable ``event_id`` order.
 
-        The head and critical tail are separate SQL-limited queries.  This
-        intentionally does not materialize or deserialize the complete task
-        journal when a caller only needs a bounded view.
+        Without ``since_event_id`` this preserves the legacy bounded head plus
+        recent-critical-event view.  With a cursor, the selection is strictly
+        ``event_id > since_event_id`` and never adds a critical tail; this
+        cursor mode is the gap-free incremental journal contract.  The returned
+        count is the total matching event count for the selected mode.
         """
 
         self._validate_event_limit(limit)
+        if since_event_id is not None:
+            self._validate_event_cursor(since_event_id)
         self._validate_event_limit(critical_limit)
-        total = self.count_task_events(task_id)
         connection = self._require_connection()
+
+        if since_event_id is not None:
+            rows = connection.execute(
+                """
+                SELECT event_id, task_id, source, kind, payload_json, created_at
+                FROM task_events
+                WHERE task_id = ? AND event_id > ?
+                ORDER BY event_id ASC
+                LIMIT ?
+                """,
+                (task_id, since_event_id, limit),
+            ).fetchall()
+            # Count after selecting so an append between the page read and
+            # this count makes the response conservatively truncated rather
+            # than allowing a caller to stop before seeing the new event.
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_events "
+                    "WHERE task_id = ? AND event_id > ?",
+                    (task_id, since_event_id),
+                ).fetchone()[0]
+            )
+            return [self._event_from_row(row) for row in rows], total
+
+        total = self.count_task_events(task_id)
         head_rows = connection.execute(
             """
             SELECT event_id, task_id, source, kind, payload_json, created_at

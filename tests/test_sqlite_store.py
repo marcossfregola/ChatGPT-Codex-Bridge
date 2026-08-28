@@ -755,6 +755,51 @@ class SQLiteBridgeStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_incremental_event_window_is_exclusive_and_ordered(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "incremental.sqlite3")
+            try:
+                events = [
+                    store.append_task_event(
+                        "task-1", "codex", "incremental", {"index": index}
+                    )
+                    for index in range(5)
+                ]
+                cursor = events[1].event_id
+                self.assertIsNotNone(cursor)
+                page, total = store.list_task_events_window(
+                    "task-1",
+                    2,
+                    since_event_id=cursor,
+                    critical_kinds={"task.created", "task.finished"},
+                )
+                self.assertEqual(
+                    [event.event_id for event in page],
+                    [events[2].event_id, events[3].event_id],
+                )
+                self.assertEqual(total, 3)
+                self.assertTrue(all(event.event_id > cursor for event in page))
+
+                next_page, next_total = store.list_task_events_window(
+                    "task-1", 2, since_event_id=page[-1].event_id
+                )
+                self.assertEqual([event.event_id for event in next_page], [events[4].event_id])
+                self.assertEqual(next_total, 1)
+            finally:
+                store.close()
+
+    def test_incremental_event_window_rejects_invalid_cursor(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = self.create_store_with_task(Path(directory) / "invalid-cursor.sqlite3")
+            try:
+                for value in (-1, True, "1"):
+                    with self.assertRaises(ValueError):
+                        store.list_task_events_window(
+                            "task-1", 10, since_event_id=value  # type: ignore[arg-type]
+                        )
+            finally:
+                store.close()
+
     def test_append_event_foreign_key_rejects_missing_task(self) -> None:
         with TemporaryDirectory() as directory:
             store = SQLiteBridgeStore(Path(directory) / "bridge.sqlite3")

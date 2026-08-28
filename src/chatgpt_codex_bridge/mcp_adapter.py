@@ -28,6 +28,7 @@ MAX_EVENT_LIMIT = 1000
 DEFAULT_EVENT_LIMIT = 100
 MAX_CRITICAL_EVENT_RESULTS = 64
 MAX_EVENT_RESPONSE_BYTES = 512 * 1024
+MAX_EVENT_CURSOR = (1 << 63) - 1
 _RESULT_EVENT_KINDS = (
     "task.finished",
     "policy.git_checkpoint",
@@ -228,6 +229,51 @@ class MCPAdapter:
             selected.append(event_value)
         selected.sort(key=lambda event: event.get("event_id") or 0)
         return selected, omitted
+
+    def _bounded_incremental_event_response(
+        self,
+        task_id: str,
+        events: list[TaskEvent],
+        total: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Bound a cursor page to an ordered prefix without skipping events.
+
+        Cursor pages cannot retain the legacy critical-event tail: a non-
+        contiguous response would make an event-id cursor lose or duplicate
+        events.  If the byte budget is reached, stop at that event instead of
+        omitting it and later events; the returned cursor therefore advances
+        only across events actually delivered.
+        """
+
+        selected: list[dict[str, Any]] = []
+        for event in events:
+            event_value = _event_dict(event)
+            candidate = {
+                "task_id": task_id,
+                "events": [*selected, event_value],
+                "count": total,
+                "truncated": True,
+                "next_cursor": event_value.get("event_id"),
+            }
+            if self._response_size(candidate) > MAX_EVENT_RESPONSE_BYTES:
+                return selected, True
+            selected.append(event_value)
+        return selected, False
+
+    @staticmethod
+    def _validate_event_cursor(value: Any) -> int | None:
+        if value is None:
+            return None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > MAX_EVENT_CURSOR
+        ):
+            raise MCPToolError(
+                "argument 'since_event_id' must be a non-negative integer"
+            )
+        return value
 
     def _status(self) -> dict[str, Any]:
         worker_state = read_worker_state(self.store.db_path)
@@ -441,6 +487,7 @@ class MCPAdapter:
             task_id = _required_text(args, "task_id")
             if self.store.get_task(task_id) is None:
                 raise MCPToolError(f"task does not exist: {task_id}")
+            since_event_id = self._validate_event_cursor(args.get("since_event_id"))
             limit = args.get("limit")
             if limit is not None:
                 if isinstance(limit, bool) or not isinstance(limit, int):
@@ -453,17 +500,45 @@ class MCPAdapter:
             selected, total = self.store.list_task_events_window(
                 task_id,
                 requested_limit,
+                since_event_id=since_event_id,
                 critical_kinds=self._critical_event_kinds(),
                 critical_limit=MAX_CRITICAL_EVENT_RESULTS,
             )
-            selected_values, response_omitted = self._bounded_event_response(
-                task_id, selected, total
-            )
+            if since_event_id is None:
+                # Legacy callers retain the bounded head + critical-tail
+                # selection.  Its truncated response is not a safe cursor
+                # page, so next_cursor is null in that case.
+                selected_values, response_omitted = self._bounded_event_response(
+                    task_id, selected, total
+                )
+                truncated = response_omitted or len(selected_values) < total
+                next_cursor = None
+                if not truncated and selected_values:
+                    candidate_cursor = selected_values[-1].get("event_id")
+                    if isinstance(candidate_cursor, int) and not isinstance(
+                        candidate_cursor, bool
+                    ):
+                        next_cursor = candidate_cursor
+            else:
+                selected_values, response_omitted = (
+                    self._bounded_incremental_event_response(
+                        task_id, selected, total
+                    )
+                )
+                truncated = response_omitted or len(selected_values) < total
+                next_cursor = since_event_id
+                if selected_values:
+                    candidate_cursor = selected_values[-1].get("event_id")
+                    if isinstance(candidate_cursor, int) and not isinstance(
+                        candidate_cursor, bool
+                    ):
+                        next_cursor = candidate_cursor
             return {
                 "task_id": task_id,
                 "events": selected_values,
                 "count": total,
-                "truncated": response_omitted or len(selected_values) < total,
+                "truncated": truncated,
+                "next_cursor": next_cursor,
             }
         if name == "get_result":
             task = self.store.get_task(_required_text(args, "task_id"))
@@ -493,6 +568,7 @@ class MCPAdapter:
 __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_EVENT_LIMIT",
+    "MAX_EVENT_CURSOR",
     "MAX_EVENT_LIMIT",
     "MCPAdapter",
     "MCPConcurrencyError",
