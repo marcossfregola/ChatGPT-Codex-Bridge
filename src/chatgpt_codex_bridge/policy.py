@@ -24,6 +24,7 @@ from .domain.models import TaskMode
 
 _MAX_EVIDENCE_TEXT = 16_384
 _MAX_EVIDENCE_PATHS = 256
+TRUNCATION_SENTINEL = "[TRUNCATED]"
 GIT_COMMAND_TIMEOUT_SECONDS = 15.0
 
 
@@ -153,15 +154,14 @@ def _coerce_mode(mode: TaskMode | str) -> TaskMode:
 def _bounded_text(value: str, limit: int = _MAX_EVIDENCE_TEXT) -> str:
     if len(value) <= limit:
         return value
-    marker = "[TRUNCATED]"
-    return value[: limit - len(marker)] + marker
+    return value[: limit - len(TRUNCATION_SENTINEL)] + TRUNCATION_SENTINEL
 
 
 def _bounded_paths(paths: Iterable[str]) -> tuple[str, ...]:
     values = tuple(paths)
     if len(values) <= _MAX_EVIDENCE_PATHS:
         return values
-    return values[:_MAX_EVIDENCE_PATHS] + ("[TRUNCATED]",)
+    return values[:_MAX_EVIDENCE_PATHS] + (TRUNCATION_SENTINEL,)
 
 
 def _bounded_fingerprints(
@@ -170,25 +170,246 @@ def _bounded_fingerprints(
     values = tuple(fingerprints)
     if len(values) <= _MAX_EVIDENCE_PATHS:
         return values
-    return values[:_MAX_EVIDENCE_PATHS] + (("[TRUNCATED]", "", ""),)
+    return values[:_MAX_EVIDENCE_PATHS] + ((TRUNCATION_SENTINEL, "", ""),)
 
 
 def _evidence_is_complete(value: Any) -> bool:
     """Return whether bounded evidence contains no truncation sentinel."""
 
     if isinstance(value, str):
-        return not value.endswith("[TRUNCATED]")
+        return not value.endswith(TRUNCATION_SENTINEL)
     if isinstance(value, (list, tuple)):
         return not any(
-            item == "[TRUNCATED]"
+            item == TRUNCATION_SENTINEL
             or (
                 isinstance(item, (list, tuple))
                 and item
-                and item[0] == "[TRUNCATED]"
+                and item[0] == TRUNCATION_SENTINEL
             )
             for item in value
         )
     return True
+
+
+def _validate_fingerprint_path(path: Any, field_name: str) -> str:
+    """Validate one relative Git evidence path without touching the filesystem."""
+
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise ContinuationBaselineError(f"{field_name} contains an invalid path")
+    if any(ord(character) < 32 for character in path):
+        raise ContinuationBaselineError(f"{field_name} contains an invalid path")
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("/") or normalized.startswith("./"):
+        raise ContinuationBaselineError(f"{field_name} contains an unsafe path")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        raise ContinuationBaselineError(f"{field_name} contains an absolute path")
+    if any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise ContinuationBaselineError(f"{field_name} contains an unsafe path")
+    return path
+
+
+def validate_continuation_snapshot(
+    payload: Mapping[str, Any],
+    *,
+    expected_repo: str | os.PathLike[str] | None = None,
+    expected_branch: str | None = None,
+    expected_head: str | None = None,
+) -> dict[str, Any]:
+    """Validate and normalize a complete postflight-shaped Git snapshot.
+
+    Reconciled continuation evidence is durable authority.  It therefore may
+    not contain any of the bounded-evidence truncation sentinels used by the
+    normal event/response paths.  The returned mapping is JSON-safe and uses
+    the exact shape consumed by :func:`git_continuation_preflight`.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ContinuationBaselineError("continuation snapshot is not an object")
+
+    required_text = (
+        "repo_path",
+        "baseline_branch",
+        "baseline_head",
+        "final_branch",
+        "final_head",
+        "status_porcelain",
+        "diff",
+        "cached_diff",
+    )
+    values: dict[str, Any] = {}
+    for key in required_text:
+        value = payload.get(key)
+        if not isinstance(value, str):
+            raise ContinuationBaselineError(
+                f"continuation snapshot {key} evidence is incomplete"
+            )
+        if key in {"repo_path", "baseline_branch", "baseline_head", "final_branch", "final_head"} and not value:
+            raise ContinuationBaselineError(
+                f"continuation snapshot {key} identity is incomplete"
+            )
+        if not _evidence_is_complete(value):
+            raise ContinuationBaselineError(
+                "continuation snapshot Git evidence was truncated"
+            )
+        values[key] = value
+
+    if payload.get("policy_violation") is not False:
+        raise ContinuationBaselineError("continuation snapshot has a policy violation")
+    values["policy_violation"] = False
+
+    if expected_repo is not None:
+        try:
+            expected_root = _resolved_path(str(expected_repo), require_exists=True)
+            snapshot_root = _resolved_path(values["repo_path"], require_exists=True)
+        except (GitPreflightError, ValueError) as exc:
+            raise ContinuationBaselineError(
+                "continuation snapshot repo path is invalid"
+            ) from exc
+        if _path_key(expected_root) != _path_key(snapshot_root):
+            raise ContinuationBaselineError("continuation snapshot repo path differs")
+
+    if expected_branch is not None and values["baseline_branch"] != expected_branch:
+        raise ContinuationBaselineError("continuation snapshot baseline branch differs")
+    if expected_head is not None and values["baseline_head"] != expected_head:
+        raise ContinuationBaselineError("continuation snapshot baseline HEAD differs")
+    if values["final_branch"] != values["baseline_branch"]:
+        raise ContinuationBaselineError("continuation snapshot branch changed")
+    if values["final_head"] != values["baseline_head"]:
+        raise ContinuationBaselineError("continuation snapshot HEAD changed")
+
+    list_fields = ("changed_files", "untracked_files")
+    for key in list_fields:
+        value = payload.get(key)
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ContinuationBaselineError(
+                f"continuation snapshot {key} evidence is incomplete"
+            )
+        if not _evidence_is_complete(value):
+            raise ContinuationBaselineError(
+                "continuation snapshot paths were truncated"
+            )
+        for item in value:
+            _validate_fingerprint_path(item, f"continuation snapshot {key}")
+        values[key] = list(value)
+
+    for key in ("changed_files", "untracked_files"):
+        if len(set(values[key])) != len(values[key]):
+            raise ContinuationBaselineError(
+                f"continuation snapshot {key} contains duplicates"
+            )
+
+    raw_fingerprints = payload.get("content_fingerprints")
+    if not isinstance(raw_fingerprints, list):
+        raise ContinuationBaselineError(
+            "continuation snapshot lacks complete dirty content evidence"
+        )
+    if not _evidence_is_complete(raw_fingerprints):
+        raise ContinuationBaselineError(
+            "continuation snapshot dirty content evidence was truncated"
+        )
+    normalized_fingerprints: list[dict[str, str]] = []
+    seen_fingerprints: set[tuple[str, str]] = set()
+    for item in raw_fingerprints:
+        if not isinstance(item, Mapping):
+            raise ContinuationBaselineError(
+                "continuation snapshot dirty content evidence is invalid"
+            )
+        path = item.get("path")
+        state = item.get("state")
+        digest = item.get("sha256")
+        if path == TRUNCATION_SENTINEL:
+            raise ContinuationBaselineError(
+                "continuation snapshot dirty content evidence was truncated"
+            )
+        _validate_fingerprint_path(path, "continuation snapshot fingerprints")
+        if state not in {"staged", "unstaged", "untracked"}:
+            raise ContinuationBaselineError(
+                "continuation snapshot dirty content evidence is incomplete"
+            )
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ContinuationBaselineError(
+                "continuation snapshot dirty content evidence is incomplete"
+            )
+        identity = (path, state)
+        if identity in seen_fingerprints:
+            raise ContinuationBaselineError(
+                "continuation snapshot dirty content evidence contains duplicates"
+            )
+        seen_fingerprints.add(identity)
+        normalized_fingerprints.append(
+            {"path": path, "state": state, "sha256": digest}
+        )
+    normalized_fingerprints.sort(key=lambda item: (item["path"], item["state"]))
+    values["content_fingerprints"] = normalized_fingerprints
+
+    raw_untracked = payload.get("untracked_fingerprints")
+    if not isinstance(raw_untracked, list):
+        raise ContinuationBaselineError(
+            "continuation snapshot lacks untracked fingerprints"
+        )
+    if not _evidence_is_complete(raw_untracked):
+        raise ContinuationBaselineError(
+            "continuation snapshot untracked fingerprints were truncated"
+        )
+    normalized_untracked: list[dict[str, str]] = []
+    seen_untracked: set[str] = set()
+    for item in raw_untracked:
+        if not isinstance(item, Mapping):
+            raise ContinuationBaselineError(
+                "continuation snapshot untracked fingerprints are invalid"
+            )
+        path = item.get("path")
+        digest = item.get("sha256")
+        _validate_fingerprint_path(path, "continuation snapshot untracked fingerprints")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ContinuationBaselineError(
+                "continuation snapshot untracked fingerprints are incomplete"
+            )
+        if path in seen_untracked:
+            raise ContinuationBaselineError(
+                "continuation snapshot untracked fingerprints contain duplicates"
+            )
+        seen_untracked.add(path)
+        normalized_untracked.append({"path": path, "sha256": digest})
+    normalized_untracked.sort(key=lambda item: item["path"])
+    values["untracked_fingerprints"] = normalized_untracked
+
+    expected_untracked = {
+        item["path"]: item["sha256"]
+        for item in normalized_fingerprints
+        if item["state"] == "untracked"
+    }
+    actual_untracked = {item["path"]: item["sha256"] for item in normalized_untracked}
+    if actual_untracked != expected_untracked:
+        raise ContinuationBaselineError(
+            "continuation snapshot untracked fingerprints differ"
+        )
+
+    # Preserve the established postflight field order/shape while dropping any
+    # untrusted extension keys from the durable continuation baseline.
+    return {
+        "repo_path": values["repo_path"],
+        "baseline_branch": values["baseline_branch"],
+        "baseline_head": values["baseline_head"],
+        "final_branch": values["final_branch"],
+        "final_head": values["final_head"],
+        "status_porcelain": values["status_porcelain"],
+        "diff": values["diff"],
+        "cached_diff": values["cached_diff"],
+        "changed_files": values["changed_files"],
+        "untracked_files": values["untracked_files"],
+        "policy_violation": False,
+        "untracked_fingerprints": values["untracked_fingerprints"],
+        "content_fingerprints": values["content_fingerprints"],
+    }
 
 
 def _resolved_path(value: str | os.PathLike[str], *, require_exists: bool) -> Path:
@@ -363,7 +584,9 @@ def _git_branch(
         raise GitPreflightError("autonomous-write requires a named Git branch")
 
 
-def _parse_status(status: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+def _parse_status(
+    status: str, *, bounded: bool = True
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     staged: list[str] = []
     unstaged: list[str] = []
     untracked: list[str] = []
@@ -379,7 +602,9 @@ def _parse_status(status: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[
             staged.append(path)
         if code[1] != " ":
             unstaged.append(path)
-    return _bounded_paths(staged), _bounded_paths(unstaged), _bounded_paths(untracked)
+    if bounded:
+        return _bounded_paths(staged), _bounded_paths(unstaged), _bounded_paths(untracked)
+    return tuple(staged), tuple(unstaged), tuple(untracked)
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -441,6 +666,7 @@ def _content_fingerprints(
     untracked: Iterable[str],
     *,
     env: Mapping[str, str] | None = None,
+    bounded: bool = True,
 ) -> tuple[tuple[str, str, str], ...]:
     """Capture bounded SHA-256 evidence for every dirty file with content."""
 
@@ -458,7 +684,7 @@ def _content_fingerprints(
         if digest is not None:
             entries.append((path, "untracked", digest))
     entries.sort(key=lambda value: (value[0], value[1]))
-    return _bounded_fingerprints(entries)
+    return _bounded_fingerprints(entries) if bounded else tuple(entries)
 
 
 def _legacy_untracked_fingerprints(
@@ -490,6 +716,7 @@ def _git_state(
     allow_detached: bool = False,
     include_diff: bool = False,
     include_fingerprints: bool = False,
+    bounded: bool = True,
     env: Mapping[str, str] | None = None,
 ) -> tuple[
     str,
@@ -510,13 +737,15 @@ def _git_state(
     status = _git_with_env(
         repo, "status", "--porcelain", "--untracked-files=all", env=env
     )
-    staged, unstaged, untracked = _parse_status(status)
+    staged, unstaged, untracked = _parse_status(status, bounded=bounded)
     diff = _git_with_env(repo, "diff", env=env) if include_diff else ""
     cached_diff = (
         _git_with_env(repo, "diff", "--cached", env=env) if include_diff else ""
     )
     fingerprints = (
-        _content_fingerprints(repo, staged, unstaged, untracked, env=env)
+        _content_fingerprints(
+            repo, staged, unstaged, untracked, env=env, bounded=bounded
+        )
         if include_fingerprints
         else ()
     )
@@ -630,7 +859,7 @@ def git_continuation_preflight(
         path = value.get("path")
         state = value.get("state")
         digest = value.get("sha256")
-        if path == "[TRUNCATED]":
+        if path == TRUNCATION_SENTINEL:
             raise ContinuationBaselineError(
                 "previous dirty content evidence was truncated"
             )
@@ -652,6 +881,14 @@ def git_continuation_preflight(
             "previous dirty content evidence was truncated"
         )
 
+    capture_complete = any(
+        isinstance(value, str) and len(value) > _MAX_EVIDENCE_TEXT
+        for value in (expected_status, expected_diff, expected_cached_diff)
+    ) or any(
+        isinstance(value, list) and len(value) > _MAX_EVIDENCE_PATHS
+        for value in (expected_changed, expected_untracked, expected_fingerprints)
+    )
+
     (
         branch,
         head,
@@ -662,11 +899,20 @@ def git_continuation_preflight(
         diff,
         cached_diff,
         fingerprints,
-    ) = _git_state(repo, include_diff=True, include_fingerprints=True)
-    current_status = _bounded_text(status)
-    current_diff = _bounded_text(diff)
-    current_cached_diff = _bounded_text(cached_diff)
-    current_changed = _bounded_paths((*staged, *unstaged))
+    ) = _git_state(
+        repo,
+        include_diff=True,
+        include_fingerprints=True,
+        bounded=not capture_complete,
+    )
+    current_status = status if capture_complete else _bounded_text(status)
+    current_diff = diff if capture_complete else _bounded_text(diff)
+    current_cached_diff = cached_diff if capture_complete else _bounded_text(cached_diff)
+    current_changed = (
+        tuple((*staged, *unstaged))
+        if capture_complete
+        else _bounded_paths((*staged, *unstaged))
+    )
     if not _evidence_is_complete(current_status) or not _evidence_is_complete(
         current_diff
     ) or not _evidence_is_complete(current_cached_diff):
@@ -676,7 +922,7 @@ def git_continuation_preflight(
     ) or not _evidence_is_complete(fingerprints):
         raise ContinuationBaselineError("current Git paths are too numerous to compare")
     expected_staged, expected_unstaged, expected_untracked_paths = _parse_status(
-        expected_status
+        expected_status, bounded=not capture_complete
     )
     if (
         branch != expected_branch
@@ -738,6 +984,53 @@ def git_postflight(checkpoint: GitCheckpoint) -> GitPostflight:
         diff=_bounded_text(diff),
         cached_diff=_bounded_text(cached_diff),
         changed_files=changed,
+        untracked_files=untracked,
+        policy_violation=(
+            final_branch != checkpoint.baseline_branch
+            or final_head != checkpoint.baseline_head
+        ),
+        untracked_fingerprints=_legacy_untracked_fingerprints(fingerprints),
+        content_fingerprints=fingerprints,
+    )
+
+
+def git_postflight_complete(checkpoint: GitCheckpoint) -> GitPostflight:
+    """Collect an unbounded Git snapshot for explicit baseline adoption.
+
+    Normal task postflight remains bounded.  Recovery adoption is deliberately
+    explicit and durable, so it needs the complete status, diff, path, and
+    fingerprint sets rather than the preview sentinels used by MCP/event
+    responses.
+    """
+
+    repo = Path(checkpoint.repo_path)
+    (
+        final_branch,
+        final_head,
+        status,
+        staged,
+        unstaged,
+        untracked,
+        diff,
+        cached_diff,
+        fingerprints,
+    ) = _git_state(
+        repo,
+        allow_detached=True,
+        include_diff=True,
+        include_fingerprints=True,
+        bounded=False,
+    )
+    return GitPostflight(
+        repo_path=checkpoint.repo_path,
+        baseline_branch=checkpoint.baseline_branch,
+        baseline_head=checkpoint.baseline_head,
+        final_branch=final_branch,
+        final_head=final_head,
+        status_porcelain=status,
+        diff=diff,
+        cached_diff=cached_diff,
+        changed_files=tuple((*staged, *unstaged)),
         untracked_files=untracked,
         policy_violation=(
             final_branch != checkpoint.baseline_branch
@@ -1074,11 +1367,14 @@ __all__ = [
     "checkpoint_commit",
     "ensure_autonomous_workspace",
     "git_postflight",
+    "git_postflight_complete",
     "git_continuation_preflight",
     "git_checkpoint_commit",
     "git_preflight",
     "postflight_payload",
     "protected_roots",
+    "TRUNCATION_SENTINEL",
+    "validate_continuation_snapshot",
 ]
 
 

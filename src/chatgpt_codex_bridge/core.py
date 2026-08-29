@@ -52,8 +52,11 @@ from .policy import (
     git_checkpoint_prepare,
     _h4_rehydrate_prepared,
     git_postflight,
+    git_postflight_complete,
     git_preflight,
     postflight_payload,
+    TRUNCATION_SENTINEL,
+    validate_continuation_snapshot,
 )
 from .persistence.sqlite_store import (
     CHECKPOINT_CREATED_EVENT,
@@ -62,6 +65,7 @@ from .persistence.sqlite_store import (
     CHECKPOINT_STARTED_EVENT,
     D3_H3_CONTRACT,
     D3_R2_CONTRACT,
+    RECONCILIATION_BASELINE_ADOPTED_EVENT,
     SQLiteBridgeStore,
 )
 
@@ -96,6 +100,8 @@ _MAX_NOTIFICATION_TEXT = 4096
 # response without bound.
 MAX_EVIDENCE_PAYLOAD_BYTES = 16 * 1024
 MAX_FINAL_RESPONSE_BYTES = 12 * 1024
+RECONCILIATION_BASELINE_SCHEMA_VERSION = 1
+RECONCILIATION_BASELINE_KIND = "reconciled_continuation"
 _CRITICAL_EVIDENCE_KEYS = (
     "threadId",
     "turnId",
@@ -776,6 +782,591 @@ class BridgeCore:
             payload=payload,
         )
 
+    @staticmethod
+    def _snapshot_error_is_incomplete(
+        error: ContinuationBaselineError,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        expected_repo: str | None = None,
+        expected_branch: str | None = None,
+        expected_head: str | None = None,
+    ) -> bool:
+        """Return true only for a structurally valid snapshot with real truncation.
+
+        The exception is deliberately ignored.  Recovery eligibility comes only
+        from the postflight payload and the official Bridge sentinel; generic
+        validation-error wording is never treated as evidence of truncation.
+        """
+
+        del error
+        if not isinstance(payload, Mapping):
+            return False
+
+        sanitized = dict(payload)
+        found_sentinel = False
+
+        for key in ("status_porcelain", "diff", "cached_diff"):
+            value = payload.get(key)
+            if not isinstance(value, str):
+                continue
+            if TRUNCATION_SENTINEL not in value:
+                continue
+            if (
+                not value.endswith(TRUNCATION_SENTINEL)
+                or value.count(TRUNCATION_SENTINEL) != 1
+            ):
+                return False
+            sanitized[key] = value[: -len(TRUNCATION_SENTINEL)]
+            found_sentinel = True
+
+        for key in ("changed_files", "untracked_files"):
+            value = payload.get(key)
+            if not isinstance(value, list):
+                continue
+            sentinel_indexes = [
+                index
+                for index, item in enumerate(value)
+                if item == TRUNCATION_SENTINEL
+            ]
+            if sentinel_indexes and sentinel_indexes != [len(value) - 1]:
+                return False
+            if any(
+                isinstance(item, str) and TRUNCATION_SENTINEL in item
+                and item != TRUNCATION_SENTINEL
+                for item in value
+            ):
+                return False
+            if sentinel_indexes:
+                sanitized[key] = value[:-1]
+                found_sentinel = True
+
+        raw_fingerprints = payload.get("content_fingerprints")
+        if isinstance(raw_fingerprints, list):
+            sentinel_indexes: list[int] = []
+            for index, item in enumerate(raw_fingerprints):
+                if isinstance(item, Mapping):
+                    path = item.get("path")
+                    if isinstance(path, str) and TRUNCATION_SENTINEL in path:
+                        if item != {
+                            "path": TRUNCATION_SENTINEL,
+                            "state": "",
+                            "sha256": "",
+                        }:
+                            return False
+                        sentinel_indexes.append(index)
+                    if any(
+                        isinstance(value, str)
+                        and TRUNCATION_SENTINEL in value
+                        and not (
+                            path == TRUNCATION_SENTINEL
+                            and item == {
+                                "path": TRUNCATION_SENTINEL,
+                                "state": "",
+                                "sha256": "",
+                            }
+                        )
+                        for value in item.values()
+                    ):
+                        return False
+                elif isinstance(item, (list, tuple)):
+                    if any(
+                        isinstance(value, str) and TRUNCATION_SENTINEL in value
+                        for value in item
+                    ):
+                        return False
+                elif isinstance(item, str) and TRUNCATION_SENTINEL in item:
+                    return False
+            if sentinel_indexes and sentinel_indexes != [len(raw_fingerprints) - 1]:
+                return False
+            if sentinel_indexes:
+                sanitized["content_fingerprints"] = raw_fingerprints[:-1]
+                found_sentinel = True
+
+        # The historical postflight serializer never emits a truncation marker
+        # in the legacy untracked-fingerprint field.  Any marker there is
+        # therefore malformed evidence, not an adoption trigger.
+        raw_untracked_fingerprints = payload.get("untracked_fingerprints")
+        if isinstance(raw_untracked_fingerprints, list):
+            for item in raw_untracked_fingerprints:
+                values = item.values() if isinstance(item, Mapping) else item
+                if isinstance(values, (list, tuple)) and any(
+                    isinstance(value, str) and TRUNCATION_SENTINEL in value
+                    for value in values
+                ):
+                    return False
+
+        for key in (
+            "repo_path",
+            "baseline_branch",
+            "baseline_head",
+            "final_branch",
+            "final_head",
+        ):
+            value = payload.get(key)
+            if (
+                not isinstance(value, str)
+                or not value
+                or TRUNCATION_SENTINEL in value
+            ):
+                return False
+
+        if not found_sentinel:
+            return False
+        try:
+            validate_continuation_snapshot(
+                sanitized,
+                expected_repo=expected_repo,
+                expected_branch=expected_branch,
+                expected_head=expected_head,
+            )
+        except ContinuationBaselineError:
+            return False
+        return True
+
+    @staticmethod
+    def _canonical_path_key(value: str) -> str:
+        """Normalize a validated repository path for platform comparison."""
+
+        return str(value).replace("/", "\\").rstrip("\\").casefold()
+
+    @staticmethod
+    def _event_id(event: Any) -> int:
+        value = getattr(event, "event_id", None)
+        return value if isinstance(value, int) and value > 0 else 0
+
+    @staticmethod
+    def _preflight_only_failure(task: Task, events: list[Any]) -> bool:
+        """Return whether an AW failure has only an explicit preflight marker."""
+
+        if task.execution_status is not ExecutionStatus.FAILED:
+            return False
+        if any(
+            event.source == "bridge" and event.kind == "policy.postflight"
+            for event in events
+        ):
+            return False
+        return any(
+            event.source == "bridge"
+            and event.kind == "policy.violation"
+            and isinstance(event.payload, Mapping)
+            and event.payload.get("phase") == "preflight"
+            for event in events
+        )
+
+    def _assert_source_is_latest_continuation_candidate(
+        self, source_task: Task, source_postflight_event_id: int
+    ) -> None:
+        """Reject a source that is hidden by a newer autonomous execution."""
+
+        for candidate in self.store.list_tasks(source_task.project_id):
+            if (
+                candidate.task_id == source_task.task_id
+                or candidate.project_id != source_task.project_id
+                or candidate.mode is not TaskMode.AUTONOMOUS_WRITE
+            ):
+                continue
+            events = self.store.list_task_events(candidate.task_id)
+            postflights = [
+                event
+                for event in events
+                if event.source == "bridge" and event.kind == "policy.postflight"
+            ]
+            adoptions = [
+                event
+                for event in events
+                if event.source == "bridge"
+                and event.kind == RECONCILIATION_BASELINE_ADOPTED_EVENT
+            ]
+            violations = [
+                event
+                for event in events
+                if event.source == "bridge" and event.kind == "policy.violation"
+            ]
+            latest_relevant = max(
+                [self._event_id(event) for event in (*postflights, *adoptions, *violations)],
+                default=0,
+            )
+            if postflights:
+                latest_relevant = max(
+                    latest_relevant,
+                    self._event_id(max(postflights, key=self._event_id)),
+                )
+                if latest_relevant > source_postflight_event_id:
+                    raise ContinuationBaselineError(
+                        "source task is not the latest continuation candidate"
+                    )
+                # A non-final autonomous task with a later journal entry is a
+                # fail-closed barrier even if its postflight is historical.
+                if (
+                    candidate.execution_status is not ExecutionStatus.FINISHED
+                    and max((self._event_id(event) for event in events), default=0)
+                    > source_postflight_event_id
+                ):
+                    raise ContinuationBaselineError(
+                        "source task is not the latest continuation candidate"
+                    )
+                continue
+            if adoptions:
+                if max(self._event_id(event) for event in adoptions) > source_postflight_event_id:
+                    raise ContinuationBaselineError(
+                        "source task is not the latest continuation candidate"
+                    )
+                continue
+            if self._preflight_only_failure(candidate, events):
+                continue
+            if candidate.execution_status is ExecutionStatus.QUEUED:
+                continue
+            if max((self._event_id(event) for event in events), default=0) > source_postflight_event_id:
+                raise ContinuationBaselineError(
+                    "source task is not the latest continuation candidate"
+                )
+
+    def _validated_baseline_adoption_context(
+        self, source_task: Task, inspection_task_id: str
+    ) -> dict[str, Any]:
+        """Validate source and inspection provenance for explicit adoption."""
+
+        if source_task.mode is not TaskMode.AUTONOMOUS_WRITE:
+            raise ContinuationBaselineError(
+                "reconciliation baseline source must be AUTONOMOUS_WRITE"
+            )
+        if source_task.execution_status is not ExecutionStatus.FINISHED:
+            raise ContinuationBaselineError(
+                "reconciliation baseline source must be FINISHED"
+            )
+        if not isinstance(inspection_task_id, str) or not inspection_task_id.strip():
+            raise ContinuationBaselineError("inspection_task_id must be non-empty text")
+
+        project = self.store.get_project(source_task.project_id)
+        if project is None:
+            raise ContinuationBaselineError("source project does not exist")
+        project_root = ensure_autonomous_workspace(project.repo_path)
+
+        source_events = self.store.list_task_events(source_task.task_id)
+        if any(
+            event.source == "bridge" and event.kind == "policy.violation"
+            for event in source_events
+        ):
+            raise ContinuationBaselineError("source task has a policy violation")
+        postflight_events = [
+            event
+            for event in source_events
+            if event.source == "bridge" and event.kind == "policy.postflight"
+        ]
+        if not postflight_events:
+            raise ContinuationBaselineError("source task has no policy.postflight")
+        postflight_event = max(postflight_events, key=self._event_id)
+        postflight_event_id = self._event_id(postflight_event)
+        if not postflight_event_id or not isinstance(postflight_event.payload, Mapping):
+            raise ContinuationBaselineError("source policy.postflight evidence is invalid")
+        source_terminal = max(
+            (
+                event
+                for event in source_events
+                if event.source == "bridge" and event.kind == "task.finished"
+            ),
+            key=self._event_id,
+            default=None,
+        )
+        if (
+            source_terminal is None
+            or self._event_id(source_terminal) <= postflight_event_id
+        ):
+            raise ContinuationBaselineError(
+                "source terminal evidence is not posterior to policy.postflight"
+            )
+        if (
+            isinstance(source_terminal.payload, Mapping)
+            and source_terminal.payload.get("policy_violation") is True
+        ):
+            raise ContinuationBaselineError("source terminal evidence has a policy violation")
+        source_payload = dict(postflight_event.payload)
+        if source_payload.get("policy_violation") is not False:
+            raise ContinuationBaselineError("source policy.postflight has a policy violation")
+        identity_fields = (
+            "repo_path",
+            "baseline_branch",
+            "baseline_head",
+            "final_branch",
+            "final_head",
+        )
+        for key in identity_fields:
+            value = source_payload.get(key)
+            if not isinstance(value, str) or not value.strip() or "[TRUNCATED]" in value:
+                raise ContinuationBaselineError(
+                    f"source policy.postflight {key} identity is incomplete"
+                )
+        if (
+            source_payload["final_branch"] != source_payload["baseline_branch"]
+            or source_payload["final_head"] != source_payload["baseline_head"]
+        ):
+            raise ContinuationBaselineError(
+                "source policy.postflight branch or HEAD changed"
+            )
+        source_root = ensure_autonomous_workspace(source_payload["repo_path"])
+        if self._canonical_path_key(str(source_root)) != self._canonical_path_key(
+            str(project_root)
+        ):
+            raise ContinuationBaselineError("source policy.postflight repo path differs")
+        try:
+            validate_continuation_snapshot(
+                source_payload,
+                expected_repo=project.repo_path,
+                expected_branch=source_payload["baseline_branch"],
+                expected_head=source_payload["baseline_head"],
+            )
+        except ContinuationBaselineError as error:
+            if not self._snapshot_error_is_incomplete(
+                error,
+                source_payload,
+                expected_repo=project.repo_path,
+                expected_branch=source_payload["baseline_branch"],
+                expected_head=source_payload["baseline_head"],
+            ):
+                raise
+            source_validation_error = error
+        else:
+            raise ContinuationBaselineError(
+                "source policy.postflight evidence is already complete"
+            )
+
+        self._assert_source_is_latest_continuation_candidate(
+            source_task, postflight_event_id
+        )
+
+        inspection_task = self.store.get_task(inspection_task_id)
+        if inspection_task is None:
+            raise KeyError(f"task does not exist: {inspection_task_id}")
+        if inspection_task.mode is not TaskMode.READ_ONLY:
+            raise ContinuationBaselineError("inspection task must be READ_ONLY")
+        if inspection_task.execution_status is not ExecutionStatus.FINISHED:
+            raise ContinuationBaselineError("inspection task must be FINISHED")
+        if inspection_task.project_id != source_task.project_id:
+            raise ContinuationBaselineError(
+                "inspection task belongs to another project"
+            )
+        inspection_project = self.store.get_project(inspection_task.project_id)
+        if inspection_project is None:
+            raise ContinuationBaselineError("inspection project does not exist")
+        inspection_root = ensure_autonomous_workspace(inspection_project.repo_path)
+        if self._canonical_path_key(str(inspection_root)) != self._canonical_path_key(
+            str(project_root)
+        ):
+            raise ContinuationBaselineError("inspection repository differs")
+        inspection_events = self.store.list_task_events(inspection_task_id)
+        if any(
+            event.source == "bridge" and event.kind == "policy.violation"
+            for event in inspection_events
+        ):
+            raise ContinuationBaselineError("inspection task has a policy violation")
+        inspection_terminal = max(
+            (
+                event
+                for event in inspection_events
+                if event.source == "bridge" and event.kind == "task.finished"
+            ),
+            key=self._event_id,
+            default=None,
+        )
+        inspection_terminal_event_id = self._event_id(inspection_terminal)
+        if (
+            inspection_terminal is None
+            or not inspection_terminal_event_id
+            or inspection_terminal_event_id <= postflight_event_id
+        ):
+            raise ContinuationBaselineError(
+                "inspection terminal evidence is not posterior to source postflight"
+            )
+        if (
+            isinstance(inspection_terminal.payload, Mapping)
+            and inspection_terminal.payload.get("policy_violation") is True
+        ):
+            raise ContinuationBaselineError(
+                "inspection terminal evidence has a policy violation"
+            )
+
+        checkpoint = GitCheckpoint(
+            repo_path=str(source_root),
+            baseline_branch=source_payload["baseline_branch"],
+            baseline_head=source_payload["baseline_head"],
+            status_porcelain="",
+            staged_paths=(),
+            unstaged_paths=(),
+            untracked_paths=(),
+            baseline_kind="reconciled_continuation",
+        )
+        return {
+            "project": project,
+            "source_events": source_events,
+            "inspection_events": inspection_events,
+            "source_postflight": postflight_event,
+            "source_postflight_payload": source_payload,
+            "source_postflight_validation_error": source_validation_error,
+            "inspection_task": inspection_task,
+            "inspection_terminal": inspection_terminal,
+            "checkpoint": checkpoint,
+            "source_high_water": max(
+                (self._event_id(event) for event in source_events), default=0
+            ),
+            "inspection_high_water": max(
+                (self._event_id(event) for event in inspection_events), default=0
+            ),
+        }
+
+    @staticmethod
+    def _baseline_adoption_fingerprint(
+        *,
+        source_task_id: str,
+        source_postflight_event_id: int,
+        inspection_task_id: str,
+        inspection_terminal_event_id: int,
+        project_id: str,
+        source_high_water_event_id: int,
+        inspection_high_water_event_id: int,
+        snapshot: Mapping[str, Any],
+    ) -> str:
+        """Hash all durable adoption provenance and the complete Git snapshot."""
+
+        material = {
+            "schema_version": RECONCILIATION_BASELINE_SCHEMA_VERSION,
+            "baseline_kind": RECONCILIATION_BASELINE_KIND,
+            "source_task_id": source_task_id,
+            "source_postflight_event_id": source_postflight_event_id,
+            "inspection_task_id": inspection_task_id,
+            "inspection_terminal_event_id": inspection_terminal_event_id,
+            "project_id": project_id,
+            "source_high_water_event_id": source_high_water_event_id,
+            "inspection_high_water_event_id": inspection_high_water_event_id,
+            "snapshot": snapshot,
+        }
+        encoded = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _capture_reconciled_snapshot(
+        self, checkpoint: GitCheckpoint, project: Project
+    ) -> dict[str, Any]:
+        """Capture one complete, branch-stable Git snapshot for adoption."""
+
+        try:
+            postflight = git_postflight_complete(checkpoint)
+            payload = postflight_payload(postflight)
+            return validate_continuation_snapshot(
+                payload,
+                expected_repo=project.repo_path,
+                expected_branch=checkpoint.baseline_branch,
+                expected_head=checkpoint.baseline_head,
+            )
+        except ContinuationBaselineError:
+            raise
+        except Exception as error:
+            raise ContinuationBaselineError(
+                "Git state could not be captured for reconciliation adoption"
+            ) from error
+
+    def adopt_reconciled_continuation_baseline(
+        self, source_task_id: str, inspection_task_id: str
+    ) -> dict[str, Any]:
+        """Adopt two identical, Bridge-captured Git snapshots explicitly."""
+
+        source_task = self.store.get_task(source_task_id)
+        if source_task is None:
+            raise KeyError(f"task does not exist: {source_task_id}")
+        context = self._validated_baseline_adoption_context(
+            source_task, inspection_task_id
+        )
+        project = context["project"]
+        checkpoint = context["checkpoint"]
+
+        first_snapshot = self._capture_reconciled_snapshot(checkpoint, project)
+        second_snapshot = self._capture_reconciled_snapshot(checkpoint, project)
+        if first_snapshot != second_snapshot:
+            raise ContinuationBaselineError(
+                "Git state changed during reconciliation baseline adoption"
+            )
+
+        source_postflight_event_id = self._event_id(context["source_postflight"])
+        inspection_terminal_event_id = self._event_id(context["inspection_terminal"])
+        source_high_water = context["source_high_water"]
+        inspection_high_water = context["inspection_high_water"]
+        # A retry must reproduce the exact original durable payload.  Reuse
+        # the original high-water marks rather than making a second event look
+        # different merely because the first adoption is now in the journal.
+        existing_adoptions = [
+            event
+            for event in context["source_events"]
+            if event.source == "bridge"
+            and event.kind == RECONCILIATION_BASELINE_ADOPTED_EVENT
+        ]
+        if len(existing_adoptions) == 1 and isinstance(
+            existing_adoptions[0].payload, Mapping
+        ):
+            existing_payload = existing_adoptions[0].payload
+            for key, fallback in (
+                ("source_high_water_event_id", source_high_water),
+                ("inspection_high_water_event_id", inspection_high_water),
+            ):
+                value = existing_payload.get(key)
+                if isinstance(value, int) and value > 0:
+                    if key == "source_high_water_event_id":
+                        source_high_water = value
+                    else:
+                        inspection_high_water = value
+
+        evidence_fingerprint = self._baseline_adoption_fingerprint(
+            source_task_id=source_task.task_id,
+            source_postflight_event_id=source_postflight_event_id,
+            inspection_task_id=inspection_task_id,
+            inspection_terminal_event_id=inspection_terminal_event_id,
+            project_id=source_task.project_id,
+            source_high_water_event_id=source_high_water,
+            inspection_high_water_event_id=inspection_high_water,
+            snapshot=first_snapshot,
+        )
+        adoption_payload: dict[str, Any] = {
+            "schema_version": RECONCILIATION_BASELINE_SCHEMA_VERSION,
+            "baseline_kind": RECONCILIATION_BASELINE_KIND,
+            "source_task_id": source_task.task_id,
+            "source_postflight_event_id": source_postflight_event_id,
+            "inspection_task_id": inspection_task_id,
+            "inspection_terminal_event_id": inspection_terminal_event_id,
+            "project_id": source_task.project_id,
+            "repo_path": first_snapshot["repo_path"],
+            "baseline_branch": first_snapshot["baseline_branch"],
+            "baseline_head": first_snapshot["baseline_head"],
+            "final_branch": first_snapshot["final_branch"],
+            "final_head": first_snapshot["final_head"],
+            "source_high_water_event_id": source_high_water,
+            "inspection_high_water_event_id": inspection_high_water,
+            "snapshot": first_snapshot,
+            "fingerprint": evidence_fingerprint,
+            "evidence_fingerprint": evidence_fingerprint,
+        }
+        try:
+            event, created = self.store.persist_reconciliation_baseline_adoption(
+                source_task.task_id,
+                adoption_payload,
+                source_high_water=context["source_high_water"],
+                inspection_task_id=inspection_task_id,
+                inspection_high_water=context["inspection_high_water"],
+            )
+        except TaskStateError as error:
+            raise ContinuationBaselineError(str(error)) from error
+        return {
+            "adopted": True,
+            "idempotent": not created,
+            "source_task_id": source_task.task_id,
+            "inspection_task_id": inspection_task_id,
+            "adoption_event_id": event.event_id,
+            "baseline_kind": RECONCILIATION_BASELINE_KIND,
+            "fingerprint": evidence_fingerprint,
+        }
+
     def _checkpoint_for_task(self, task_id: str) -> GitCheckpoint | None:
         """Rehydrate the last autonomous checkpoint for orphan recovery."""
 
@@ -825,13 +1416,451 @@ class BridgeCore:
             )
         return None
 
+    @staticmethod
+    def _strict_checkpoint_from_event(event: Any) -> GitCheckpoint:
+        """Rehydrate one complete initial ``policy.git_checkpoint`` event."""
+
+        if (
+            getattr(event, "source", None) != "bridge"
+            or getattr(event, "kind", None) != "policy.git_checkpoint"
+            or getattr(event, "event_id", None) is None
+        ):
+            raise ContinuationBaselineError("source Git checkpoint evidence is missing")
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, Mapping):
+            raise ContinuationBaselineError("source Git checkpoint evidence is invalid")
+        if payload.get("mode") != TaskMode.AUTONOMOUS_WRITE.value:
+            raise ContinuationBaselineError("source Git checkpoint mode is invalid")
+
+        required = (
+            "repo_path",
+            "baseline_branch",
+            "baseline_head",
+            "status_porcelain",
+            "staged_paths",
+            "unstaged_paths",
+            "untracked_paths",
+            "baseline_kind",
+        )
+        if not all(key in payload for key in required):
+            raise ContinuationBaselineError("source Git checkpoint evidence is incomplete")
+        if not all(
+            isinstance(payload[key], str) and bool(payload[key])
+            for key in ("repo_path", "baseline_branch", "baseline_head", "baseline_kind")
+        ):
+            raise ContinuationBaselineError("source Git checkpoint identity is incomplete")
+        status = payload["status_porcelain"]
+        if not isinstance(status, str) or status.endswith("[TRUNCATED]"):
+            raise ContinuationBaselineError("source Git checkpoint evidence was truncated")
+
+        def paths(name: str) -> tuple[str, ...]:
+            value = payload.get(name)
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ContinuationBaselineError(
+                    f"source Git checkpoint {name} evidence is incomplete"
+                )
+            if any(item == "[TRUNCATED]" for item in value):
+                raise ContinuationBaselineError("source Git checkpoint paths were truncated")
+            return tuple(value)
+
+        previous_task_id = payload.get("previous_task_id")
+        if previous_task_id is not None and (
+            not isinstance(previous_task_id, str) or not previous_task_id
+        ):
+            raise ContinuationBaselineError("source Git checkpoint previous task is invalid")
+        return GitCheckpoint(
+            repo_path=payload["repo_path"],
+            baseline_branch=payload["baseline_branch"],
+            baseline_head=payload["baseline_head"],
+            status_porcelain=status,
+            staged_paths=paths("staged_paths"),
+            unstaged_paths=paths("unstaged_paths"),
+            untracked_paths=paths("untracked_paths"),
+            baseline_kind=payload["baseline_kind"],
+            previous_task_id=previous_task_id,
+        )
+
+    def _validated_reconciliation_context(
+        self,
+        source_task: Task,
+        reconciliation_id: str,
+        inspection_task_id: str,
+    ) -> dict[str, Any]:
+        """Validate source/inspection provenance for reconciliation adoption."""
+
+        if source_task.mode is not TaskMode.AUTONOMOUS_WRITE:
+            raise ContinuationBaselineError(
+                "reconciliation baseline source must be AUTONOMOUS_WRITE"
+            )
+        if source_task.execution_status is not ExecutionStatus.FAILED:
+            raise ContinuationBaselineError(
+                "reconciliation baseline source must be FAILED"
+            )
+        if not isinstance(reconciliation_id, str) or not reconciliation_id.strip():
+            raise ContinuationBaselineError("reconciliation_id must be non-empty text")
+        if not isinstance(inspection_task_id, str) or not inspection_task_id.strip():
+            raise ContinuationBaselineError("inspection_task_id must be non-empty text")
+
+        source_events = self.store.list_task_events(source_task.task_id)
+        state = self.store.get_reconciliation_state(source_task.task_id)
+        if state is None or not state.get("required") or not state.get("resolved"):
+            raise ContinuationBaselineError(
+                "source task does not have a resolved reconciliation"
+            )
+        if state.get("reconciliation_id") != reconciliation_id:
+            raise ContinuationBaselineError("reconciliation_id is stale or incorrect")
+        required_event = state.get("required_event")
+        resolved_event = state.get("resolved_event")
+        required_event_id = getattr(required_event, "event_id", None)
+        resolved_event_id = getattr(resolved_event, "event_id", None)
+        if (
+            not isinstance(required_event_id, int)
+            or required_event_id <= 0
+            or not isinstance(resolved_event_id, int)
+            or resolved_event_id <= required_event_id
+        ):
+            raise ContinuationBaselineError("reconciliation provenance is incomplete")
+        resolved_payload = getattr(resolved_event, "payload", None)
+        if not isinstance(resolved_payload, Mapping):
+            raise ContinuationBaselineError("reconciliation resolution evidence is invalid")
+        if (
+            resolved_payload.get("reconciliation_id") != reconciliation_id
+            or resolved_payload.get("resolution") != ExecutionStatus.FAILED.value
+            or resolved_payload.get("resolver") != "mcp"
+        ):
+            raise ContinuationBaselineError(
+                "reconciliation was not resolved by resolve_task_reconciliation"
+            )
+        failed_event = next(
+            (
+                event
+                for event in source_events
+                if event.source == "bridge"
+                and event.kind == "task.failed"
+                and (event.event_id or 0) > resolved_event_id
+                and isinstance(event.payload, Mapping)
+                and event.payload.get("reconciliation_id") == reconciliation_id
+            ),
+            None,
+        )
+        if failed_event is None:
+            raise ContinuationBaselineError(
+                "resolved reconciliation lacks its FAILED terminal evidence"
+            )
+
+        checkpoint_events = [
+            event
+            for event in source_events
+            if event.source == "bridge" and event.kind == "policy.git_checkpoint"
+        ]
+        if len(checkpoint_events) != 1:
+            raise ContinuationBaselineError(
+                "source task must have exactly one initial Git checkpoint"
+            )
+        checkpoint_event = checkpoint_events[0]
+        checkpoint = self._strict_checkpoint_from_event(checkpoint_event)
+        if (checkpoint_event.event_id or 0) >= required_event_id:
+            raise ContinuationBaselineError("source Git checkpoint evidence is not initial")
+
+        project = self.store.get_project(source_task.project_id)
+        if project is None:
+            raise ContinuationBaselineError("source project does not exist")
+
+        inspection_task = self.store.get_task(inspection_task_id)
+        if inspection_task is None:
+            raise KeyError(f"task does not exist: {inspection_task_id}")
+        if inspection_task.mode is not TaskMode.READ_ONLY:
+            raise ContinuationBaselineError("inspection task must be READ_ONLY")
+        if inspection_task.execution_status is not ExecutionStatus.FINISHED:
+            raise ContinuationBaselineError("inspection task must be FINISHED")
+        if inspection_task.project_id != source_task.project_id:
+            raise ContinuationBaselineError(
+                "inspection task belongs to another Project"
+            )
+        inspection_events = self.store.list_task_events(inspection_task_id)
+        inspection_terminal = max(
+            (
+                event
+                for event in inspection_events
+                if event.source == "bridge" and event.kind == "task.finished"
+            ),
+            key=lambda event: event.event_id or 0,
+            default=None,
+        )
+        if inspection_terminal is None or (inspection_terminal.event_id or 0) <= required_event_id:
+            raise ContinuationBaselineError(
+                "inspection terminal evidence is not posterior to reconciliation"
+            )
+
+        return {
+            "project": project,
+            "source_events": source_events,
+            "inspection_events": inspection_events,
+            "required_event": required_event,
+            "resolved_event": resolved_event,
+            "failed_event": failed_event,
+            "checkpoint_event": checkpoint_event,
+            "checkpoint": checkpoint,
+            "inspection_task": inspection_task,
+            "inspection_terminal": inspection_terminal,
+            "source_high_water": max(
+                (event.event_id or 0 for event in source_events), default=0
+            ),
+            "inspection_high_water": max(
+                (event.event_id or 0 for event in inspection_events), default=0
+            ),
+        }
+
+    @staticmethod
+    def _adoption_fingerprint(
+        *,
+        source_task_id: str,
+        reconciliation_id: str,
+        inspection_task_id: str,
+        project_id: str,
+        source_checkpoint_event_id: int,
+        reconciliation_required_event_id: int,
+        reconciliation_resolved_event_id: int,
+        inspection_terminal_event_id: int,
+        snapshot: Mapping[str, Any],
+    ) -> str:
+        material = {
+            "schema_version": RECONCILIATION_BASELINE_SCHEMA_VERSION,
+            "baseline_kind": RECONCILIATION_BASELINE_KIND,
+            "source_task_id": source_task_id,
+            "reconciliation_id": reconciliation_id,
+            "inspection_task_id": inspection_task_id,
+            "project_id": project_id,
+            "source_checkpoint_event_id": source_checkpoint_event_id,
+            "reconciliation_required_event_id": reconciliation_required_event_id,
+            "reconciliation_resolved_event_id": reconciliation_resolved_event_id,
+            "inspection_terminal_event_id": inspection_terminal_event_id,
+            "snapshot": snapshot,
+        }
+        encoded = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _adoption_snapshot_from_event(
+        cls,
+        event: Any,
+        candidate: Task,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate one durable adoption event and return its Git snapshot."""
+
+        if event.source != "bridge" or event.kind != RECONCILIATION_BASELINE_ADOPTED_EVENT:
+            raise ContinuationBaselineError("adoption event kind is invalid")
+        payload = event.payload
+        if not isinstance(payload, Mapping):
+            raise ContinuationBaselineError("adoption event payload is invalid")
+        if payload.get("schema_version") != RECONCILIATION_BASELINE_SCHEMA_VERSION:
+            raise ContinuationBaselineError("adoption event schema is unsupported")
+        if payload.get("baseline_kind") != RECONCILIATION_BASELINE_KIND:
+            raise ContinuationBaselineError("adoption event baseline kind is invalid")
+        source_task_id = payload.get("source_task_id")
+        reconciliation_id = payload.get("reconciliation_id")
+        inspection_task_id = payload.get("inspection_task_id")
+        project_id = payload.get("project_id")
+        if (
+            source_task_id != candidate.task_id
+            or not isinstance(reconciliation_id, str)
+            or not reconciliation_id
+            or not isinstance(inspection_task_id, str)
+            or not inspection_task_id
+            or project_id != candidate.project_id
+        ):
+            raise ContinuationBaselineError("adoption event provenance is invalid")
+        checkpoint_event = context["checkpoint_event"]
+        required_event = context["required_event"]
+        resolved_event = context["resolved_event"]
+        inspection_terminal = context["inspection_terminal"]
+
+        def event_ref(name: str, expected: Any) -> int:
+            value = payload.get(name)
+            expected_id = getattr(expected, "event_id", None)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                or value != expected_id
+            ):
+                raise ContinuationBaselineError(f"adoption event {name} is invalid")
+            return value
+
+        checkpoint_id = event_ref("source_checkpoint_event_id", checkpoint_event)
+        required_id = event_ref("reconciliation_required_event_id", required_event)
+        resolved_id = event_ref("reconciliation_resolved_event_id", resolved_event)
+        inspection_id = event_ref("inspection_terminal_event_id", inspection_terminal)
+        if (event.event_id or 0) <= max(resolved_id, inspection_id):
+            raise ContinuationBaselineError("adoption event ordering is invalid")
+
+        snapshot = payload.get("snapshot")
+        normalized = validate_continuation_snapshot(
+            snapshot,
+            expected_repo=context["checkpoint"].repo_path,
+            expected_branch=context["checkpoint"].baseline_branch,
+            expected_head=context["checkpoint"].baseline_head,
+        )
+        expected_fingerprint = cls._adoption_fingerprint(
+            source_task_id=source_task_id,
+            reconciliation_id=reconciliation_id,
+            inspection_task_id=inspection_task_id,
+            project_id=project_id,
+            source_checkpoint_event_id=checkpoint_id,
+            reconciliation_required_event_id=required_id,
+            reconciliation_resolved_event_id=resolved_id,
+            inspection_terminal_event_id=inspection_id,
+            snapshot=normalized,
+        )
+        if payload.get("evidence_fingerprint") != expected_fingerprint:
+            raise ContinuationBaselineError("adoption evidence fingerprint is invalid")
+        for key in ("repo_path", "baseline_branch", "baseline_head", "final_branch", "final_head"):
+            if key in payload and payload[key] != normalized[key]:
+                raise ContinuationBaselineError("adoption event summary differs from snapshot")
+        return normalized
+
+    def _baseline_adoption_snapshot_from_event(
+        self,
+        event: Any,
+        candidate: Task,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate one explicit adoption against its exact source postflight."""
+
+        if event.source != "bridge" or event.kind != RECONCILIATION_BASELINE_ADOPTED_EVENT:
+            raise ContinuationBaselineError("adoption event kind is invalid")
+        payload = event.payload
+        if not isinstance(payload, Mapping):
+            raise ContinuationBaselineError("adoption event payload is invalid")
+        if payload.get("schema_version") != RECONCILIATION_BASELINE_SCHEMA_VERSION:
+            raise ContinuationBaselineError("adoption event schema is unsupported")
+        if payload.get("baseline_kind") != RECONCILIATION_BASELINE_KIND:
+            raise ContinuationBaselineError("adoption event baseline kind is invalid")
+        source_postflight = context["source_postflight"]
+        inspection_terminal = context["inspection_terminal"]
+        source_postflight_id = self._event_id(source_postflight)
+        inspection_terminal_id = self._event_id(inspection_terminal)
+        if (
+            payload.get("source_task_id") != candidate.task_id
+            or payload.get("project_id") != candidate.project_id
+            or payload.get("inspection_task_id") != context["inspection_task"].task_id
+        ):
+            raise ContinuationBaselineError("adoption event provenance is invalid")
+
+        def event_ref(name: str, expected: int) -> int:
+            value = payload.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                or value != expected
+            ):
+                raise ContinuationBaselineError(f"adoption event {name} is invalid")
+            return value
+
+        source_ref = event_ref("source_postflight_event_id", source_postflight_id)
+        inspection_ref = event_ref("inspection_terminal_event_id", inspection_terminal_id)
+        adoption_id = self._event_id(event)
+        if adoption_id <= max(source_ref, inspection_ref):
+            raise ContinuationBaselineError("adoption event ordering is invalid")
+
+        source_high_water = payload.get("source_high_water_event_id")
+        inspection_high_water = payload.get("inspection_high_water_event_id")
+        if (
+            isinstance(source_high_water, bool)
+            or not isinstance(source_high_water, int)
+            or source_high_water < source_ref
+            or source_high_water >= adoption_id
+            or isinstance(inspection_high_water, bool)
+            or not isinstance(inspection_high_water, int)
+            or inspection_high_water < inspection_ref
+        ):
+            raise ContinuationBaselineError("adoption event high-water is invalid")
+        if any(
+            self._event_id(item) > adoption_id
+            for item in context["source_events"]
+        ):
+            raise ContinuationBaselineError("source task changed after baseline adoption")
+        source_prior_high_water = max(
+            (
+                self._event_id(item)
+                for item in context["source_events"]
+                if self._event_id(item) < adoption_id
+            ),
+            default=0,
+        )
+        if source_high_water != source_prior_high_water:
+            raise ContinuationBaselineError("source task high-water is not exact")
+        inspection_actual_high_water = max(
+            (self._event_id(item) for item in context["inspection_events"]),
+            default=0,
+        )
+        if inspection_high_water != inspection_actual_high_water:
+            raise ContinuationBaselineError("inspection task high-water is not exact")
+        if any(
+            self._event_id(item) > inspection_high_water
+            for item in context["inspection_events"]
+        ):
+            raise ContinuationBaselineError(
+                "inspection task changed after baseline adoption"
+            )
+
+        snapshot = payload.get("snapshot")
+        normalized = validate_continuation_snapshot(
+            snapshot,
+            expected_repo=context["project"].repo_path,
+            expected_branch=context["source_postflight_payload"]["baseline_branch"],
+            expected_head=context["source_postflight_payload"]["baseline_head"],
+        )
+        expected_fingerprint = self._baseline_adoption_fingerprint(
+            source_task_id=candidate.task_id,
+            source_postflight_event_id=source_ref,
+            inspection_task_id=context["inspection_task"].task_id,
+            inspection_terminal_event_id=inspection_ref,
+            project_id=candidate.project_id,
+            source_high_water_event_id=source_high_water,
+            inspection_high_water_event_id=inspection_high_water,
+            snapshot=normalized,
+        )
+        if payload.get("fingerprint") != expected_fingerprint or payload.get(
+            "evidence_fingerprint"
+        ) != expected_fingerprint:
+            raise ContinuationBaselineError("adoption evidence fingerprint is invalid")
+        for key in (
+            "repo_path",
+            "baseline_branch",
+            "baseline_head",
+            "final_branch",
+            "final_head",
+        ):
+            if payload.get(key) != normalized[key]:
+                raise ContinuationBaselineError("adoption event summary differs from snapshot")
+        return normalized
+
     def _previous_continuation_baseline(
         self, task: Task
     ) -> tuple[str, dict[str, Any]] | None:
-        """Return the latest eligible durable autonomous postflight baseline."""
+        """Return the latest eligible explicit continuation baseline."""
 
         latest: tuple[int, str, dict[str, Any]] | None = None
-        blocking_event_id: int | None = None
+        blocker: tuple[int, str, ContinuationBaselineError | None] | None = None
+
+        def add_blocker(
+            event_id: int, reason: str, error: ContinuationBaselineError | None = None
+        ) -> None:
+            nonlocal blocker
+            if event_id <= 0:
+                return
+            if blocker is None or event_id > blocker[0]:
+                blocker = (event_id, reason, error)
+
         for candidate in self.store.list_tasks(task.project_id):
             if (
                 candidate.task_id == task.task_id
@@ -840,61 +1869,122 @@ class BridgeCore:
             ):
                 continue
             events = self.store.list_task_events(candidate.task_id)
-            latest_event_id = max(
-                (event.event_id or 0 for event in events), default=0
-            )
-            postflight_events = [
+            postflights = [
                 event
                 for event in events
                 if event.source == "bridge" and event.kind == "policy.postflight"
             ]
-            if not postflight_events:
-                preflight_failure = any(
-                    event.source == "bridge"
-                    and event.kind == "policy.violation"
-                    and isinstance(event.payload, dict)
-                    and event.payload.get("phase") == "preflight"
-                    for event in events
-                )
+            adoptions = [
+                event
+                for event in events
+                if event.source == "bridge"
+                and event.kind == RECONCILIATION_BASELINE_ADOPTED_EVENT
+            ]
+            violations = [
+                event
+                for event in events
+                if event.source == "bridge" and event.kind == "policy.violation"
+            ]
+            latest_event_id = max((self._event_id(event) for event in events), default=0)
+            candidate_baseline: tuple[int, str, dict[str, Any]] | None = None
+
+            if adoptions:
+                if len(adoptions) != 1:
+                    add_blocker(max(self._event_id(event) for event in adoptions), "invalid")
+                else:
+                    adoption = adoptions[0]
+                    try:
+                        adoption_payload = adoption.payload
+                        if not isinstance(adoption_payload, Mapping):
+                            raise ContinuationBaselineError(
+                                "adoption event payload is invalid"
+                            )
+                        inspection_id = adoption_payload.get("inspection_task_id")
+                        if not isinstance(inspection_id, str) or not inspection_id:
+                            raise ContinuationBaselineError(
+                                "adoption event provenance is invalid"
+                            )
+                        context = self._validated_baseline_adoption_context(
+                            candidate, inspection_id
+                        )
+                        snapshot = self._baseline_adoption_snapshot_from_event(
+                            adoption, candidate, context
+                        )
+                        candidate_baseline = (
+                            self._event_id(adoption),
+                            candidate.task_id,
+                            snapshot,
+                        )
+                    except (ContinuationBaselineError, KeyError) as error:
+                        add_blocker(
+                            self._event_id(adoption) or latest_event_id,
+                            "invalid",
+                            error if isinstance(error, ContinuationBaselineError) else None,
+                        )
+
+            if candidate_baseline is None and postflights and not adoptions:
+                postflight = max(postflights, key=self._event_id)
+                payload = postflight.payload
                 if (
-                    candidate.execution_status is ExecutionStatus.QUEUED
-                    or (
-                        candidate.execution_status is ExecutionStatus.FAILED
-                        and preflight_failure
-                    )
+                    candidate.execution_status is ExecutionStatus.FINISHED
+                    and self._event_id(postflight)
+                    and isinstance(payload, Mapping)
+                    and not violations
+                    and payload.get("policy_violation") is False
                 ):
+                    try:
+                        normalized = validate_continuation_snapshot(
+                            payload,
+                            expected_repo=payload.get("repo_path"),
+                            expected_branch=payload.get("baseline_branch"),
+                            expected_head=payload.get("baseline_head"),
+                        )
+                    except ContinuationBaselineError as error:
+                        reason = (
+                            "incomplete"
+                            if self._snapshot_error_is_incomplete(
+                                error,
+                                payload,
+                                expected_repo=payload.get("repo_path"),
+                                expected_branch=payload.get("baseline_branch"),
+                                expected_head=payload.get("baseline_head"),
+                            )
+                            else "invalid"
+                        )
+                        add_blocker(self._event_id(postflight), reason, error)
+                    else:
+                        candidate_baseline = (
+                            self._event_id(postflight),
+                            candidate.task_id,
+                            normalized,
+                        )
+                else:
+                    add_blocker(latest_event_id, "invalid")
+            elif candidate_baseline is None and adoptions:
+                # An adoption is an explicit attempted replacement.  A
+                # malformed one must not silently expose the historical
+                # postflight or an older task as a baseline.
+                if not postflights:
+                    add_blocker(latest_event_id, "invalid")
+
+            if candidate_baseline is None and not postflights and not adoptions:
+                if self._preflight_only_failure(candidate, events):
                     continue
-                # A preflight-only failure has no Codex/postflight evidence and
-                # therefore cannot have changed the worktree.  Other AW states
-                # without postflight evidence remain ambiguous barriers.
-                if latest_event_id:
-                    blocking_event_id = max(blocking_event_id or 0, latest_event_id)
-                continue
-            postflight = max(
-                postflight_events,
-                key=lambda event: event.event_id if event.event_id is not None else 0,
-            )
-            payload = postflight.payload
-            if (
-                candidate.execution_status is not ExecutionStatus.FINISHED
-                or postflight.event_id is None
-                or not isinstance(payload, dict)
-                or payload.get("policy_violation") is not False
-                or any(
-                    event.source == "bridge" and event.kind == "policy.violation"
-                    for event in events
-                )
-            ):
-                # Do not fall back to stale evidence when a newer AW execution
-                # has an invalid postflight or is not durably FINISHED.
-                if latest_event_id:
-                    blocking_event_id = max(blocking_event_id or 0, latest_event_id)
-                continue
-            if latest is None or postflight.event_id > latest[0]:
-                latest = (postflight.event_id, candidate.task_id, payload)
+                if candidate.execution_status is ExecutionStatus.QUEUED:
+                    continue
+                add_blocker(latest_event_id, "invalid")
+
+            if candidate_baseline is not None:
+                if latest is None or candidate_baseline[0] > latest[0]:
+                    latest = candidate_baseline
+
         if latest is None:
+            if blocker is not None and blocker[2] is not None:
+                raise blocker[2]
             return None
-        if blocking_event_id is not None and blocking_event_id > latest[0]:
+        if blocker is not None and blocker[0] > latest[0]:
+            if blocker[2] is not None:
+                raise blocker[2]
             return None
         _, previous_task_id, previous_postflight = latest
         return previous_task_id, previous_postflight

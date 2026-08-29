@@ -184,6 +184,27 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
         )
 
     @server.tool(
+        name="adopt_reconciled_continuation_baseline",
+        description=(
+            "Adopt a double-captured Git state for a FINISHED autonomous task "
+            "whose durable postflight evidence is incomplete."
+        ),
+        structured_output=True,
+    )
+    async def adopt_reconciled_continuation_baseline(
+        source_task_id: str,
+        inspection_task_id: str,
+    ) -> dict[str, Any]:
+        return await _call_adapter(
+            adapter,
+            "adopt_reconciled_continuation_baseline",
+            {
+                "source_task_id": source_task_id,
+                "inspection_task_id": inspection_task_id,
+            },
+        )
+
+    @server.tool(
         name="commit_checkpoint",
         description="Create one verified local checkpoint commit for a finished autonomous task.",
         structured_output=True,

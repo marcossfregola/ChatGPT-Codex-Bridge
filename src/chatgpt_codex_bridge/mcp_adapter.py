@@ -320,6 +320,7 @@ class MCPAdapter:
             "task.recovered",
             "task.reconciliation_required",
             "task.reconciliation_resolved",
+            "reconciliation.baseline_adopted",
             "policy.git_checkpoint",
             "policy.postflight",
             "policy.violation",
@@ -962,6 +963,11 @@ class MCPAdapter:
                 raise MCPToolError("resolution must be FAILED")
             return self.core.resolve_task_reconciliation(
                 task_id, reconciliation_id, resolution
+            )
+        if name == "adopt_reconciled_continuation_baseline":
+            return self.core.adopt_reconciled_continuation_baseline(
+                _required_text(args, "source_task_id"),
+                _required_text(args, "inspection_task_id"),
             )
         if name == "commit_checkpoint":
             return self.core.commit_checkpoint(
