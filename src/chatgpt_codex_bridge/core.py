@@ -954,13 +954,21 @@ class BridgeCore:
         )
 
     def _assert_source_is_latest_continuation_candidate(
-        self, source_task: Task, source_postflight_event_id: int
+        self,
+        source_task: Task,
+        source_postflight_event_id: int,
+        *,
+        excluded_task_id: str | None = None,
     ) -> None:
         """Reject a source that is hidden by a newer autonomous execution."""
 
         for candidate in self.store.list_tasks(source_task.project_id):
             if (
                 candidate.task_id == source_task.task_id
+                or (
+                    excluded_task_id is not None
+                    and candidate.task_id == excluded_task_id
+                )
                 or candidate.project_id != source_task.project_id
                 or candidate.mode is not TaskMode.AUTONOMOUS_WRITE
             ):
@@ -1022,7 +1030,11 @@ class BridgeCore:
                 )
 
     def _validated_baseline_adoption_context(
-        self, source_task: Task, inspection_task_id: str
+        self,
+        source_task: Task,
+        inspection_task_id: str,
+        *,
+        excluded_task_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate source and inspection provenance for explicit adoption."""
 
@@ -1131,7 +1143,9 @@ class BridgeCore:
             )
 
         self._assert_source_is_latest_continuation_candidate(
-            source_task, postflight_event_id
+            source_task,
+            postflight_event_id,
+            excluded_task_id=excluded_task_id,
         )
 
         inspection_task = self.store.get_task(inspection_task_id)
@@ -1905,7 +1919,9 @@ class BridgeCore:
                                 "adoption event provenance is invalid"
                             )
                         context = self._validated_baseline_adoption_context(
-                            candidate, inspection_id
+                            candidate,
+                            inspection_id,
+                            excluded_task_id=task.task_id,
                         )
                         snapshot = self._baseline_adoption_snapshot_from_event(
                             adoption, candidate, context

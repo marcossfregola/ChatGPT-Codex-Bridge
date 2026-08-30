@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from chatgpt_codex_bridge.core import BridgeCore  # noqa: E402
 from chatgpt_codex_bridge.domain.models import ExecutionStatus, TaskMode  # noqa: E402
 from chatgpt_codex_bridge.executors.base import ExecutionResult  # noqa: E402
+from chatgpt_codex_bridge.execution_worker import ExecutionWorker  # noqa: E402
 from chatgpt_codex_bridge.mcp_adapter import MCPAdapter  # noqa: E402
 from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
     RECONCILIATION_BASELINE_ADOPTED_EVENT,
@@ -224,6 +225,123 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
         self.assertEqual(checkpoint.payload["previous_task_id"], source.task_id)
         self.assertEqual((repo / "app.txt").read_text(encoding="utf-8"), "SURVIVOR\n")
+
+    async def test_worker_running_task_accepts_adopted_baseline_without_self_invalidation(
+        self,
+    ) -> None:
+        repo, source, inspection, _, _ = self._seed_source()
+        self.core.adopt_reconciled_continuation_baseline(
+            source.task_id, inspection.task_id
+        )
+
+        executor = FinishedExecutor()
+        continuation_core = BridgeCore(self.store, executor)
+        current = continuation_core.create_task(
+            "project-adoption",
+            "continue through the persistent worker",
+            task_id="task-current-worker",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        adapter = MCPAdapter(continuation_core, self.store)
+        accepted = await adapter.call_tool("run_task", {"task_id": current.task_id})
+        worker = ExecutionWorker(
+            self.store,
+            continuation_core,
+            worker_id="worker-adopted-baseline",
+            pid=42001,
+        )
+
+        claimed = worker.claim_next()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(claimed.execution_status, ExecutionStatus.RUNNING)
+        self.assertEqual(
+            [event.kind for event in self.store.list_task_events(current.task_id)],
+            [
+                "task.created",
+                "task.execution_requested",
+                "task.execution_claimed",
+                "task.started",
+            ],
+        )
+        adoption_event = self._adoption_events(source.task_id)[0]
+        current_initial_events = self.store.list_task_events(current.task_id)
+        self.assertGreater(
+            max(event.event_id or 0 for event in current_initial_events),
+            adoption_event.event_id or 0,
+        )
+
+        finished = await continuation_core.execute_claimed_task(current.task_id)
+
+        self.assertEqual(finished.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(executor.requests), 1)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
+        self.assertEqual(checkpoint.payload["previous_task_id"], source.task_id)
+        self.assertEqual((repo / "app.txt").read_text(encoding="utf-8"), "SURVIVOR\n")
+
+    async def test_adopted_baseline_revalidation_still_rejects_another_later_autonomous_candidate(
+        self,
+    ) -> None:
+        _, source, inspection, _, _ = self._seed_source()
+        self.core.adopt_reconciled_continuation_baseline(
+            source.task_id, inspection.task_id
+        )
+
+        executor = FinishedExecutor()
+        continuation_core = BridgeCore(self.store, executor)
+        adapter = MCPAdapter(continuation_core, self.store)
+        worker = ExecutionWorker(
+            self.store,
+            continuation_core,
+            worker_id="worker-intervening-baseline",
+            pid=42002,
+        )
+        intervening = continuation_core.create_task(
+            "project-adoption",
+            "intervene after the adopted baseline",
+            task_id="task-intervening-worker",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        await adapter.call_tool("run_task", {"task_id": intervening.task_id})
+        intervening_claimed = worker.claim_next()
+        self.assertIsNotNone(intervening_claimed)
+        assert intervening_claimed is not None
+        self.assertEqual(intervening_claimed.execution_status, ExecutionStatus.RUNNING)
+
+        current = continuation_core.create_task(
+            "project-adoption",
+            "must reject an intervening autonomous task",
+            task_id="task-current-intervening",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        await adapter.call_tool("run_task", {"task_id": current.task_id})
+        current_claimed = worker.claim_next()
+        self.assertIsNotNone(current_claimed)
+        assert current_claimed is not None
+        self.assertEqual(current_claimed.execution_status, ExecutionStatus.RUNNING)
+
+        adoption_event = self._adoption_events(source.task_id)[0]
+        intervening_events = self.store.list_task_events(intervening.task_id)
+        self.assertGreater(
+            max(event.event_id or 0 for event in intervening_events),
+            adoption_event.event_id or 0,
+        )
+        source_task = self.store.get_task(source.task_id)
+        assert source_task is not None
+        with self.assertRaises(ContinuationBaselineError):
+            continuation_core._validated_baseline_adoption_context(  # noqa: SLF001
+                source_task,
+                inspection.task_id,
+                excluded_task_id=current.task_id,
+            )
+
+        self.assertEqual(executor.requests, [])
 
     async def test_large_git_evidence_uses_complete_adoption_snapshot(self) -> None:
         repo, source, inspection, _, _ = self._seed_source(large_change=True)
