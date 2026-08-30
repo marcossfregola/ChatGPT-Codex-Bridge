@@ -35,34 +35,38 @@ function Get-VerifiedWorkerProcess {
 
     $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
     if ($null -eq $process) {
-        return $null
+        return [pscustomobject]@{ Status = "ABSENT"; Process = $null; Reason = "not running" }
     }
     $actualPath = $null
     try {
         $actualPath = $process.Path
     }
     catch {
-        return $null
+        return [pscustomobject]@{ Status = "AMBIGUOUS"; Process = $process; Reason = "executable path unavailable" }
     }
     if ([string]::IsNullOrWhiteSpace($actualPath) -or
         ((Resolve-Path -LiteralPath $actualPath).Path -ine $expectedPython)) {
-        return $null
+        return [pscustomobject]@{ Status = "MISMATCH"; Process = $process; Reason = "executable path mismatch" }
     }
-    $record = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
-    if ($null -eq $record) {
-        # Some restricted Windows sessions deny the WMI command-line query.
-        # The exact PID plus the exact Bridge .venv executable is the safe
-        # fallback; the worker lock remains the authoritative duplicate guard.
-        return $process
+    try {
+        $records = @(Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -OperationTimeoutSec 3 -ErrorAction Stop)
+        if ($records.Count -ne 1) {
+            throw "CIM returned no unique process record."
+        }
     }
+    catch {
+        return [pscustomobject]@{ Status = "AMBIGUOUS"; Process = $process; Reason = "CIM command line is unavailable" }
+    }
+    $record = $records[0]
     $commandLine = [string]$record.CommandLine
-    if ($commandLine -notmatch "chatgpt_codex_bridge\.execution_worker") {
-        return $null
+    if ([string]::IsNullOrWhiteSpace($commandLine) -or
+        $commandLine -notmatch "chatgpt_codex_bridge\.execution_worker") {
+        return [pscustomobject]@{ Status = "MISMATCH"; Process = $process; Reason = "unexpected worker command line" }
     }
     if ($commandLine -notmatch [regex]::Escape($dbPath)) {
-        return $null
+        return [pscustomobject]@{ Status = "MISMATCH"; Process = $process; Reason = "worker DB path mismatch" }
     }
-    return $process
+    return [pscustomobject]@{ Status = "VERIFIED"; Process = $process; Reason = "identity verified" }
 }
 
 function Get-ValidPidFromFile {
@@ -89,17 +93,28 @@ try {
         $expectedPython = (Resolve-Path -LiteralPath $python).Path
     }
 
+    # Do not launch a worker that this host cannot later identify.  A CIM
+    # command-line query is mandatory for every lifecycle identity decision;
+    # an inaccessible query is a startup failure, never a path-only decision.
+    $probeRecords = @(Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $PID) -OperationTimeoutSec 3 -ErrorAction Stop)
+    if ($probeRecords.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$probeRecords[0].CommandLine)) {
+        throw "CIM command line is unavailable; refusing to launch an unverifiable worker."
+    }
+
     New-Item -ItemType Directory -Force -Path $stateRoot | Out-Null
     New-Item -ItemType Directory -Force -Path $logsRoot | Out-Null
 
     $existingPid = Get-ValidPidFromFile $pidFile
     if ($existingPid -gt 0) {
         $existing = Get-VerifiedWorkerProcess $existingPid
-        if ($null -ne $existing) {
+        if ($existing.Status -eq "VERIFIED") {
             Write-Output "WORKER_ALREADY_RUNNING"
             Write-Output ("WORKER_PID=" + $existingPid)
             Write-Output ("DB_PATH=" + $dbPath)
             exit 0
+        }
+        if ($existing.Status -eq "AMBIGUOUS") {
+            throw "The existing worker PID cannot be identified completely; refusing to start around ambiguous state."
         }
         Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
     }
@@ -123,7 +138,7 @@ try {
         $pidFromWorker = Get-ValidPidFromFile $pidFile
         if ($pidFromWorker -gt 0) {
             $verified = Get-VerifiedWorkerProcess $pidFromWorker
-            if ($null -ne $verified) {
+            if ($verified.Status -eq "VERIFIED") {
                 Write-Output "WORKER_STARTED"
                 Write-Output ("WORKER_PID=" + $pidFromWorker)
                 Write-Output ("DB_PATH=" + $dbPath)
@@ -160,7 +175,7 @@ catch {
             $workerProcess.Refresh()
             if (!$workerProcess.HasExited) {
                 $verified = Get-VerifiedWorkerProcess $workerProcess.Id
-                if ($null -ne $verified) {
+                if ($verified.Status -eq "VERIFIED") {
                     [IO.File]::WriteAllText(
                         $stopFile,
                         "{`"requested_by`":`"start_execution_worker`"}" + [Environment]::NewLine,

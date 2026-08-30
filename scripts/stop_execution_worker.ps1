@@ -74,13 +74,14 @@ function Get-WorkerProcess {
         ((Resolve-Path -LiteralPath $actualPath).Path -ine $expectedPython)) {
         throw "The recorded PID is not the Bridge .venv Python worker; refusing to stop it."
     }
-    $record = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
-    if ($null -eq $record) {
-        # Restricted Windows sessions may deny the WMI command-line query.
-        return $process
+    $records = @(Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -OperationTimeoutSec 3 -ErrorAction Stop)
+    if ($records.Count -ne 1) {
+        throw "CIM command line is unavailable for worker PID $ProcessId; refusing partial identity."
     }
+    $record = $records[0]
     $commandLine = [string]$record.CommandLine
-    if ($commandLine -notmatch "chatgpt_codex_bridge\.execution_worker" -or
+    if ([string]::IsNullOrWhiteSpace($commandLine) -or
+        $commandLine -notmatch "chatgpt_codex_bridge\.execution_worker" -or
         $commandLine -notmatch [regex]::Escape($dbPath)) {
         throw "The recorded PID is not the D3 execution worker; refusing to stop it."
     }

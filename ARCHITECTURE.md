@@ -133,6 +133,15 @@ verificable y el script se niega a terminar procesos. `doctor_execution_worker.p
 es sólo lectura y muestra PID/state, proceso, lock, DB y Tasks solicitadas o en
 ejecución.
 
+El protocolo de emergencia `scripts/reset_bridge.ps1` es deliberadamente
+distinto: tras verificar PID, ejecutable, command line CIM y perfil/runtime, puede
+terminar el túnel directo de esta instalación cuando no existe una parada
+gestionada. Si CIM no entrega una identidad única, falla cerrado y no detiene el
+proceso. Después mueve el directorio `state` completo a `state.archive` y arranca
+el worker sobre una base nueva; nunca recupera ni reconcilia la base archivada.
+El protocolo no enumera ni modifica repositorios de Projects y conserva
+credenciales, perfil y binarios.
+
 El runtime no reutiliza rutas, procesos, locks, perfiles ni secretos del
 ChatGPT–OpenCode Bridge ni de VisorVideosDevBridge.
 

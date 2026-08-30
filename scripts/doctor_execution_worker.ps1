@@ -93,19 +93,20 @@ if ($workerPid -gt 0) {
         $pathMatches = $pythonAvailable -and
             -not [string]::IsNullOrWhiteSpace($actualPath) -and
             ((Resolve-Path -LiteralPath $actualPath).Path -ieq $expectedPython)
-        $record = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $workerPid) -ErrorAction SilentlyContinue
-        $commandMatches = $true
+        $record = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $workerPid) -OperationTimeoutSec 3 -ErrorAction SilentlyContinue
+        $commandMatches = $false
         if ($null -ne $record) {
             $commandLine = [string]$record.CommandLine
-            $commandMatches = $commandLine -match "chatgpt_codex_bridge\.execution_worker" -and
+            $commandMatches = -not [string]::IsNullOrWhiteSpace($commandLine) -and
+                $commandLine -match "chatgpt_codex_bridge\.execution_worker" -and
                 $commandLine -match [regex]::Escape($dbPath)
         }
         if ($pathMatches -and $commandMatches) {
             $processActive = $true
-            $processIdentity = if ($null -eq $record) { "PATH_VERIFIED_WMI_UNAVAILABLE" } else { "VERIFIED" }
+            $processIdentity = "VERIFIED"
         }
         else {
-            $processIdentity = "MISMATCH"
+            $processIdentity = if ($null -eq $record) { "CIM_UNAVAILABLE" } else { "MISMATCH" }
         }
     }
 }

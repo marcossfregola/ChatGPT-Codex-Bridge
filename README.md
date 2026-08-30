@@ -46,6 +46,42 @@ El runtime operativo de esta etapa es **ChatGPT–Codex Bridge D3-R2-B**. El
 complemento original conserva un schema MCP cacheado anterior a `TaskMode`; no
 debe borrarse ni modificarse destructivamente.
 
+## EMERGENCY HARD RESET
+
+Cuando el Bridge queda bloqueado, interrumpido o con estado durable dudoso, el
+protocolo operativo es un único comando desde el checkout:
+
+```powershell
+cd C:\Codex\ChatGPT-Codex-Bridge
+pwsh -NoProfile -File .\scripts\reset_bridge.ps1
+```
+
+El reset detiene el worker y el túnel D3 (incluido el túnel directo iniciado por
+`start_mcp_tunnel.ps1`), mueve el directorio `state` completo a
+`%LOCALAPPDATA%\ChatGPTCodexBridge\state.archive\<UTC>-<guid>`, y crea una base
+nueva mediante el código normal del Bridge. No inspecciona ni recupera el
+archivo. El perfil, la credencial DPAPI, los binarios del túnel, el checkout y
+los repositorios de Projects quedan fuera de la operación.
+
+Antes de detener un proceso exige el PID y una identidad completa: executable
+exacto, command line CIM disponible y el módulo/DB (worker) o perfil/runtime D3
+(túnel). Un CIM inaccesible, un PID ajeno o un candidato ambiguo producen
+`FAIL/NO` sin `Stop-Process`. Si `tunnel.pid` falta, sólo se considera el
+`tunnel-client.exe` exacto de esta instalación; ningún candidato o un candidato
+ambiguo se maneja de forma segura sin matar por nombre global.
+
+Sólo una salida con estas dos últimas líneas confirma el resultado:
+
+```text
+BRIDGE_RESET=PASS
+READY_FOR_CHATGPT=YES
+```
+
+En cualquier otro resultado el reset es `FAIL/NO`; no se debe asumir readiness.
+El comando es idempotente: una segunda ejecución archiva la base vacía actual y
+vuelve a iniciar un Bridge vacío. Las pruebas del protocolo usan un
+`LOCALAPPDATA` temporal y nunca el runtime productivo.
+
 ## Flujo
 
 ```text

@@ -110,6 +110,8 @@ try {
     [void]$startInfo.ArgumentList.Add($profileFile)
     [void]$startInfo.ArgumentList.Add("--cloudflared.path")
     [void]$startInfo.ArgumentList.Add($cloudflared)
+    [void]$startInfo.ArgumentList.Add("--health.listen-addr")
+    [void]$startInfo.ArgumentList.Add("127.0.0.1:0")
     $startInfo.Environment["CONTROL_PLANE_API_KEY"] = $apiKey
 
     $doctorProcess = [Diagnostics.Process]::new()

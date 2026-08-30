@@ -13,6 +13,23 @@ SCRIPTS = ROOT / "scripts"
 PWSH = shutil.which("pwsh")
 
 
+def _cim_available() -> bool:
+    probe = subprocess.run(
+        [
+            str(PWSH),
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "try { Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object -First 1 | Out-Null; exit 0 } catch { exit 1 }",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
 @unittest.skipUnless(os.name == "nt" and PWSH, "PowerShell 7 is required")
 class WorkerScriptLifecycleTests(unittest.TestCase):
     def _run(
@@ -56,6 +73,8 @@ class WorkerScriptLifecycleTests(unittest.TestCase):
         )
 
     def test_start_double_start_doctor_and_controlled_stop(self) -> None:
+        if not _cim_available():
+            self.skipTest("strict worker lifecycle identity requires accessible CIM")
         with tempfile.TemporaryDirectory() as directory:
             first = self._run("start_execution_worker.ps1", directory, capture=False)
             self.assertEqual(first.returncode, 0)
@@ -90,6 +109,8 @@ class WorkerScriptLifecycleTests(unittest.TestCase):
             self.assertIn("WORKER_ACTIVE=false", after.stdout)
 
     def test_runtime_wrappers_report_partial_start_and_stop_in_order(self) -> None:
+        if not _cim_available():
+            self.skipTest("strict worker lifecycle identity requires accessible CIM")
         with tempfile.TemporaryDirectory() as directory:
             started = self._run("start_runtime.ps1", directory, capture=False)
             self.assertNotEqual(started.returncode, 0)

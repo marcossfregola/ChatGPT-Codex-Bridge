@@ -16,6 +16,7 @@ SCRIPTS = (
     ROOT / "scripts" / "doctor_execution_worker.ps1",
     ROOT / "scripts" / "start_runtime.ps1",
     ROOT / "scripts" / "stop_runtime.ps1",
+    ROOT / "scripts" / "reset_bridge.ps1",
 )
 GUARD_MESSAGE = "This script requires PowerShell 7+. Run it with pwsh."
 
@@ -33,6 +34,17 @@ class PowerShellScriptTests(unittest.TestCase):
                 self.assertLess(guard, text.index("ProcessStartInfo"))
             if "ArgumentList.Add" in text:
                 self.assertLess(guard, text.index("ArgumentList.Add"))
+
+    def test_process_identity_helpers_have_no_partial_fallback(self) -> None:
+        for script_name in ("start_execution_worker.ps1", "stop_execution_worker.ps1", "reset_bridge.ps1"):
+            text = (ROOT / "scripts" / script_name).read_text(encoding="utf-8").lower()
+            self.assertNotIn("verified_" + "fallback", text)
+            self.assertNotIn("safe " + "fallback", text)
+
+    def test_tunnel_doctor_uses_ephemeral_health_probe_port(self) -> None:
+        text = (ROOT / "scripts" / "doctor_mcp_tunnel.ps1").read_text(encoding="utf-8")
+        self.assertIn('[void]$startInfo.ArgumentList.Add("--health.listen-addr")', text)
+        self.assertIn('[void]$startInfo.ArgumentList.Add("127.0.0.1:0")', text)
 
     @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell 5.1 unavailable")
     def test_windows_powershell_51_fails_immediately_without_runtime_start(self) -> None:

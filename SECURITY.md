@@ -135,6 +135,30 @@ explícito. Un perfil directo no ofrece una parada graceful local verificable: e
 script se niega a terminar procesos. El doctor del worker es de sólo lectura y
 no elimina sidecars ni detiene procesos.
 
+### Emergency hard reset
+
+`scripts/reset_bridge.ps1` es una operación deliberadamente destructiva sólo
+para el estado interno del Bridge. Antes de actuar comprueba PowerShell 7, el
+checkout, la raíz canónica `%LOCALAPPDATA%\ChatGPTCodexBridge`, el Python del
+`.venv`, el perfil, los binarios y la credencial. Cada PID se verifica contra el
+ejecutable instalado, la línea de comando obtenida por CIM y la base/runtime
+correspondiente; si la command line no está disponible, la identidad es ambigua,
+el reset falla y no detiene ningún proceso. Nunca se termina un proceso por
+nombre global. Un túnel directo puede terminarse de forma forzada únicamente
+después de esa identidad exacta;
+un túnel gestionado se intenta detener mediante `runtimes status/stop` y se
+comprueba el mismo PID.
+
+Tras detener los componentes, el directorio `state` se mueve atómicamente a un
+directorio forense único dentro de `state.archive`. El archivo nunca se lee,
+restaura ni mezcla con el estado nuevo. La base vacía se crea al arrancar el
+worker con `SQLiteBridgeStore`; una consulta SQLite de sólo lectura exige schema
+vigente y cero `projects`, `tasks`, `task_events` y tareas `QUEUED/RUNNING`.
+`secrets`, `tunnel-client`, el perfil, el checkout y los repositorios externos no
+son objetivos de limpieza. Si falla cualquier preflight, identidad, archive,
+arranque, readiness o doctor, las últimas líneas son `BRIDGE_RESET=FAIL` y
+`READY_FOR_CHATGPT=NO`, con código de salida distinto de cero.
+
 ## Tiempos y recuperación
 
 - RPC corto: deadline total de 30 s.
