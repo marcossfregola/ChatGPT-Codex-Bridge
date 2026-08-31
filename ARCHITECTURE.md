@@ -121,24 +121,33 @@ El runtime independiente vive en:
 La base default es
 `%LOCALAPPDATA%\ChatGPTCodexBridge\state\bridge.sqlite3`; `--db-path` permite
 laboratorios aislados. Los scripts versionados start/stop/doctor usan sólo esa
-raíz. El perfil externo del tunnel-client usa `channel: main`, el tunnel ID
-autorizado, MCP stdio y readiness local en `127.0.0.1:8877/readyz`.
+raíz. El perfil externo del tunnel-client usa `channel: main`, el mismo Tunnel
+ID histórico autorizado y MCP stdio. La readiness se comprueba con
+`tunnel-client health --port 8877 --pid-file <tunnel.pid>
+--require-control-plane-poll --json`; no depende de `health.url`.
 
 El lifecycle normal se opera con `start_runtime.ps1` y `stop_runtime.ps1`.
 `start_runtime.ps1` inicia worker y túnel en ese orden, sin duplicar los que ya
-estén vivos; `stop_runtime.ps1` solicita primero el cierre controlado del worker
-mediante stop-file y luego usa `tunnel-client runtimes stop` con un alias
-gestionado explícito. Un perfil directo no ofrece una parada graceful local
-verificable y el script se niega a terminar procesos. `doctor_execution_worker.ps1`
-es sólo lectura y muestra PID/state, proceso, lock, DB y Tasks solicitadas o en
-ejecución.
+estén vivos, arrancando el túnel directo con `tunnel-client run
+--profile-file <profile-file> --pid.file <tunnel.pid>`. `stop_runtime.ps1`
+solicita primero el cierre controlado del worker mediante stop-file y luego
+ejecuta el Stop directo del túnel. Ese Stop usa el PID sidecar
+`%LOCALAPPDATA%\ChatGPTCodexBridge\tunnel-state\tunnel.pid`, valida que el PID
+vivo corresponda exactamente al executable instalado y, sólo después, termina
+exclusivamente ese PID y su árbol con `taskkill.exe /PID <verified_pid> /T /F`.
+Un PID ausente o stale se trata de forma idempotente; un PID inválido o un
+executable ajeno falla cerrado. No hay búsqueda ni terminación por nombre
+genérico. El Tunnel ID sólo debe estar operativo en una máquina a la vez.
+`doctor_execution_worker.ps1` es sólo lectura y muestra PID/state, proceso,
+lock, DB y Tasks solicitadas o en ejecución.
 
 El protocolo de emergencia `scripts/reset_bridge.ps1` es deliberadamente
-distinto: tras verificar PID, ejecutable, command line CIM y perfil/runtime, puede
-terminar el túnel directo de esta instalación cuando no existe una parada
-gestionada. Si CIM no entrega una identidad única, falla cerrado y no detiene el
-proceso. Después mueve el directorio `state` completo a `state.archive` y arranca
-el worker sobre una base nueva; nunca recupera ni reconcilia la base archivada.
+distinto: tras verificar PID, ejecutable, command line CIM y perfil, puede
+terminar el túnel directo de esta instalación durante la recuperación. Si CIM no
+entrega una identidad única, falla cerrado y no detiene el proceso. Después
+mueve el directorio `state` completo a `state.archive` y arranca el worker sobre
+una base nueva; nunca recupera ni reconcilia la base archivada. Este protocolo
+no cambia el lifecycle normal directo descrito arriba.
 El protocolo no enumera ni modifica repositorios de Projects y conserva
 credenciales, perfil y binarios.
 
@@ -229,8 +238,12 @@ RELIABLY`); por eso no se agregó un Job Object ni containment adicional.
 ## Observabilidad y límites
 
 `get_status` incorpora la señal bounded del worker (`worker_active`,
-`worker_pid`, `worker_owner`, `requested_task_id` y `running_task_id`), mientras
-que `doctor_execution_worker.ps1` verifica el proceso y la DB con más detalle.
+`worker_pid`, `worker_owner`, `requested_task_id` y `running_task_id`), además de
+`instance_id` configurado localmente mediante
+`CHATGPT_CODEX_BRIDGE_INSTANCE_ID` y `hostname` obtenido del sistema local.
+El `instance_id` se recorta y toma `UNCONFIGURED` cuando falta o está en blanco;
+no hay una identidad de máquina hardcodeada. `doctor_execution_worker.ps1`
+verifica el proceso y la DB con más detalle.
 `get_task_events` expone el journal y `get_result` recupera la respuesta final
 y la evidencia Git. No se persisten rollouts Codex, credenciales, raw stderr,
 duración total, retry history ni una auditoría ChatGPT automática.

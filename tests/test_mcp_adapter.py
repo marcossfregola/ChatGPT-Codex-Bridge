@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import time
@@ -213,6 +214,41 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.is_error)
         self.assertEqual(result.structured_content["executor"], "codex")
         self.assertIsNone(result.structured_content["active_task"])
+
+    async def test_get_status_reports_configured_instance_id_trimmed(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CHATGPT_CODEX_BRIDGE_INSTANCE_ID": "  bridge-local-01  "},
+        ):
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["instance_id"], "bridge-local-01")
+
+    async def test_get_status_reports_unconfigured_instance_id_when_absent(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CHATGPT_CODEX_BRIDGE_INSTANCE_ID", None)
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["instance_id"], "UNCONFIGURED")
+
+    async def test_get_status_reports_unconfigured_instance_id_when_blank(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CHATGPT_CODEX_BRIDGE_INSTANCE_ID": " \t "},
+        ):
+            result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["instance_id"], "UNCONFIGURED")
+
+    async def test_get_status_reports_os_hostname_and_preserves_existing_fields(self) -> None:
+        result = await self.adapter.call_tool("get_status", {})
+
+        self.assertEqual(result["hostname"], socket.gethostname())
+        self.assertEqual(result["bridge_version"], self.adapter.bridge_version)
+        self.assertEqual(result["stage"], self.adapter.stage)
+        self.assertEqual(result["executor"], "codex")
+        self.assertIn("active_task", result)
+        self.assertIn("execution_status", result)
 
     async def test_get_status_queued_preserves_shape_and_reports_no_result(self) -> None:
         self._create_task()

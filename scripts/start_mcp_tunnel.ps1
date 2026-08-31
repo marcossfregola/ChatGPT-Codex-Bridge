@@ -22,8 +22,8 @@ $secretFile = Join-Path $runtimeRoot "secrets\control-plane-api-key.dpapi"
 $tunnelClient = Join-Path $runtimeRoot "tunnel-client\tunnel-client.exe"
 $profileFile = Join-Path $runtimeRoot "tunnel-client\profiles\chatgpt-codex-bridge.yaml"
 $pidFile = Join-Path $runtimeRoot "tunnel-state\tunnel.pid"
-$healthFile = Join-Path $runtimeRoot "tunnel-state\health.url"
 $expectedTunnelId = "tunnel_6a8ef626bf008191a6294996145747e5"
+$healthPort = 8877
 
 foreach ($directory in @(
         (Join-Path $runtimeRoot "state"),
@@ -78,13 +78,36 @@ if (Test-Path -LiteralPath $pidFile -PathType Leaf) {
     Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
 }
 
+function Test-TunnelClientReadiness {
+    param(
+        [Parameter(Mandatory)]
+        [string]$TunnelClientPath,
+        [Parameter(Mandatory)]
+        [int]$HealthPort,
+        [Parameter(Mandatory)]
+        [string]$TunnelPidFile
+    )
+
+    $healthArguments = @(
+        "health",
+        "--port",
+        [string]$HealthPort,
+        "--pid-file",
+        $TunnelPidFile,
+        "--require-control-plane-poll",
+        "--json"
+    )
+    & $TunnelClientPath @healthArguments 2>$null | Out-Null
+    $probeExitCode = $LASTEXITCODE
+    return ($probeExitCode -eq 0)
+}
+
 $cipher = $null
 $secure = $null
 $bstr = [IntPtr]::Zero
 $apiKey = $null
 $startInfo = $null
 $startedProcess = $null
-$healthBaseUrl = $null
 $ready = $false
 
 try {
@@ -133,31 +156,22 @@ try {
         if ($startedProcess.HasExited) {
             throw "The new tunnel-client exited before readiness (exit code $($startedProcess.ExitCode))."
         }
-        if (Test-Path -LiteralPath $healthFile -PathType Leaf) {
-            $healthBaseUrl = (Get-Content -LiteralPath $healthFile -Raw).Trim()
-            if (![string]::IsNullOrWhiteSpace($healthBaseUrl)) {
-                $readyUrl = $healthBaseUrl.TrimEnd("/") + "/readyz"
-                try {
-                    $response = Invoke-WebRequest -Uri $readyUrl -UseBasicParsing -TimeoutSec 3
-                    if ([int]$response.StatusCode -eq 200) {
-                        $ready = $true
-                        break
-                    }
-                }
-                catch {
-                    # The daemon may still be binding its local health listener.
-                }
-            }
+        if (Test-TunnelClientReadiness `
+                -TunnelClientPath $resolvedTunnelClient `
+                -HealthPort $healthPort `
+                -TunnelPidFile $pidFile) {
+            $ready = $true
+            break
         }
         Start-Sleep -Milliseconds 500
     }
 
     if (!$ready) {
-        throw "The new tunnel-client did not report /readyz HTTP 200 before the readiness timeout."
+        throw "The new tunnel-client did not report supported health readiness before the readiness timeout."
     }
 
     Write-Output ("MCP tunnel PID: " + $startedProcess.Id)
-    Write-Output ("Health URL: " + $healthBaseUrl.TrimEnd("/"))
+    Write-Output ("Health URL: http://127.0.0.1:" + $healthPort)
 }
 catch {
     if ($null -ne $startedProcess) {

@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateRange(1, 120)]
-    [int]$WorkerGracePeriodSeconds = 20,
-    [string]$TunnelRuntimeAlias = ""
+    [int]$WorkerGracePeriodSeconds = 20
 )
 
 if ($PSVersionTable.PSVersion.Major -lt 7 -or $PSVersionTable.PSEdition -ne "Core") {
@@ -19,7 +18,7 @@ $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
 $exitCode = 0
 $workerReadyForTunnel = $true
 
-Write-Output "RUNTIME_STOP_ORDER=worker_then_managed_tunnel"
+Write-Output "RUNTIME_STOP_ORDER=worker_then_direct_tunnel"
 
 try {
     $workerOutput = & $pwsh -NoProfile -File $workerStop -GracePeriodSeconds $WorkerGracePeriodSeconds 2>&1
@@ -47,15 +46,7 @@ if (!$workerReadyForTunnel) {
 }
 else {
 try {
-    $tunnelArguments = @(
-        "-NoProfile",
-        "-File",
-        $tunnelStop
-    )
-    if (![string]::IsNullOrWhiteSpace($TunnelRuntimeAlias)) {
-        $tunnelArguments += @("-RuntimeAlias", $TunnelRuntimeAlias)
-    }
-    $tunnelOutput = & $pwsh @tunnelArguments 2>&1
+    $tunnelOutput = & $pwsh -NoProfile -File $tunnelStop 2>&1
     $tunnelExit = $LASTEXITCODE
     foreach ($line in $tunnelOutput) {
         Write-Output ("TUNNEL: " + $line)

@@ -127,27 +127,35 @@ Task no puede ser eliminado automáticamente de la fila Task; no deben incluirse
 credenciales en objetivos ni prompts.
 
 Los scripts `start_runtime.ps1` y `stop_runtime.ps1` requieren PowerShell 7 y
-operan únicamente sobre `%LOCALAPPDATA%\ChatGPTCodexBridge`. El wrapper de
-arranque puede dejar un estado parcial (worker vivo, túnel fallido) y lo
-reporta; el wrapper de parada solicita primero el cierre del worker mediante
-stop-file y sólo después usa `tunnel-client runtimes stop` con un alias gestionado
-explícito. Un perfil directo no ofrece una parada graceful local verificable: el
-script se niega a terminar procesos. El doctor del worker es de sólo lectura y
-no elimina sidecars ni detiene procesos.
+operan únicamente sobre `%LOCALAPPDATA%\ChatGPTCodexBridge`. El arranque usa el
+tunnel-client directo con `run --profile-file ... --pid.file ...`; su readiness
+se valida con `tunnel-client health ... --require-control-plane-poll`, sin
+depender de `health.url`. El wrapper de arranque puede dejar un estado parcial
+(worker vivo, túnel fallido) y lo reporta. El wrapper de parada solicita primero
+el cierre del worker mediante stop-file y después lee el PID sidecar del túnel,
+valida el executable exacto y termina sólo ese árbol con
+`taskkill.exe /PID <verified_pid> /T /F`. Nunca mata por nombre genérico ni
+`python.exe`. El mismo Tunnel ID histórico se reutiliza y una sola máquina debe
+operarlo a la vez. El doctor del worker es de sólo lectura y no elimina
+sidecars ni detiene procesos.
+
+`instance_id` es una configuración local por máquina mediante
+`CHATGPT_CODEX_BRIDGE_INSTANCE_ID`; el valor se recorta y, si falta o está en
+blanco, `get_status` informa `UNCONFIGURED`. El hostname se obtiene del sistema
+local.
 
 ### Emergency hard reset
 
 `scripts/reset_bridge.ps1` es una operación deliberadamente destructiva sólo
-para el estado interno del Bridge. Antes de actuar comprueba PowerShell 7, el
-checkout, la raíz canónica `%LOCALAPPDATA%\ChatGPTCodexBridge`, el Python del
-`.venv`, el perfil, los binarios y la credencial. Cada PID se verifica contra el
-ejecutable instalado, la línea de comando obtenida por CIM y la base/runtime
-correspondiente; si la command line no está disponible, la identidad es ambigua,
-el reset falla y no detiene ningún proceso. Nunca se termina un proceso por
-nombre global. Un túnel directo puede terminarse de forma forzada únicamente
-después de esa identidad exacta;
-un túnel gestionado se intenta detener mediante `runtimes status/stop` y se
-comprueba el mismo PID.
+para el estado interno del Bridge y no forma parte del lifecycle normal. Antes
+de actuar comprueba PowerShell 7, el checkout, la raíz canónica
+`%LOCALAPPDATA%\ChatGPTCodexBridge`, el Python del `.venv`, el perfil, los
+binarios y la credencial. Cada PID se verifica contra el executable instalado,
+la línea de comando obtenida por CIM y la base/runtime correspondiente; si la
+command line no está disponible o la identidad es ambigua, el reset falla y no
+detiene ningún proceso. Nunca se termina un proceso por nombre global. El
+lifecycle normal directo mantiene las garantías de PID sidecar, executable
+exacto y árbol exclusivo descritas arriba.
 
 Tras detener los componentes, el directorio `state` se mueve atómicamente a un
 directorio forense único dentro de `state.archive`. El archivo nunca se lee,
