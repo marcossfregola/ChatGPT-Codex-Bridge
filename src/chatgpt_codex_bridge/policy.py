@@ -11,9 +11,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -26,6 +28,7 @@ _MAX_EVIDENCE_TEXT = 16_384
 _MAX_EVIDENCE_PATHS = 256
 TRUNCATION_SENTINEL = "[TRUNCATED]"
 GIT_COMMAND_TIMEOUT_SECONDS = 15.0
+WORKING_TREE_FINGERPRINT_VERSION = 1
 
 
 class PolicyError(RuntimeError):
@@ -121,6 +124,8 @@ class GitPostflight:
     policy_violation: bool
     untracked_fingerprints: tuple[tuple[str, str], ...] = ()
     content_fingerprints: tuple[tuple[str, str, str], ...] = ()
+    working_tree_fingerprint_version: int | None = None
+    working_tree_fingerprint: str | None = None
 
 
 AUTONOMOUS_WRITE_CONTRACT = """[Bridge autonomous-write contract]
@@ -186,9 +191,104 @@ def _evidence_is_complete(value: Any) -> bool:
                 and item
                 and item[0] == TRUNCATION_SENTINEL
             )
+            or (
+                isinstance(item, Mapping)
+                and item.get("path") == TRUNCATION_SENTINEL
+            )
             for item in value
         )
     return True
+
+
+def _is_valid_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _working_tree_fingerprint_fields(
+    payload: Mapping[str, Any],
+) -> tuple[bool, int | None, str | None]:
+    """Validate the optional canonical working-tree fingerprint fields.
+
+    A payload with neither field is a legacy payload.  A payload containing
+    only one field, an unsupported version, or a malformed digest is invalid;
+    it must never silently fall back to a weaker identity check.
+    """
+
+    version_present = "working_tree_fingerprint_version" in payload
+    fingerprint_present = "working_tree_fingerprint" in payload
+    if not version_present and not fingerprint_present:
+        return False, None, None
+    if not version_present or not fingerprint_present:
+        raise ContinuationBaselineError(
+            "working-tree fingerprint fields are incomplete"
+        )
+    version = payload.get("working_tree_fingerprint_version")
+    fingerprint = payload.get("working_tree_fingerprint")
+    if isinstance(version, bool) or version != WORKING_TREE_FINGERPRINT_VERSION:
+        raise ContinuationBaselineError(
+            "working-tree fingerprint version is unsupported"
+        )
+    if not _is_valid_sha256(fingerprint):
+        raise ContinuationBaselineError("working-tree fingerprint is invalid")
+    return True, version, fingerprint
+
+
+def _bounded_text_is_well_formed(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    marker_count = value.count(TRUNCATION_SENTINEL)
+    return marker_count == 0 or (
+        marker_count == 1 and value.endswith(TRUNCATION_SENTINEL)
+    )
+
+
+def _bounded_path_list_is_well_formed(value: Any) -> bool:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return False
+    if any(
+        TRUNCATION_SENTINEL in item and item != TRUNCATION_SENTINEL
+        for item in value
+    ):
+        return False
+    marker_indexes = [
+        index for index, item in enumerate(value) if item == TRUNCATION_SENTINEL
+    ]
+    return not marker_indexes or marker_indexes == [len(value) - 1]
+
+
+def _bounded_fingerprint_list_is_well_formed(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    marker_indexes: list[int] = []
+    for index, item in enumerate(value):
+        if isinstance(item, Mapping):
+            path = item.get("path")
+            if path == TRUNCATION_SENTINEL:
+                if item not in (
+                    {
+                        "path": TRUNCATION_SENTINEL,
+                        "state": "",
+                        "sha256": "",
+                    },
+                    {"path": TRUNCATION_SENTINEL, "sha256": ""},
+                ):
+                    return False
+                marker_indexes.append(index)
+                continue
+            if isinstance(path, str) and TRUNCATION_SENTINEL in path:
+                return False
+        elif isinstance(item, (list, tuple)):
+            if item and item[0] == TRUNCATION_SENTINEL:
+                if tuple(item) != (TRUNCATION_SENTINEL, "", ""):
+                    return False
+                marker_indexes.append(index)
+                continue
+            return False
+        else:
+            return False
+    return not marker_indexes or marker_indexes == [len(value) - 1]
 
 
 def _validate_fingerprint_path(path: Any, field_name: str) -> str:
@@ -214,6 +314,7 @@ def validate_continuation_snapshot(
     expected_repo: str | os.PathLike[str] | None = None,
     expected_branch: str | None = None,
     expected_head: str | None = None,
+    allow_fingerprint_truncation: bool = False,
 ) -> dict[str, Any]:
     """Validate and normalize a complete postflight-shaped Git snapshot.
 
@@ -225,6 +326,11 @@ def validate_continuation_snapshot(
 
     if not isinstance(payload, Mapping):
         raise ContinuationBaselineError("continuation snapshot is not an object")
+
+    fingerprint_present, fingerprint_version, fingerprint = (
+        _working_tree_fingerprint_fields(payload)
+    )
+    allow_truncated = allow_fingerprint_truncation and fingerprint_present
 
     required_text = (
         "repo_path",
@@ -247,7 +353,9 @@ def validate_continuation_snapshot(
             raise ContinuationBaselineError(
                 f"continuation snapshot {key} identity is incomplete"
             )
-        if not _evidence_is_complete(value):
+        if not _evidence_is_complete(value) and not (
+            allow_truncated and _bounded_text_is_well_formed(value)
+        ):
             raise ContinuationBaselineError(
                 "continuation snapshot Git evidence was truncated"
             )
@@ -284,16 +392,21 @@ def validate_continuation_snapshot(
             raise ContinuationBaselineError(
                 f"continuation snapshot {key} evidence is incomplete"
             )
-        if not _evidence_is_complete(value):
+        if not _evidence_is_complete(value) and not (
+            allow_truncated and _bounded_path_list_is_well_formed(value)
+        ):
             raise ContinuationBaselineError(
                 "continuation snapshot paths were truncated"
             )
         for item in value:
+            if item == TRUNCATION_SENTINEL:
+                continue
             _validate_fingerprint_path(item, f"continuation snapshot {key}")
         values[key] = list(value)
 
     for key in ("changed_files", "untracked_files"):
-        if len(set(values[key])) != len(values[key]):
+        comparable = [item for item in values[key] if item != TRUNCATION_SENTINEL]
+        if len(set(comparable)) != len(comparable):
             raise ContinuationBaselineError(
                 f"continuation snapshot {key} contains duplicates"
             )
@@ -303,12 +416,15 @@ def validate_continuation_snapshot(
         raise ContinuationBaselineError(
             "continuation snapshot lacks complete dirty content evidence"
         )
-    if not _evidence_is_complete(raw_fingerprints):
+    if not _evidence_is_complete(raw_fingerprints) and not (
+        allow_truncated and _bounded_fingerprint_list_is_well_formed(raw_fingerprints)
+    ):
         raise ContinuationBaselineError(
             "continuation snapshot dirty content evidence was truncated"
         )
     normalized_fingerprints: list[dict[str, str]] = []
     seen_fingerprints: set[tuple[str, str]] = set()
+    fingerprint_truncated = False
     for item in raw_fingerprints:
         if not isinstance(item, Mapping):
             raise ContinuationBaselineError(
@@ -318,9 +434,16 @@ def validate_continuation_snapshot(
         state = item.get("state")
         digest = item.get("sha256")
         if path == TRUNCATION_SENTINEL:
-            raise ContinuationBaselineError(
-                "continuation snapshot dirty content evidence was truncated"
-            )
+            if not allow_truncated or item != {
+                "path": TRUNCATION_SENTINEL,
+                "state": "",
+                "sha256": "",
+            }:
+                raise ContinuationBaselineError(
+                    "continuation snapshot dirty content evidence was truncated"
+                )
+            fingerprint_truncated = True
+            continue
         _validate_fingerprint_path(path, "continuation snapshot fingerprints")
         if state not in {"staged", "unstaged", "untracked"}:
             raise ContinuationBaselineError(
@@ -344,6 +467,10 @@ def validate_continuation_snapshot(
             {"path": path, "state": state, "sha256": digest}
         )
     normalized_fingerprints.sort(key=lambda item: (item["path"], item["state"]))
+    if fingerprint_truncated:
+        normalized_fingerprints.append(
+            {"path": TRUNCATION_SENTINEL, "state": "", "sha256": ""}
+        )
     values["content_fingerprints"] = normalized_fingerprints
 
     raw_untracked = payload.get("untracked_fingerprints")
@@ -351,12 +478,15 @@ def validate_continuation_snapshot(
         raise ContinuationBaselineError(
             "continuation snapshot lacks untracked fingerprints"
         )
-    if not _evidence_is_complete(raw_untracked):
+    if not _evidence_is_complete(raw_untracked) and not (
+        allow_truncated and _bounded_fingerprint_list_is_well_formed(raw_untracked)
+    ):
         raise ContinuationBaselineError(
             "continuation snapshot untracked fingerprints were truncated"
         )
     normalized_untracked: list[dict[str, str]] = []
     seen_untracked: set[str] = set()
+    untracked_truncated = False
     for item in raw_untracked:
         if not isinstance(item, Mapping):
             raise ContinuationBaselineError(
@@ -364,6 +494,16 @@ def validate_continuation_snapshot(
             )
         path = item.get("path")
         digest = item.get("sha256")
+        if path == TRUNCATION_SENTINEL:
+            if not allow_truncated or item != {
+                "path": TRUNCATION_SENTINEL,
+                "sha256": "",
+            }:
+                raise ContinuationBaselineError(
+                    "continuation snapshot untracked fingerprints were truncated"
+                )
+            untracked_truncated = True
+            continue
         _validate_fingerprint_path(path, "continuation snapshot untracked fingerprints")
         if (
             not isinstance(digest, str)
@@ -380,6 +520,8 @@ def validate_continuation_snapshot(
         seen_untracked.add(path)
         normalized_untracked.append({"path": path, "sha256": digest})
     normalized_untracked.sort(key=lambda item: item["path"])
+    if untracked_truncated:
+        normalized_untracked.append({"path": TRUNCATION_SENTINEL, "sha256": ""})
     values["untracked_fingerprints"] = normalized_untracked
 
     expected_untracked = {
@@ -388,14 +530,14 @@ def validate_continuation_snapshot(
         if item["state"] == "untracked"
     }
     actual_untracked = {item["path"]: item["sha256"] for item in normalized_untracked}
-    if actual_untracked != expected_untracked:
+    if not fingerprint_truncated and not untracked_truncated and actual_untracked != expected_untracked:
         raise ContinuationBaselineError(
             "continuation snapshot untracked fingerprints differ"
         )
 
     # Preserve the established postflight field order/shape while dropping any
     # untrusted extension keys from the durable continuation baseline.
-    return {
+    normalized_payload = {
         "repo_path": values["repo_path"],
         "baseline_branch": values["baseline_branch"],
         "baseline_head": values["baseline_head"],
@@ -410,6 +552,10 @@ def validate_continuation_snapshot(
         "untracked_fingerprints": values["untracked_fingerprints"],
         "content_fingerprints": values["content_fingerprints"],
     }
+    if fingerprint_present:
+        normalized_payload["working_tree_fingerprint_version"] = fingerprint_version
+        normalized_payload["working_tree_fingerprint"] = fingerprint
+    return normalized_payload
 
 
 def _resolved_path(value: str | os.PathLike[str], *, require_exists: bool) -> Path:
@@ -611,27 +757,72 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _filesystem_digest(path: Path) -> str | None:
-    """Hash one Git-reported worktree file, without walking other paths."""
+def _filesystem_content_identity(path: Path) -> tuple[str | None, str]:
+    """Read one Git-reported worktree path and classify its content."""
 
     try:
         if path.is_symlink():
-            return _sha256_bytes(
-                os.readlink(path).encode("utf-8", "surrogateescape")
+            return (
+                _sha256_bytes(os.readlink(path).encode("utf-8", "surrogateescape")),
+                "symlink",
             )
         if path.is_file():
             digest = hashlib.sha256()
             with path.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
-            return digest.hexdigest()
+            mode = stat.S_IMODE(path.stat().st_mode)
+            return digest.hexdigest(), f"file:{mode:o}"
+        if path.is_dir() and (path / ".git").exists():
+            try:
+                commit = _git_with_env(path, "rev-parse", "HEAD").strip()
+            except (_GitCommandFailure, GitPreflightError) as exc:
+                raise GitPreflightError(
+                    "unable to fingerprint Git submodule worktree"
+                ) from exc
+            if not commit:
+                raise GitPreflightError("Git submodule HEAD is empty")
+            return _sha256_bytes(f"gitlink\0{commit}".encode("ascii")), "gitlink"
         if path.exists():
             raise GitPreflightError(
                 "Git reported a dirty path that is not a regular file"
             )
-        return None
+        return None, "missing"
     except (OSError, ValueError) as exc:
         raise GitPreflightError("unable to fingerprint dirty file") from exc
+
+
+def _filesystem_digest(path: Path) -> str | None:
+    """Hash one Git-reported worktree file, without walking other paths."""
+
+    digest, _ = _filesystem_content_identity(path)
+    return digest
+
+
+def _index_content_identity(
+    repo: Path,
+    path: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str | None, str]:
+    """Read staged content and mode from the index without decoding binary data."""
+
+    try:
+        entries = _git_with_env(repo, "ls-files", "--stage", "--", path, env=env)
+        entry = next((line for line in entries.splitlines() if line.strip()), None)
+        if entry is None:
+            return None, "missing"
+        fields = entry.split(maxsplit=3)
+        mode = fields[0] if fields else ""
+        if mode == "160000":
+            if len(fields) < 2 or not fields[1]:
+                raise GitPreflightError("Gitlink index entry is incomplete")
+            return _sha256_bytes(f"gitlink\0{fields[1]}".encode("ascii")), "gitlink"
+        content = _git_bytes_with_env(repo, "cat-file", "blob", f":{path}", env=env)
+    except _GitCommandFailure as error:
+        raise error
+    kind = "symlink:120000" if mode == "120000" else f"file:{mode}"
+    return _sha256_bytes(content), kind
 
 
 def _index_digest(
@@ -659,6 +850,36 @@ def _index_digest(
     return _sha256_bytes(content)
 
 
+@dataclass(frozen=True)
+class _ContentRecord:
+    path: str
+    state: str
+    digest: str | None
+    kind: str
+
+
+def _content_records(
+    repo: Path,
+    staged: Iterable[str],
+    unstaged: Iterable[str],
+    untracked: Iterable[str],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[_ContentRecord, ...]:
+    records: list[_ContentRecord] = []
+    for path in staged:
+        digest, kind = _index_content_identity(repo, path, env=env)
+        records.append(_ContentRecord(path, "staged", digest, kind))
+    for path in unstaged:
+        digest, kind = _filesystem_content_identity(repo / Path(path))
+        records.append(_ContentRecord(path, "unstaged", digest, kind))
+    for path in untracked:
+        digest, kind = _filesystem_content_identity(repo / Path(path))
+        records.append(_ContentRecord(path, "untracked", digest, kind))
+    records.sort(key=lambda value: (value.path, value.state))
+    return tuple(records)
+
+
 def _content_fingerprints(
     repo: Path,
     staged: Iterable[str],
@@ -670,21 +891,86 @@ def _content_fingerprints(
 ) -> tuple[tuple[str, str, str], ...]:
     """Capture bounded SHA-256 evidence for every dirty file with content."""
 
-    entries: list[tuple[str, str, str]] = []
-    for path in staged:
-        digest = _index_digest(repo, path, env=env)
-        if digest is not None:
-            entries.append((path, "staged", digest))
-    for path in unstaged:
-        digest = _filesystem_digest(repo / Path(path))
-        if digest is not None:
-            entries.append((path, "unstaged", digest))
-    for path in untracked:
-        digest = _filesystem_digest(repo / Path(path))
-        if digest is not None:
-            entries.append((path, "untracked", digest))
-    entries.sort(key=lambda value: (value[0], value[1]))
-    return _bounded_fingerprints(entries) if bounded else tuple(entries)
+    entries = tuple(
+        (record.path, record.state, record.digest)
+        for record in _content_records(
+            repo, staged, unstaged, untracked, env=env
+        )
+        if record.digest is not None
+    )
+    return _bounded_fingerprints(entries) if bounded else entries
+
+
+def _status_records(status: str) -> tuple[tuple[str, str], ...]:
+    """Parse complete porcelain output into stable code/path records."""
+
+    records: list[tuple[str, str]] = []
+    for line in status.splitlines():
+        if len(line) < 3:
+            continue
+        records.append((line[:2], line[3:]))
+    records.sort(key=lambda value: (value[0], value[1]))
+    return tuple(records)
+
+
+def _working_tree_fingerprint(
+    repo: Path,
+    branch: str,
+    head: str,
+    status: str,
+    staged: Iterable[str],
+    unstaged: Iterable[str],
+    untracked: Iterable[str],
+    content_records: Iterable[_ContentRecord],
+) -> str:
+    """Hash one complete, structured Git snapshot before diagnostic bounds."""
+
+    records = tuple(content_records)
+    content_by_identity = {
+        (record.path, record.state): record for record in records
+    }
+    states = (
+        ("staged", tuple(sorted(staged))),
+        ("unstaged", tuple(sorted(unstaged))),
+        ("untracked", tuple(sorted(untracked))),
+    )
+    content = [
+        {
+            "path": path.replace("\\", "/"),
+            "state": state,
+            "kind": content_by_identity[(path, state)].kind,
+            "sha256": content_by_identity[(path, state)].digest,
+        }
+        for state, paths in states
+        for path in paths
+    ]
+    canonical = {
+        "schema": "bridge.working_tree_fingerprint",
+        "version": WORKING_TREE_FINGERPRINT_VERSION,
+        "repo_path": _path_key(repo),
+        "branch": branch,
+        "head": head,
+        "status": [
+            {"code": code, "path": path.replace("\\", "/")}
+            for code, path in _status_records(status)
+        ],
+        "states": [
+            {
+                "state": state,
+                "paths": [path.replace("\\", "/") for path in paths],
+            }
+            for state, paths in states
+        ],
+        "content": content,
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+    return _sha256_bytes(encoded)
 
 
 def _legacy_untracked_fingerprints(
@@ -728,6 +1014,8 @@ def _git_state(
     str,
     str,
     tuple[tuple[str, str, str], ...],
+    int | None,
+    str | None,
 ]:
     _validate_worktree_root(repo, env=env)
     branch = _git_branch(repo, allow_detached=allow_detached, env=env)
@@ -737,18 +1025,49 @@ def _git_state(
     status = _git_with_env(
         repo, "status", "--porcelain", "--untracked-files=all", env=env
     )
-    staged, unstaged, untracked = _parse_status(status, bounded=bounded)
+    full_staged, full_unstaged, full_untracked = _parse_status(
+        status, bounded=False
+    )
     diff = _git_with_env(repo, "diff", env=env) if include_diff else ""
     cached_diff = (
         _git_with_env(repo, "diff", "--cached", env=env) if include_diff else ""
     )
-    fingerprints = (
-        _content_fingerprints(
-            repo, staged, unstaged, untracked, env=env, bounded=bounded
+    fingerprint_version: int | None = None
+    working_tree_fingerprint: str | None = None
+    if include_fingerprints:
+        content_records = _content_records(
+            repo,
+            full_staged,
+            full_unstaged,
+            full_untracked,
+            env=env,
         )
-        if include_fingerprints
-        else ()
-    )
+        full_fingerprints = tuple(
+            (record.path, record.state, record.digest)
+            for record in content_records
+            if record.digest is not None
+        )
+        fingerprint_version = WORKING_TREE_FINGERPRINT_VERSION
+        working_tree_fingerprint = _working_tree_fingerprint(
+            repo,
+            branch,
+            head,
+            status,
+            full_staged,
+            full_unstaged,
+            full_untracked,
+            content_records,
+        )
+        fingerprints = (
+            _bounded_fingerprints(full_fingerprints)
+            if bounded
+            else full_fingerprints
+        )
+    else:
+        fingerprints = ()
+    staged = _bounded_paths(full_staged) if bounded else full_staged
+    unstaged = _bounded_paths(full_unstaged) if bounded else full_unstaged
+    untracked = _bounded_paths(full_untracked) if bounded else full_untracked
     return (
         branch,
         head,
@@ -759,6 +1078,8 @@ def _git_state(
         diff,
         cached_diff,
         fingerprints,
+        fingerprint_version,
+        working_tree_fingerprint,
     )
 
 
@@ -766,7 +1087,7 @@ def git_preflight(repo_path: str | os.PathLike[str]) -> GitCheckpoint:
     """Require a clean Git worktree and capture its durable baseline."""
 
     repo = _resolved_path(repo_path, require_exists=True)
-    branch, head, status, staged, unstaged, untracked, _, _, _ = _git_state(repo)
+    branch, head, status, staged, unstaged, untracked, _, _, _, _, _ = _git_state(repo)
     if status.strip():
         raise DirtyWorkingTreeError(
             "autonomous-write requires a clean Git working tree",
@@ -787,6 +1108,114 @@ def git_preflight(repo_path: str | os.PathLike[str]) -> GitCheckpoint:
     )
 
 
+def _git_continuation_preflight_with_fingerprint(
+    repo: Path,
+    *,
+    previous_task_id: str,
+    previous_postflight: Mapping[str, Any],
+) -> GitCheckpoint:
+    """Validate a v1 fingerprint while treating previews as diagnostics."""
+
+    (
+        fingerprint_present,
+        fingerprint_version,
+        expected_fingerprint,
+    ) = _working_tree_fingerprint_fields(previous_postflight)
+    if (
+        not fingerprint_present
+        or fingerprint_version is None
+        or expected_fingerprint is None
+    ):
+        raise ContinuationBaselineError("working-tree fingerprint is incomplete")
+    expected_baseline_branch = previous_postflight.get("baseline_branch")
+    expected_baseline_head = previous_postflight.get("baseline_head")
+    normalized = validate_continuation_snapshot(
+        previous_postflight,
+        expected_repo=repo,
+        expected_branch=expected_baseline_branch,
+        expected_head=expected_baseline_head,
+        allow_fingerprint_truncation=True,
+    )
+
+    (
+        branch,
+        head,
+        status,
+        staged,
+        unstaged,
+        untracked,
+        diff,
+        cached_diff,
+        fingerprints,
+        current_fingerprint_version,
+        current_fingerprint,
+    ) = _git_state(
+        repo,
+        include_diff=True,
+        include_fingerprints=True,
+        bounded=False,
+    )
+    if (
+        current_fingerprint_version != fingerprint_version
+        or current_fingerprint != expected_fingerprint
+        or branch != normalized["final_branch"]
+        or head != normalized["final_head"]
+    ):
+        raise ContinuationBaselineError(
+            "current Git state does not match the previous autonomous postflight"
+        )
+
+    diagnostic_keys = (
+        "status_porcelain",
+        "diff",
+        "cached_diff",
+        "changed_files",
+        "untracked_files",
+        "content_fingerprints",
+        "untracked_fingerprints",
+    )
+    diagnostics_complete = all(
+        _evidence_is_complete(normalized[key]) for key in diagnostic_keys
+    )
+    if diagnostics_complete:
+        expected_status = normalized["status_porcelain"]
+        expected_changed = normalized["changed_files"]
+        expected_untracked = normalized["untracked_files"]
+        expected_fingerprints = tuple(
+            (item["path"], item["state"], item["sha256"])
+            for item in normalized["content_fingerprints"]
+        )
+        expected_staged, expected_unstaged, expected_untracked_paths = _parse_status(
+            expected_status, bounded=False
+        )
+        if (
+            status != expected_status
+            or staged != expected_staged
+            or unstaged != expected_unstaged
+            or untracked != expected_untracked_paths
+            or list((*staged, *unstaged)) != expected_changed
+            or list(untracked) != expected_untracked
+            or diff != normalized["diff"]
+            or cached_diff != normalized["cached_diff"]
+            or tuple(fingerprints) != expected_fingerprints
+        ):
+            raise ContinuationBaselineError(
+                "current Git diagnostic evidence does not match the previous autonomous postflight"
+            )
+
+    return GitCheckpoint(
+        repo_path=str(repo),
+        baseline_branch=branch,
+        baseline_head=head,
+        status_porcelain=_bounded_text(status),
+        staged_paths=_bounded_paths(staged),
+        unstaged_paths=_bounded_paths(unstaged),
+        untracked_paths=_bounded_paths(untracked),
+        baseline_kind="continuation",
+        previous_task_id=previous_task_id,
+    )
+
+
 def git_continuation_preflight(
     repo_path: str | os.PathLike[str],
     *,
@@ -802,6 +1231,13 @@ def git_continuation_preflight(
         raise ContinuationBaselineError("previous postflight payload is invalid")
     if previous_postflight.get("policy_violation") is not False:
         raise ContinuationBaselineError("previous postflight has a policy violation")
+    fingerprint_present, _, _ = _working_tree_fingerprint_fields(previous_postflight)
+    if fingerprint_present:
+        return _git_continuation_preflight_with_fingerprint(
+            repo,
+            previous_task_id=previous_task_id,
+            previous_postflight=previous_postflight,
+        )
 
     expected_repo = previous_postflight.get("repo_path")
     expected_branch = previous_postflight.get("final_branch")
@@ -899,6 +1335,8 @@ def git_continuation_preflight(
         diff,
         cached_diff,
         fingerprints,
+        _,
+        _,
     ) = _git_state(
         repo,
         include_diff=True,
@@ -967,6 +1405,8 @@ def git_postflight(checkpoint: GitCheckpoint) -> GitPostflight:
         diff,
         cached_diff,
         fingerprints,
+        fingerprint_version,
+        working_tree_fingerprint,
     ) = _git_state(
         repo,
         allow_detached=True,
@@ -991,6 +1431,8 @@ def git_postflight(checkpoint: GitCheckpoint) -> GitPostflight:
         ),
         untracked_fingerprints=_legacy_untracked_fingerprints(fingerprints),
         content_fingerprints=fingerprints,
+        working_tree_fingerprint_version=fingerprint_version,
+        working_tree_fingerprint=working_tree_fingerprint,
     )
 
 
@@ -1014,6 +1456,8 @@ def git_postflight_complete(checkpoint: GitCheckpoint) -> GitPostflight:
         diff,
         cached_diff,
         fingerprints,
+        fingerprint_version,
+        working_tree_fingerprint,
     ) = _git_state(
         repo,
         allow_detached=True,
@@ -1038,6 +1482,8 @@ def git_postflight_complete(checkpoint: GitCheckpoint) -> GitPostflight:
         ),
         untracked_fingerprints=_legacy_untracked_fingerprints(fingerprints),
         content_fingerprints=fingerprints,
+        working_tree_fingerprint_version=fingerprint_version,
+        working_tree_fingerprint=working_tree_fingerprint,
     )
 
 
@@ -1076,6 +1522,8 @@ def postflight_payload(postflight: GitPostflight) -> dict[str, Any]:
             {"path": path, "state": state, "sha256": digest}
             for path, state, digest in postflight.content_fingerprints
         ],
+        "working_tree_fingerprint_version": postflight.working_tree_fingerprint_version,
+        "working_tree_fingerprint": postflight.working_tree_fingerprint,
     }
 
 
@@ -1195,6 +1643,8 @@ def _checkpoint_expected_state(
         diff,
         cached_diff,
         fingerprints,
+        _,
+        _,
     ) = _git_state(repo, include_diff=True, include_fingerprints=True)
     current_status = _bounded_text(status)
     current_diff = _bounded_text(diff)
@@ -1374,6 +1824,7 @@ __all__ = [
     "postflight_payload",
     "protected_roots",
     "TRUNCATION_SENTINEL",
+    "WORKING_TREE_FINGERPRINT_VERSION",
     "validate_continuation_snapshot",
 ]
 

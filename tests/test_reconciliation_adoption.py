@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -420,8 +421,21 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(self._adoption_events(source.task_id), [])
 
-    async def test_truncated_source_without_adoption_remains_a_blocker(self) -> None:
+    async def test_legacy_truncated_source_without_adoption_remains_a_blocker(self) -> None:
         _, source, _, _, _ = self._seed_source()
+        source_postflight = next(
+            event
+            for event in self.store.list_task_events(source.task_id)
+            if event.kind == "policy.postflight"
+        )
+        legacy_payload = dict(source_postflight.payload)
+        legacy_payload.pop("working_tree_fingerprint_version")
+        legacy_payload.pop("working_tree_fingerprint")
+        self.store.connection.execute(
+            "UPDATE task_events SET payload_json = ? WHERE event_id = ?",
+            (json.dumps(legacy_payload), source_postflight.event_id),
+        )
+        self.store.connection.commit()
         executor = FinishedExecutor()
         current_core = BridgeCore(self.store, executor)
         current = current_core.create_task(

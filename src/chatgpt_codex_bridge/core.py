@@ -1949,11 +1949,16 @@ class BridgeCore:
                     and payload.get("policy_violation") is False
                 ):
                     try:
+                        fingerprint_present = (
+                            "working_tree_fingerprint_version" in payload
+                            or "working_tree_fingerprint" in payload
+                        )
                         normalized = validate_continuation_snapshot(
                             payload,
                             expected_repo=payload.get("repo_path"),
                             expected_branch=payload.get("baseline_branch"),
                             expected_head=payload.get("baseline_head"),
+                            allow_fingerprint_truncation=fingerprint_present,
                         )
                     except ContinuationBaselineError as error:
                         reason = (
