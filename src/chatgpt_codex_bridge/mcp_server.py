@@ -187,13 +187,14 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
         name="adopt_reconciled_continuation_baseline",
         description=(
             "Adopt a double-captured Git state for a FINISHED autonomous task "
-            "whose durable postflight evidence is incomplete."
+            "using either the legacy inspection-backed flow or explicit direct mode."
         ),
         structured_output=True,
     )
     async def adopt_reconciled_continuation_baseline(
         source_task_id: str,
-        inspection_task_id: str,
+        inspection_task_id: str | None = None,
+        mode: str | None = None,
     ) -> dict[str, Any]:
         return await _call_adapter(
             adapter,
@@ -201,6 +202,7 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
             {
                 "source_task_id": source_task_id,
                 "inspection_task_id": inspection_task_id,
+                "mode": mode,
             },
         )
 

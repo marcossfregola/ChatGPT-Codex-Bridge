@@ -56,6 +56,7 @@ from .policy import (
     git_preflight,
     postflight_payload,
     TRUNCATION_SENTINEL,
+    WORKING_TREE_FINGERPRINT_VERSION,
     validate_continuation_snapshot,
 )
 from .persistence.sqlite_store import (
@@ -102,6 +103,8 @@ MAX_EVIDENCE_PAYLOAD_BYTES = 16 * 1024
 MAX_FINAL_RESPONSE_BYTES = 12 * 1024
 RECONCILIATION_BASELINE_SCHEMA_VERSION = 1
 RECONCILIATION_BASELINE_KIND = "reconciled_continuation"
+ADOPTION_MODE_LEGACY = "legacy"
+ADOPTION_MODE_DIRECT = "direct"
 _CRITICAL_EVIDENCE_KEYS = (
     "threadId",
     "turnId",
@@ -260,6 +263,19 @@ class BridgeCore:
     def __init__(self, store: SQLiteBridgeStore, executor: Executor | None = None) -> None:
         self.store = store
         self.executor = executor
+
+    @staticmethod
+    def _normalize_adoption_mode(mode: str | None) -> str:
+        """Normalize the explicit baseline-adoption mode fail-closed."""
+
+        if mode is None:
+            return ADOPTION_MODE_LEGACY
+        if not isinstance(mode, str) or mode not in {
+            ADOPTION_MODE_LEGACY,
+            ADOPTION_MODE_DIRECT,
+        }:
+            raise ContinuationBaselineError("adoption mode is unsupported")
+        return mode
 
     def create_project(
         self,
@@ -1032,11 +1048,14 @@ class BridgeCore:
     def _validated_baseline_adoption_context(
         self,
         source_task: Task,
-        inspection_task_id: str,
+        inspection_task_id: str | None,
         *,
+        adoption_mode: str = ADOPTION_MODE_LEGACY,
         excluded_task_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate source and inspection provenance for explicit adoption."""
+
+        adoption_mode = self._normalize_adoption_mode(adoption_mode)
 
         if source_task.mode is not TaskMode.AUTONOMOUS_WRITE:
             raise ContinuationBaselineError(
@@ -1046,8 +1065,14 @@ class BridgeCore:
             raise ContinuationBaselineError(
                 "reconciliation baseline source must be FINISHED"
             )
-        if not isinstance(inspection_task_id, str) or not inspection_task_id.strip():
+        if adoption_mode == ADOPTION_MODE_LEGACY and (
+            not isinstance(inspection_task_id, str) or not inspection_task_id.strip()
+        ):
             raise ContinuationBaselineError("inspection_task_id must be non-empty text")
+        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_task_id is not None:
+            raise ContinuationBaselineError(
+                "direct adoption cannot include inspection_task_id"
+            )
 
         project = self.store.get_project(source_task.project_id)
         if project is None:
@@ -1120,6 +1145,71 @@ class BridgeCore:
             str(project_root)
         ):
             raise ContinuationBaselineError("source policy.postflight repo path differs")
+
+        if adoption_mode == ADOPTION_MODE_DIRECT:
+            fingerprint_present = (
+                "working_tree_fingerprint_version" in source_payload
+                or "working_tree_fingerprint" in source_payload
+            )
+            if not fingerprint_present:
+                raise ContinuationBaselineError(
+                    "direct adoption requires working-tree fingerprint v1"
+                )
+            normalized_source = validate_continuation_snapshot(
+                source_payload,
+                expected_repo=project.repo_path,
+                expected_branch=source_payload["baseline_branch"],
+                expected_head=source_payload["baseline_head"],
+                allow_fingerprint_truncation=True,
+            )
+            if (
+                isinstance(
+                    normalized_source.get("working_tree_fingerprint_version"), bool
+                )
+                or not isinstance(
+                    normalized_source.get("working_tree_fingerprint_version"), int
+                )
+                or normalized_source.get("working_tree_fingerprint_version")
+                != WORKING_TREE_FINGERPRINT_VERSION
+                or not isinstance(
+                    normalized_source.get("working_tree_fingerprint"), str
+                )
+            ):
+                raise ContinuationBaselineError(
+                    "direct adoption requires working-tree fingerprint v1"
+                )
+
+            self._assert_source_is_latest_continuation_candidate(
+                source_task,
+                postflight_event_id,
+                excluded_task_id=excluded_task_id,
+            )
+            return {
+                "adoption_mode": adoption_mode,
+                "project": project,
+                "source_events": source_events,
+                "inspection_events": [],
+                "source_postflight": postflight_event,
+                "source_postflight_payload": source_payload,
+                "source_postflight_validation_error": None,
+                "inspection_task": None,
+                "inspection_terminal": None,
+                "checkpoint": GitCheckpoint(
+                    repo_path=str(source_root),
+                    baseline_branch=source_payload["baseline_branch"],
+                    baseline_head=source_payload["baseline_head"],
+                    status_porcelain="",
+                    staged_paths=(),
+                    unstaged_paths=(),
+                    untracked_paths=(),
+                    baseline_kind=RECONCILIATION_BASELINE_KIND,
+                ),
+                "source_high_water": max(
+                    (self._event_id(event) for event in source_events), default=0
+                ),
+                "inspection_high_water": 0,
+            }
+
         try:
             validate_continuation_snapshot(
                 source_payload,
@@ -1210,6 +1300,7 @@ class BridgeCore:
             baseline_kind="reconciled_continuation",
         )
         return {
+            "adoption_mode": adoption_mode,
             "project": project,
             "source_events": source_events,
             "inspection_events": inspection_events,
@@ -1232,12 +1323,13 @@ class BridgeCore:
         *,
         source_task_id: str,
         source_postflight_event_id: int,
-        inspection_task_id: str,
-        inspection_terminal_event_id: int,
+        inspection_task_id: str | None,
+        inspection_terminal_event_id: int | None,
         project_id: str,
         source_high_water_event_id: int,
         inspection_high_water_event_id: int,
         snapshot: Mapping[str, Any],
+        adoption_mode: str = ADOPTION_MODE_LEGACY,
     ) -> str:
         """Hash all durable adoption provenance and the complete Git snapshot."""
 
@@ -1253,6 +1345,16 @@ class BridgeCore:
             "inspection_high_water_event_id": inspection_high_water_event_id,
             "snapshot": snapshot,
         }
+        if not isinstance(adoption_mode, str) or adoption_mode not in {
+            ADOPTION_MODE_LEGACY,
+            ADOPTION_MODE_DIRECT,
+        }:
+            raise ContinuationBaselineError("adoption mode is unsupported")
+        # Legacy payloads predate adoption_mode.  Keep their fingerprint
+        # material byte-for-byte compatible while binding the new direct mode
+        # explicitly in every direct adoption fingerprint.
+        if adoption_mode == ADOPTION_MODE_DIRECT:
+            material["adoption_mode"] = ADOPTION_MODE_DIRECT
         encoded = json.dumps(
             material,
             ensure_ascii=False,
@@ -1284,15 +1386,32 @@ class BridgeCore:
             ) from error
 
     def adopt_reconciled_continuation_baseline(
-        self, source_task_id: str, inspection_task_id: str
+        self,
+        source_task_id: str,
+        inspection_task_id: str | None = None,
+        *,
+        mode: str | None = None,
     ) -> dict[str, Any]:
-        """Adopt two identical, Bridge-captured Git snapshots explicitly."""
+        """Adopt two identical, Bridge-captured Git snapshots explicitly.
 
+        ``mode`` defaults to the established inspection-backed flow.  The
+        direct mode is an explicit administrative invocation over the same
+        durable adoption event; it never infers authorization from a dirty
+        worktree.
+        """
+
+        adoption_mode = self._normalize_adoption_mode(mode)
+        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_task_id is not None:
+            raise ContinuationBaselineError(
+                "direct adoption cannot include inspection_task_id"
+            )
         source_task = self.store.get_task(source_task_id)
         if source_task is None:
             raise KeyError(f"task does not exist: {source_task_id}")
         context = self._validated_baseline_adoption_context(
-            source_task, inspection_task_id
+            source_task,
+            inspection_task_id,
+            adoption_mode=adoption_mode,
         )
         project = context["project"]
         checkpoint = context["checkpoint"]
@@ -1303,9 +1422,27 @@ class BridgeCore:
             raise ContinuationBaselineError(
                 "Git state changed during reconciliation baseline adoption"
             )
+        if adoption_mode == ADOPTION_MODE_DIRECT and (
+            isinstance(
+                first_snapshot.get("working_tree_fingerprint_version"), bool
+            )
+            or not isinstance(
+                first_snapshot.get("working_tree_fingerprint_version"), int
+            )
+            or first_snapshot.get("working_tree_fingerprint_version")
+            != WORKING_TREE_FINGERPRINT_VERSION
+            or not isinstance(first_snapshot.get("working_tree_fingerprint"), str)
+        ):
+            raise ContinuationBaselineError(
+                "direct adoption requires working-tree fingerprint v1"
+            )
 
         source_postflight_event_id = self._event_id(context["source_postflight"])
-        inspection_terminal_event_id = self._event_id(context["inspection_terminal"])
+        inspection_terminal_event_id = (
+            None
+            if adoption_mode == ADOPTION_MODE_DIRECT
+            else self._event_id(context["inspection_terminal"])
+        )
         source_high_water = context["source_high_water"]
         inspection_high_water = context["inspection_high_water"]
         # A retry must reproduce the exact original durable payload.  Reuse
@@ -1341,10 +1478,12 @@ class BridgeCore:
             source_high_water_event_id=source_high_water,
             inspection_high_water_event_id=inspection_high_water,
             snapshot=first_snapshot,
+            adoption_mode=adoption_mode,
         )
         adoption_payload: dict[str, Any] = {
             "schema_version": RECONCILIATION_BASELINE_SCHEMA_VERSION,
             "baseline_kind": RECONCILIATION_BASELINE_KIND,
+            "adoption_mode": adoption_mode,
             "source_task_id": source_task.task_id,
             "source_postflight_event_id": source_postflight_event_id,
             "inspection_task_id": inspection_task_id,
@@ -1368,12 +1507,14 @@ class BridgeCore:
                 source_high_water=context["source_high_water"],
                 inspection_task_id=inspection_task_id,
                 inspection_high_water=context["inspection_high_water"],
+                adoption_mode=adoption_mode,
             )
         except TaskStateError as error:
             raise ContinuationBaselineError(str(error)) from error
         return {
             "adopted": True,
             "idempotent": not created,
+            "adoption_mode": adoption_mode,
             "source_task_id": source_task.task_id,
             "inspection_task_id": inspection_task_id,
             "adoption_event_id": event.event_id,
@@ -1757,6 +1898,115 @@ class BridgeCore:
             raise ContinuationBaselineError("adoption event schema is unsupported")
         if payload.get("baseline_kind") != RECONCILIATION_BASELINE_KIND:
             raise ContinuationBaselineError("adoption event baseline kind is invalid")
+        adoption_mode = payload.get("adoption_mode", ADOPTION_MODE_LEGACY)
+        if not isinstance(adoption_mode, str) or adoption_mode not in {
+            ADOPTION_MODE_LEGACY,
+            ADOPTION_MODE_DIRECT,
+        }:
+            raise ContinuationBaselineError("adoption event mode is unsupported")
+
+        if adoption_mode == ADOPTION_MODE_DIRECT:
+            source_postflight = context["source_postflight"]
+            source_postflight_id = self._event_id(source_postflight)
+            if (
+                payload.get("source_task_id") != candidate.task_id
+                or payload.get("project_id") != candidate.project_id
+                or payload.get("inspection_task_id") is not None
+                or payload.get("inspection_terminal_event_id") is not None
+            ):
+                raise ContinuationBaselineError("direct adoption provenance is invalid")
+
+            source_ref = payload.get("source_postflight_event_id")
+            if (
+                isinstance(source_ref, bool)
+                or not isinstance(source_ref, int)
+                or source_ref <= 0
+                or source_ref != source_postflight_id
+            ):
+                raise ContinuationBaselineError(
+                    "adoption event source_postflight_event_id is invalid"
+                )
+            adoption_id = self._event_id(event)
+            if adoption_id <= source_ref:
+                raise ContinuationBaselineError("adoption event ordering is invalid")
+
+            source_high_water = payload.get("source_high_water_event_id")
+            inspection_high_water = payload.get("inspection_high_water_event_id")
+            if (
+                isinstance(source_high_water, bool)
+                or not isinstance(source_high_water, int)
+                or source_high_water < source_ref
+                or source_high_water >= adoption_id
+                or isinstance(inspection_high_water, bool)
+                or not isinstance(inspection_high_water, int)
+                or inspection_high_water != 0
+            ):
+                raise ContinuationBaselineError("adoption event high-water is invalid")
+            if any(
+                self._event_id(item) > adoption_id
+                for item in context["source_events"]
+            ):
+                raise ContinuationBaselineError("source task changed after baseline adoption")
+            source_prior_high_water = max(
+                (
+                    self._event_id(item)
+                    for item in context["source_events"]
+                    if self._event_id(item) < adoption_id
+                ),
+                default=0,
+            )
+            if source_high_water != source_prior_high_water:
+                raise ContinuationBaselineError("source task high-water is not exact")
+
+            snapshot = payload.get("snapshot")
+            normalized = validate_continuation_snapshot(
+                snapshot,
+                expected_repo=context["project"].repo_path,
+                expected_branch=context["source_postflight_payload"]["baseline_branch"],
+                expected_head=context["source_postflight_payload"]["baseline_head"],
+            )
+            if (
+                isinstance(
+                    normalized.get("working_tree_fingerprint_version"), bool
+                )
+                or not isinstance(
+                    normalized.get("working_tree_fingerprint_version"), int
+                )
+                or normalized.get("working_tree_fingerprint_version")
+                != WORKING_TREE_FINGERPRINT_VERSION
+                or not isinstance(normalized.get("working_tree_fingerprint"), str)
+            ):
+                raise ContinuationBaselineError(
+                    "direct adoption snapshot lacks fingerprint v1"
+                )
+            expected_fingerprint = self._baseline_adoption_fingerprint(
+                source_task_id=candidate.task_id,
+                source_postflight_event_id=source_ref,
+                inspection_task_id=None,
+                inspection_terminal_event_id=None,
+                project_id=candidate.project_id,
+                source_high_water_event_id=source_high_water,
+                inspection_high_water_event_id=0,
+                snapshot=normalized,
+                adoption_mode=ADOPTION_MODE_DIRECT,
+            )
+            if payload.get("fingerprint") != expected_fingerprint or payload.get(
+                "evidence_fingerprint"
+            ) != expected_fingerprint:
+                raise ContinuationBaselineError("adoption evidence fingerprint is invalid")
+            for key in (
+                "repo_path",
+                "baseline_branch",
+                "baseline_head",
+                "final_branch",
+                "final_head",
+            ):
+                if payload.get(key) != normalized[key]:
+                    raise ContinuationBaselineError(
+                        "adoption event summary differs from snapshot"
+                    )
+            return normalized
+
         source_postflight = context["source_postflight"]
         inspection_terminal = context["inspection_terminal"]
         source_postflight_id = self._event_id(source_postflight)
@@ -1913,14 +2163,31 @@ class BridgeCore:
                             raise ContinuationBaselineError(
                                 "adoption event payload is invalid"
                             )
+                        adoption_mode = adoption_payload.get(
+                            "adoption_mode", ADOPTION_MODE_LEGACY
+                        )
+                        if not isinstance(adoption_mode, str) or adoption_mode not in {
+                            ADOPTION_MODE_LEGACY,
+                            ADOPTION_MODE_DIRECT,
+                        }:
+                            raise ContinuationBaselineError(
+                                "adoption event mode is unsupported"
+                            )
                         inspection_id = adoption_payload.get("inspection_task_id")
-                        if not isinstance(inspection_id, str) or not inspection_id:
+                        if adoption_mode == ADOPTION_MODE_LEGACY and (
+                            not isinstance(inspection_id, str) or not inspection_id
+                        ):
                             raise ContinuationBaselineError(
                                 "adoption event provenance is invalid"
+                            )
+                        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_id is not None:
+                            raise ContinuationBaselineError(
+                                "direct adoption provenance is invalid"
                             )
                         context = self._validated_baseline_adoption_context(
                             candidate,
                             inspection_id,
+                            adoption_mode=adoption_mode,
                             excluded_task_id=task.task_id,
                         )
                         snapshot = self._baseline_adoption_snapshot_from_event(

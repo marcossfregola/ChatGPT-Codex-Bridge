@@ -965,9 +965,24 @@ class MCPAdapter:
                 task_id, reconciliation_id, resolution
             )
         if name == "adopt_reconciled_continuation_baseline":
+            mode_value = args.get("mode")
+            if mode_value is None:
+                mode = "legacy"
+            elif not isinstance(mode_value, str) or not mode_value:
+                raise MCPToolError("argument 'mode' must be legacy or direct")
+            elif mode_value not in {"legacy", "direct"}:
+                raise MCPToolError("argument 'mode' must be legacy or direct")
+            else:
+                mode = mode_value
+            inspection_task_id = (
+                _required_text(args, "inspection_task_id")
+                if mode == "legacy"
+                else _optional_text(args, "inspection_task_id")
+            )
             return self.core.adopt_reconciled_continuation_baseline(
                 _required_text(args, "source_task_id"),
-                _required_text(args, "inspection_task_id"),
+                inspection_task_id,
+                mode=mode,
             )
         if name == "commit_checkpoint":
             return self.core.commit_checkpoint(

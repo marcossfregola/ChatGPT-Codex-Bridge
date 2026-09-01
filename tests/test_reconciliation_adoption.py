@@ -119,20 +119,24 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
     def _seed_source(
         self,
         *,
+        repo_name: str = "workspace",
+        project_id: str = "project-adoption",
+        source_task_id: str = "task-source",
         truncated: bool = True,
         status: ExecutionStatus = ExecutionStatus.FINISHED,
         source_mode: TaskMode = TaskMode.AUTONOMOUS_WRITE,
         inspection_before_postflight: bool = False,
+        create_inspection: bool = True,
         source_violation: bool = False,
         large_change: bool = False,
         postflight_mutator: Callable[[dict], None] | None = None,
     ):
-        repo = make_repo(self.root)
-        self._create_project(repo)
+        repo = make_repo(self.root, repo_name)
+        self._create_project(repo, project_id=project_id)
         source = self.core.create_task(
-            "project-adoption",
+            project_id,
             "survivor autonomous task",
-            task_id="task-source",
+            task_id=source_task_id,
             mode=source_mode,
         )
         self.store.transition_task_running(source.task_id, project_id=source.project_id)
@@ -150,7 +154,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
 
         inspection = None
         if inspection_before_postflight:
-            inspection = self._finish_inspection()
+            inspection = self._finish_inspection(project_id)
 
         postflight = postflight_payload(git_postflight(checkpoint))
         if truncated and not large_change:
@@ -178,8 +182,8 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
             event_kind=terminal_kind,
             payload={"final_response": "SURVIVOR"},
         )
-        if inspection is None:
-            inspection = self._finish_inspection()
+        if inspection is None and create_inspection:
+            inspection = self._finish_inspection(project_id)
         return repo, source, inspection, checkpoint_event, postflight_event
 
     def _adoption_events(self, task_id: str):
@@ -188,6 +192,294 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
             for event in self.store.list_task_events(task_id)
             if event.kind == RECONCILIATION_BASELINE_ADOPTED_EVENT
         ]
+
+    def test_direct_adoption_persists_without_inspection_task(self) -> None:
+        repo, source, inspection, _, _ = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        self.assertIsNone(inspection)
+
+        result = self.core.adopt_reconciled_continuation_baseline(
+            source.task_id, mode="direct"
+        )
+
+        self.assertTrue(result["adopted"])
+        self.assertFalse(result["idempotent"])
+        self.assertEqual(result["adoption_mode"], "direct")
+        self.assertIsNone(result["inspection_task_id"])
+        event = self._adoption_events(source.task_id)[0]
+        self.assertEqual(event.payload["adoption_mode"], "direct")
+        self.assertIsNone(event.payload["inspection_task_id"])
+        self.assertIsNone(event.payload["inspection_terminal_event_id"])
+        self.assertEqual(event.payload["inspection_high_water_event_id"], 0)
+        self.assertTrue(Path(event.payload["snapshot"]["repo_path"]).samefile(repo))
+        self.assertEqual(
+            event.payload["snapshot"]["working_tree_fingerprint_version"], 1
+        )
+        self.assertEqual(event.payload["fingerprint"], event.payload["evidence_fingerprint"])
+
+    def test_direct_adoption_round_trips_all_provenance(self) -> None:
+        _, source, _, _, _ = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        result = self.core.adopt_reconciled_continuation_baseline(
+            source.task_id, mode="direct"
+        )
+        before = self._adoption_events(source.task_id)[0]
+        before_payload = before.payload
+        before_id = before.event_id
+        self.store.close()
+
+        reopened = SQLiteBridgeStore(self.store.db_path)
+        self.store = reopened
+        after = self._adoption_events(source.task_id)[0]
+
+        self.assertEqual(after.event_id, before_id)
+        self.assertEqual(after.payload, before_payload)
+        self.assertEqual(after.payload["adoption_mode"], "direct")
+        self.assertEqual(after.payload["source_task_id"], source.task_id)
+        self.assertEqual(
+            after.payload["source_postflight_event_id"],
+            before_payload["source_postflight_event_id"],
+        )
+        self.assertEqual(
+            after.payload["source_high_water_event_id"],
+            before_payload["source_high_water_event_id"],
+        )
+        self.assertEqual(
+            after.payload["inspection_high_water_event_id"], 0
+        )
+        self.assertEqual(after.payload["fingerprint"], result["fingerprint"])
+        self.assertEqual(
+            after.payload["fingerprint"], after.payload["evidence_fingerprint"]
+        )
+
+    async def test_direct_adopted_baseline_enables_continuation(self) -> None:
+        repo, source, inspection, _, _ = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        self.assertIsNone(inspection)
+        self.core.adopt_reconciled_continuation_baseline(
+            source.task_id, mode="direct"
+        )
+
+        executor = FinishedExecutor()
+        continuation_core = BridgeCore(self.store, executor)
+        current = continuation_core.create_task(
+            "project-adoption",
+            "continue after direct adoption",
+            task_id="task-current-direct",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        finished = await continuation_core.run_task(current.task_id)
+
+        self.assertEqual(finished.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(executor.requests), 1)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
+        self.assertEqual(checkpoint.payload["previous_task_id"], source.task_id)
+        self.assertEqual((repo / "app.txt").read_text(encoding="utf-8"), "SURVIVOR\n")
+
+    async def test_legacy_adoption_event_without_mode_remains_valid(self) -> None:
+        _, source, inspection, _, _ = self._seed_source()
+        self.core.adopt_reconciled_continuation_baseline(
+            source.task_id, inspection.task_id
+        )
+        adoption = self._adoption_events(source.task_id)[0]
+        legacy_payload = dict(adoption.payload)
+        legacy_payload.pop("adoption_mode")
+        self.store.connection.execute(
+            "UPDATE task_events SET payload_json = ? WHERE event_id = ?",
+            (json.dumps(legacy_payload), adoption.event_id),
+        )
+        self.store.connection.commit()
+
+        executor = FinishedExecutor()
+        continuation_core = BridgeCore(self.store, executor)
+        current = continuation_core.create_task(
+            "project-adoption",
+            "continue from a legacy persisted adoption",
+            task_id="task-current-legacy-event",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        finished = await continuation_core.run_task(current.task_id)
+
+        self.assertEqual(finished.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(executor.requests), 1)
+
+    def test_direct_adoption_rejects_inspection_hybrid(self) -> None:
+        _, source, inspection, _, _ = self._seed_source(truncated=False)
+
+        with self.assertRaises(ContinuationBaselineError):
+            self.core.adopt_reconciled_continuation_baseline(
+                source.task_id,
+                inspection.task_id,
+                mode="direct",
+            )
+        self.assertEqual(self._adoption_events(source.task_id), [])
+
+    def test_legacy_adoption_without_inspection_remains_invalid(self) -> None:
+        _, source, inspection, _, _ = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        self.assertIsNone(inspection)
+
+        with self.assertRaises(ContinuationBaselineError):
+            self.core.adopt_reconciled_continuation_baseline(source.task_id)
+        self.assertEqual(self._adoption_events(source.task_id), [])
+
+    def test_direct_adoption_rejects_branch_change(self) -> None:
+        repo, source, _, _, _ = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "-c", "feature"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with self.assertRaises(ContinuationBaselineError):
+            self.core.adopt_reconciled_continuation_baseline(
+                source.task_id, mode="direct"
+            )
+        self.assertEqual(self._adoption_events(source.task_id), [])
+
+    def test_direct_adoption_rejects_head_change(self) -> None:
+        repo, source, _, _, _ = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        (repo / "head-change.txt").write_text("HEAD CHANGE\n", encoding="utf-8")
+        git(repo, "add", "app.txt", "head-change.txt")
+        git(repo, "commit", "-m", "head change")
+
+        with self.assertRaises(ContinuationBaselineError):
+            self.core.adopt_reconciled_continuation_baseline(
+                source.task_id, mode="direct"
+            )
+        self.assertEqual(self._adoption_events(source.task_id), [])
+
+    def test_direct_adoption_rejects_repo_mismatch(self) -> None:
+        repo, source, _, _, postflight_event = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        other_repo = make_repo(self.root, "other-repo")
+        payload = dict(postflight_event.payload)
+        payload["repo_path"] = str(other_repo)
+        self.store.connection.execute(
+            "UPDATE task_events SET payload_json = ? WHERE event_id = ?",
+            (json.dumps(payload), postflight_event.event_id),
+        )
+        self.store.connection.commit()
+
+        with self.assertRaises(ContinuationBaselineError):
+            self.core.adopt_reconciled_continuation_baseline(
+                source.task_id, mode="direct"
+            )
+        self.assertEqual(self._adoption_events(source.task_id), [])
+        self.assertEqual(git(repo, "status", "--porcelain"), "M app.txt")
+
+    def test_direct_adoption_rejects_ineligible_source(self) -> None:
+        _, source, _, _, _ = self._seed_source(
+            truncated=False,
+            create_inspection=False,
+            source_mode=TaskMode.READ_ONLY,
+        )
+
+        with self.assertRaises(ContinuationBaselineError):
+            self.core.adopt_reconciled_continuation_baseline(
+                source.task_id, mode="direct"
+            )
+        self.assertEqual(self._adoption_events(source.task_id), [])
+
+    def test_direct_adoption_rejects_superseded_source(self) -> None:
+        _, source, _, _, source_postflight = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        newer = self.core.create_task(
+            "project-adoption",
+            "newer autonomous task",
+            task_id="task-newer-direct",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        self.store.transition_task_running(newer.task_id, project_id=newer.project_id)
+        self.store.append_task_event(
+            newer.task_id,
+            "bridge",
+            "policy.postflight",
+            dict(source_postflight.payload),
+        )
+        self.store.transition_task_terminal(
+            newer.task_id,
+            execution_status=ExecutionStatus.FINISHED,
+            event_kind="task.finished",
+            payload={"final_response": "NEWER"},
+        )
+
+        with self.assertRaises(ContinuationBaselineError):
+            self.core.adopt_reconciled_continuation_baseline(
+                source.task_id, mode="direct"
+            )
+        self.assertEqual(self._adoption_events(source.task_id), [])
+
+    def test_direct_adoption_rejects_invalid_or_unknown_fingerprint(self) -> None:
+        for index, invalid_value in enumerate(("invalid", 999)):
+            with self.subTest(invalid_value=invalid_value):
+                _, source, _, _, postflight_event = self._seed_source(
+                    repo_name=f"workspace-invalid-{index}",
+                    project_id=f"project-invalid-{index}",
+                    source_task_id=f"task-invalid-{index}",
+                    truncated=False,
+                    create_inspection=False,
+                )
+                payload = dict(postflight_event.payload)
+                if isinstance(invalid_value, int):
+                    payload["working_tree_fingerprint_version"] = invalid_value
+                else:
+                    payload["working_tree_fingerprint"] = invalid_value
+                self.store.connection.execute(
+                    "UPDATE task_events SET payload_json = ? WHERE event_id = ?",
+                    (json.dumps(payload), postflight_event.event_id),
+                )
+                self.store.connection.commit()
+
+                with self.assertRaises(ContinuationBaselineError):
+                    self.core.adopt_reconciled_continuation_baseline(
+                        source.task_id, mode="direct"
+                    )
+                self.assertEqual(self._adoption_events(source.task_id), [])
+
+    def test_direct_adoption_rejects_double_capture_change_without_event(self) -> None:
+        _, source, _, _, _ = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        source = self.store.get_task(source.task_id)
+        assert source is not None
+        context = self.core._validated_baseline_adoption_context(  # noqa: SLF001
+            source,
+            None,
+            adoption_mode="direct",
+        )
+        snapshot = self.core._capture_reconciled_snapshot(  # noqa: SLF001
+            context["checkpoint"], context["project"]
+        )
+        changed = dict(snapshot)
+        changed["diff"] = snapshot["diff"] + " changed"
+
+        with patch.object(
+            self.core,
+            "_capture_reconciled_snapshot",
+            side_effect=[snapshot, changed],
+        ):
+            with self.assertRaises(ContinuationBaselineError):
+                self.core.adopt_reconciled_continuation_baseline(
+                    source.task_id, mode="direct"
+                )
+        self.assertEqual(self._adoption_events(source.task_id), [])
 
     async def test_explicit_adoption_persists_and_enables_continuation(self) -> None:
         repo, source, inspection, _, _ = self._seed_source()
@@ -198,9 +490,11 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["adopted"])
         self.assertFalse(result["idempotent"])
+        self.assertEqual(result["adoption_mode"], "legacy")
         self.assertEqual(result["baseline_kind"], "reconciled_continuation")
         event = self._adoption_events(source.task_id)[0]
         self.assertEqual(event.event_id, result["adoption_event_id"])
+        self.assertEqual(event.payload["adoption_mode"], "legacy")
         self.assertEqual(event.payload["source_task_id"], source.task_id)
         self.assertEqual(event.payload["inspection_task_id"], inspection.task_id)
         self.assertIn("content_fingerprints", event.payload["snapshot"])
@@ -654,6 +948,22 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["adopted"])
         self.assertEqual(result["source_task_id"], source.task_id)
         self.assertEqual(result["inspection_task_id"], inspection.task_id)
+
+    async def test_mcp_adapter_dispatches_direct_adoption_without_inspection(self) -> None:
+        _, source, inspection, _, _ = self._seed_source(
+            truncated=False, create_inspection=False
+        )
+        self.assertIsNone(inspection)
+        adapter = MCPAdapter(self.core, self.store)
+
+        result = await adapter.call_tool(
+            "adopt_reconciled_continuation_baseline",
+            {"source_task_id": source.task_id, "mode": "direct"},
+        )
+
+        self.assertTrue(result["adopted"])
+        self.assertEqual(result["adoption_mode"], "direct")
+        self.assertIsNone(result["inspection_task_id"])
 
 
 if __name__ == "__main__":

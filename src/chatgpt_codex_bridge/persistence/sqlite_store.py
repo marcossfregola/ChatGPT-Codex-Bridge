@@ -268,6 +268,8 @@ RECONCILIATION_RESOLVED_EVENT = "task.reconciliation_resolved"
 # Keep the event name separate from ``policy.postflight``: this is an
 # auditable adoption decision, never a replacement or mutation of history.
 RECONCILIATION_BASELINE_ADOPTED_EVENT = "reconciliation.baseline_adopted"
+ADOPTION_MODE_LEGACY = "legacy"
+ADOPTION_MODE_DIRECT = "direct"
 
 CHECKPOINT_STARTED_EVENT = "checkpoint.commit.started"
 CHECKPOINT_REF_UPDATED_EVENT = "checkpoint.commit.ref_updated"
@@ -1797,15 +1799,31 @@ class SQLiteBridgeStore:
         payload: Mapping[str, Any],
         *,
         source_high_water: int,
-        inspection_task_id: str,
+        inspection_task_id: str | None,
         inspection_high_water: int,
+        adoption_mode: str | None = None,
     ) -> tuple[TaskEvent, bool]:
         """Atomically append one immutable, explicitly adopted baseline."""
 
         if not isinstance(source_task_id, str) or not source_task_id.strip():
             raise ValueError("source_task_id must be non-empty text")
-        if not isinstance(inspection_task_id, str) or not inspection_task_id.strip():
-            raise ValueError("inspection_task_id must be non-empty text")
+        if not isinstance(payload, Mapping):
+            raise ValueError("adoption payload must be an object")
+        payload_mode = payload.get("adoption_mode", ADOPTION_MODE_LEGACY)
+        if adoption_mode is None:
+            adoption_mode = payload_mode
+        if not isinstance(adoption_mode, str) or adoption_mode not in {
+            ADOPTION_MODE_LEGACY,
+            ADOPTION_MODE_DIRECT,
+        }:
+            raise ValueError("adoption mode is unsupported")
+        if payload_mode != adoption_mode:
+            raise ValueError("adoption payload adoption_mode differs")
+        if adoption_mode == ADOPTION_MODE_LEGACY:
+            if not isinstance(inspection_task_id, str) or not inspection_task_id.strip():
+                raise ValueError("inspection_task_id must be non-empty text")
+        elif inspection_task_id is not None:
+            raise ValueError("direct adoption cannot include inspection_task_id")
         if (
             isinstance(source_high_water, bool)
             or not isinstance(source_high_water, int)
@@ -1815,8 +1833,8 @@ class SQLiteBridgeStore:
             or inspection_high_water < 0
         ):
             raise ValueError("event high-water marks must be non-negative integers")
-        if not isinstance(payload, Mapping):
-            raise ValueError("adoption payload must be an object")
+        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_high_water != 0:
+            raise ValueError("direct adoption inspection high-water must be zero")
 
         connection = self._require_connection()
         try:
@@ -1842,30 +1860,34 @@ class SQLiteBridgeStore:
                     "reconciliation baseline source must be FINISHED"
                 )
 
-            inspection_row = connection.execute(
-                """
-                SELECT task_id, project_id, objective, executor, model,
-                       mode, execution_status, audit_status, thread_id, turn_id,
-                       created_at, updated_at
-                FROM tasks WHERE task_id = ?
-                """,
-                (inspection_task_id,),
-            ).fetchone()
-            if inspection_row is None:
-                raise KeyError(f"task does not exist: {inspection_task_id}")
-            inspection_task = self._task_from_row(inspection_row)
-            if inspection_task.mode is not TaskMode.READ_ONLY:
-                raise TaskStateError("reconciliation inspection must be READ_ONLY")
-            if inspection_task.execution_status is not ExecutionStatus.FINISHED:
-                raise TaskStateError("reconciliation inspection must be FINISHED")
-            if inspection_task.project_id != source_task.project_id:
-                raise TaskStateError(
-                    "reconciliation inspection belongs to another project"
-                )
+            inspection_task = None
+            if adoption_mode == ADOPTION_MODE_LEGACY:
+                inspection_row = connection.execute(
+                    """
+                    SELECT task_id, project_id, objective, executor, model,
+                           mode, execution_status, audit_status, thread_id, turn_id,
+                           created_at, updated_at
+                    FROM tasks WHERE task_id = ?
+                    """,
+                    (inspection_task_id,),
+                ).fetchone()
+                if inspection_row is None:
+                    raise KeyError(f"task does not exist: {inspection_task_id}")
+                inspection_task = self._task_from_row(inspection_row)
+                if inspection_task.mode is not TaskMode.READ_ONLY:
+                    raise TaskStateError("reconciliation inspection must be READ_ONLY")
+                if inspection_task.execution_status is not ExecutionStatus.FINISHED:
+                    raise TaskStateError("reconciliation inspection must be FINISHED")
+                if inspection_task.project_id != source_task.project_id:
+                    raise TaskStateError(
+                        "reconciliation inspection belongs to another project"
+                    )
 
             source_events = self._events_in_transaction(connection, source_task_id)
-            inspection_events = self._events_in_transaction(
-                connection, inspection_task_id
+            inspection_events = (
+                self._events_in_transaction(connection, inspection_task_id)
+                if adoption_mode == ADOPTION_MODE_LEGACY
+                else []
             )
             source_max = max((event.event_id or 0 for event in source_events), default=0)
             inspection_max = max(
@@ -1879,7 +1901,14 @@ class SQLiteBridgeStore:
                 and event.kind == RECONCILIATION_BASELINE_ADOPTED_EVENT
             ]
             if existing:
-                if len(existing) != 1 or self._serialize_payload(existing[0].payload) != candidate_json:
+                existing_payload = existing[0].payload
+                if isinstance(existing_payload, Mapping) and (
+                    adoption_mode == ADOPTION_MODE_LEGACY
+                    and "adoption_mode" not in existing_payload
+                ):
+                    existing_payload = dict(existing_payload)
+                    existing_payload["adoption_mode"] = ADOPTION_MODE_LEGACY
+                if len(existing) != 1 or self._serialize_payload(existing_payload) != candidate_json:
                     raise TaskStateError(
                         "reconciliation baseline adoption provenance or snapshot differs"
                     )
@@ -1893,8 +1922,14 @@ class SQLiteBridgeStore:
 
             if payload.get("source_task_id") != source_task_id:
                 raise TaskStateError("adoption source_task_id differs")
-            if payload.get("inspection_task_id") != inspection_task_id:
+            if adoption_mode == ADOPTION_MODE_LEGACY and payload.get(
+                "inspection_task_id"
+            ) != inspection_task_id:
                 raise TaskStateError("adoption inspection_task_id differs")
+            if adoption_mode == ADOPTION_MODE_DIRECT and payload.get(
+                "inspection_task_id"
+            ) is not None:
+                raise TaskStateError("direct adoption inspection_task_id must be null")
             if payload.get("project_id") != source_task.project_id:
                 raise TaskStateError("adoption project_id differs")
 
@@ -1926,12 +1961,14 @@ class SQLiteBridgeStore:
                 "bridge",
                 "policy.postflight",
             )
-            inspection_terminal = required_event(
-                inspection_events,
-                "inspection_terminal_event_id",
-                "bridge",
-                "task.finished",
-            )
+            inspection_terminal = None
+            if adoption_mode == ADOPTION_MODE_LEGACY:
+                inspection_terminal = required_event(
+                    inspection_events,
+                    "inspection_terminal_event_id",
+                    "bridge",
+                    "task.finished",
+                )
             source_terminal = max(
                 (
                     event
@@ -1952,34 +1989,59 @@ class SQLiteBridgeStore:
                 and source_terminal.payload.get("policy_violation") is True
             ):
                 raise TaskStateError("source terminal evidence has a policy violation")
-            if (source_postflight.event_id or 0) >= (inspection_terminal.event_id or 0):
-                raise TaskStateError("inspection terminal evidence is not posterior")
-            if (
-                isinstance(inspection_terminal.payload, Mapping)
-                and inspection_terminal.payload.get("policy_violation") is True
+            if adoption_mode == ADOPTION_MODE_LEGACY:
+                if (
+                    inspection_terminal is None
+                    or (source_postflight.event_id or 0)
+                    >= (inspection_terminal.event_id or 0)
+                ):
+                    raise TaskStateError("inspection terminal evidence is not posterior")
+                if (
+                    isinstance(inspection_terminal.payload, Mapping)
+                    and inspection_terminal.payload.get("policy_violation") is True
+                ):
+                    raise TaskStateError(
+                        "inspection terminal evidence has a policy violation"
+                    )
+            if adoption_mode == ADOPTION_MODE_DIRECT and any(
+                payload.get(key) is not None
+                for key in ("inspection_terminal_event_id",)
             ):
                 raise TaskStateError(
-                    "inspection terminal evidence has a policy violation"
+                    "direct adoption inspection evidence must be absent"
                 )
             source_high_water_payload = payload.get("source_high_water_event_id")
             inspection_high_water_payload = payload.get("inspection_high_water_event_id")
             if (
                 isinstance(source_high_water_payload, bool)
                 or not isinstance(source_high_water_payload, int)
-                or isinstance(inspection_high_water_payload, bool)
-                or not isinstance(inspection_high_water_payload, int)
                 or source_high_water_payload != source_high_water
-                or inspection_high_water_payload != inspection_high_water
                 or source_high_water_payload < (source_postflight.event_id or 0)
-                or inspection_high_water_payload < (inspection_terminal.event_id or 0)
             ):
                 raise TaskStateError("adoption high-water provenance is invalid")
+            if adoption_mode == ADOPTION_MODE_LEGACY:
+                if (
+                    isinstance(inspection_high_water_payload, bool)
+                    or not isinstance(inspection_high_water_payload, int)
+                    or inspection_high_water_payload != inspection_high_water
+                    or inspection_high_water_payload < (inspection_terminal.event_id or 0)
+                ):
+                    raise TaskStateError("adoption high-water provenance is invalid")
+            elif (
+                isinstance(inspection_high_water_payload, bool)
+                or not isinstance(inspection_high_water_payload, int)
+                or inspection_high_water_payload != 0
+            ):
+                raise TaskStateError("direct adoption inspection high-water must be zero")
             if any(
                 event.source == "bridge" and event.kind == "policy.violation"
                 for event in source_events
-            ) or any(
-                event.source == "bridge" and event.kind == "policy.violation"
-                for event in inspection_events
+            ) or (
+                adoption_mode == ADOPTION_MODE_LEGACY
+                and any(
+                    event.source == "bridge" and event.kind == "policy.violation"
+                    for event in inspection_events
+                )
             ):
                 raise TaskStateError("adoption provenance contains a policy violation")
             if payload.get("schema_version") != 1 or payload.get("baseline_kind") != "reconciled_continuation":
