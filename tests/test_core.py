@@ -34,7 +34,10 @@ from chatgpt_codex_bridge.executors.base import (  # noqa: E402
 from chatgpt_codex_bridge.executors.codex_app_server import (  # noqa: E402
     AppServerMessageLimitError,
 )
-from chatgpt_codex_bridge.persistence.sqlite_store import SQLiteBridgeStore  # noqa: E402
+from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
+    EXECUTOR_DISPATCH_STARTED_EVENT,
+    SQLiteBridgeStore,
+)
 
 
 class FakeExecutor:
@@ -170,6 +173,10 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.turn_id, "turn-fake")
         self.assertEqual(executor.requests[0].cwd, "C:/workspace/bridge")
         self.assertEqual(executor.asserted_event_count_during_run, 3)
+        self.assertNotIn(
+            EXECUTOR_DISPATCH_STARTED_EVENT,
+            [event.kind for event in self.store.list_task_events("task-1")],
+        )
 
     async def test_only_queued_tasks_can_run(self) -> None:
         for status in (

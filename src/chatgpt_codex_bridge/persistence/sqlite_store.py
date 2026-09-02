@@ -258,6 +258,11 @@ _TERMINAL_EVENT_KINDS = tuple(_TERMINAL_EVENT_BY_STATUS.values())
 D3_R2_CONTRACT = "D3-R2"
 EXECUTION_REQUEST_EVENT = "task.execution_requested"
 EXECUTION_CLAIM_EVENT = "task.execution_claimed"
+# P3-S1 records the durable handoff boundary separately from the worker claim.
+# The protocol version on the claim lets recovery apply the strong meaning of
+# marker absence only to claims created by workers that know about this event.
+EXECUTOR_DISPATCH_STARTED_EVENT = "executor.dispatch_started"
+EXECUTOR_DISPATCH_PROTOCOL_VERSION = 1
 D3_H3_CONTRACT = "D3-H3"
 CANCELLATION_REQUEST_EVENT = "task.cancel_requested"
 CANCELLATION_INTERRUPT_SENT_EVENT = "task.cancel_interrupt_sent"
@@ -923,6 +928,7 @@ class SQLiteBridgeStore:
             "owner_kind": owner_kind,
             "owner_id": owner_id,
             "pid": pid,
+            "executor_dispatch_protocol_version": EXECUTOR_DISPATCH_PROTOCOL_VERSION,
         }
         connection = self._require_connection()
         claim_event: TaskEvent | None = None

@@ -27,7 +27,10 @@ from .domain.models import (
     utc_now,
 )
 from .execution_worker import read_worker_state
-from .persistence.sqlite_store import SQLiteBridgeStore
+from .persistence.sqlite_store import (
+    EXECUTOR_DISPATCH_STARTED_EVENT,
+    SQLiteBridgeStore,
+)
 from .policy import PolicyError
 
 
@@ -310,6 +313,7 @@ class MCPAdapter:
             "task.created",
             "task.execution_requested",
             "task.execution_claimed",
+            EXECUTOR_DISPATCH_STARTED_EVENT,
             "task.started",
             "task.finished",
             "task.failed",

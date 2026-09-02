@@ -22,7 +22,12 @@ from chatgpt_codex_bridge.execution_worker import (  # noqa: E402
     worker_runtime_paths,
 )
 from chatgpt_codex_bridge.mcp_adapter import MCPAdapter  # noqa: E402
-from chatgpt_codex_bridge.persistence.sqlite_store import SQLiteBridgeStore  # noqa: E402
+from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
+    EXECUTOR_DISPATCH_PROTOCOL_VERSION,
+    EXECUTOR_DISPATCH_STARTED_EVENT,
+    SQLiteBridgeStore,
+)
+from chatgpt_codex_bridge.policy import DirtyWorkingTreeError  # noqa: E402
 
 
 class FakeExecutor:
@@ -44,6 +49,11 @@ class FakeExecutor:
             status=ExecutionStatus.FINISHED,
             final_response="WORKER_OK",
         )
+
+
+class ImmediateFailureExecutor:
+    async def run(self, request, *, on_correlation=None, on_notification=None):
+        raise RuntimeError("executor failed immediately")
 
 
 class BlockingCancelableExecutor(FakeExecutor):
@@ -260,7 +270,116 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claim["owner_id"], "worker-test")
         self.assertEqual(claim["pid"], 12345)
         self.assertIsInstance(claim["claimed_at"], str)
+        self.assertEqual(
+            claim["executor_dispatch_protocol_version"],
+            EXECUTOR_DISPATCH_PROTOCOL_VERSION,
+        )
         self.assertIsNone(worker.claim_next())
+
+    def test_dispatch_marker_is_retained_as_critical_event(self) -> None:
+        self.assertIn(EXECUTOR_DISPATCH_STARTED_EVENT, self.adapter._critical_event_kinds())
+
+    async def test_worker_preflight_failure_never_dispatches_executor(self) -> None:
+        repo = self.root / "preflight-dirty"
+        repo.mkdir()
+        self._git(repo, "init")
+        self._git(repo, "config", "user.name", "Worker Test")
+        self._git(repo, "config", "user.email", "worker-test@example.invalid")
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self._git(repo, "add", "tracked.txt")
+        self._git(repo, "commit", "-m", "initial")
+        (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+
+        self.core.create_project(
+            "Bridge", str(repo), project_id="project-preflight-dirty"
+        )
+        self.core.create_task(
+            "project-preflight-dirty",
+            "must not dispatch",
+            task_id="task-preflight-dirty",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        self.core.request_execution("task-preflight-dirty")
+
+        with self.assertRaises(DirtyWorkingTreeError):
+            await ExecutionWorker(self.store, self.core).run_once()
+
+        events = self.store.list_task_events("task-preflight-dirty")
+        self.assertEqual(
+            [event.kind for event in events],
+            [
+                "task.created",
+                "task.execution_requested",
+                "task.execution_claimed",
+                "task.started",
+                "policy.violation",
+                "task.failed",
+            ],
+        )
+        self.assertNotIn(EXECUTOR_DISPATCH_STARTED_EVENT, [event.kind for event in events])
+        self.assertEqual(self.executor.requests, [])
+
+    async def test_worker_executor_failure_after_dispatch_retains_marker(self) -> None:
+        self.executor = ImmediateFailureExecutor()
+        self.core = BridgeCore(self.store, self.executor)
+        self.core.create_project("Bridge", "C:/workspace/bridge", project_id="project-fail")
+        self.adapter = MCPAdapter(self.core, self.store)
+        self.core.create_task("project-fail", "fail after dispatch", task_id="task-fail")
+        self.core.request_execution("task-fail")
+
+        with self.assertRaisesRegex(RuntimeError, "executor failed immediately"):
+            await ExecutionWorker(self.store, self.core).run_once()
+
+        events = self.store.list_task_events("task-fail")
+        kinds = [event.kind for event in events]
+        self.assertIn(EXECUTOR_DISPATCH_STARTED_EVENT, kinds)
+        self.assertEqual(kinds[-1], "task.failed")
+        self.assertIsNone(self.store.get_task("task-fail").thread_id)
+        self.assertIsNone(self.store.get_task("task-fail").turn_id)
+
+    def test_recovery_marks_current_claim_without_dispatch_as_not_reached(self) -> None:
+        task = self.create_task("task-dispatch-missing")
+        self.core.request_execution(task.task_id)
+        self.assertIsNotNone(ExecutionWorker(self.store, self.core).claim_next())
+
+        self.core.recover_orphaned_tasks()
+
+        required = self.store.get_reconciliation_state(task.task_id)
+        self.assertIsNotNone(required)
+        assert required is not None
+        self.assertEqual(
+            required["required_event"].payload["executor_dispatch"],
+            {
+                "status": "not_reached",
+                "protocol_version": EXECUTOR_DISPATCH_PROTOCOL_VERSION,
+                "event_id": None,
+            },
+        )
+
+    def test_recovery_marks_dispatch_reached_without_terminal_as_conservative(self) -> None:
+        task = self.create_task("task-dispatch-reached")
+        self.core.request_execution(task.task_id)
+        self.assertIsNotNone(ExecutionWorker(self.store, self.core).claim_next())
+        self.store.append_task_event(
+            task.task_id,
+            "bridge",
+            EXECUTOR_DISPATCH_STARTED_EVENT,
+            {
+                "task_id": task.task_id,
+                "project_id": task.project_id,
+                "executor": task.executor,
+                "protocol_version": EXECUTOR_DISPATCH_PROTOCOL_VERSION,
+            },
+        )
+
+        self.core.recover_orphaned_tasks()
+
+        required = self.store.get_reconciliation_state(task.task_id)
+        self.assertIsNotNone(required)
+        assert required is not None
+        dispatch = required["required_event"].payload["executor_dispatch"]
+        self.assertEqual(dispatch["status"], "reached")
+        self.assertIsInstance(dispatch["event_id"], int)
 
     async def test_run_task_during_running_does_not_execute_again(self) -> None:
         self.create_task()
@@ -399,15 +518,30 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
                 "task.execution_claimed",
                 "task.started",
                 "policy.git_checkpoint",
+                EXECUTOR_DISPATCH_STARTED_EVENT,
                 "turn/completed",
                 "policy.postflight",
                 "task.finished",
             ],
         )
+        events = self.store.list_task_events("task-autonomous")
+        dispatch = next(
+            event for event in events if event.kind == EXECUTOR_DISPATCH_STARTED_EVENT
+        )
+        self.assertEqual(
+            dispatch.payload,
+            {
+                "task_id": "task-autonomous",
+                "project_id": "project-auto",
+                "executor": "codex",
+                "protocol_version": EXECUTOR_DISPATCH_PROTOCOL_VERSION,
+            },
+        )
+        thread_started = next(event for event in events if event.kind == "turn/completed")
+        assert dispatch.event_id is not None and thread_started.event_id is not None
+        self.assertLess(dispatch.event_id, thread_started.event_id)
         postflight = next(
-            event
-            for event in self.store.list_task_events("task-autonomous")
-            if event.kind == "policy.postflight"
+            event for event in events if event.kind == "policy.postflight"
         )
         self.assertIn("worker.txt", postflight.payload["untracked_files"])
         self.assertFalse(postflight.payload["policy_violation"])
@@ -548,6 +682,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
                 "task.execution_requested",
                 "task.execution_claimed",
                 "task.started",
+                EXECUTOR_DISPATCH_STARTED_EVENT,
                 "task.cancel_requested",
                 "task.cancel_interrupt_sent",
                 "turn/completed",
@@ -681,6 +816,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
                 "task.execution_requested",
                 "task.execution_claimed",
                 "task.started",
+                EXECUTOR_DISPATCH_STARTED_EVENT,
                 "turn/completed",
                 "task.cancel_requested",
                 "task.finished",

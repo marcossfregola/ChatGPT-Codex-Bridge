@@ -66,6 +66,8 @@ from .persistence.sqlite_store import (
     CHECKPOINT_STARTED_EVENT,
     D3_H3_CONTRACT,
     D3_R2_CONTRACT,
+    EXECUTOR_DISPATCH_PROTOCOL_VERSION,
+    EXECUTOR_DISPATCH_STARTED_EVENT,
     RECONCILIATION_BASELINE_ADOPTED_EVENT,
     SQLiteBridgeStore,
 )
@@ -639,9 +641,88 @@ class BridgeCore:
         return None
 
     @staticmethod
-    def _reconciliation_payload(task: Task, events: list[Any]) -> dict[str, Any]:
+    def _executor_dispatch_state(task: Task, events: list[Any]) -> dict[str, Any]:
+        """Classify durable executor handoff evidence for one task.
+
+        A protocol-versioned worker claim makes marker absence meaningful for
+        current executions. Claims written before P3-S1 intentionally remain
+        ``unknown`` so recovery never applies a new negative inference to
+        historical data.
+        """
+
+        claim_payload: Mapping[str, Any] | None = None
+        for event in reversed(events):
+            if event.source != "bridge" or event.kind != "task.execution_claimed":
+                continue
+            if isinstance(event.payload, Mapping):
+                claim_payload = event.payload
+            break
+
+        claim_protocol = (
+            claim_payload.get("executor_dispatch_protocol_version")
+            if claim_payload is not None
+            else None
+        )
+        if (
+            isinstance(claim_protocol, bool)
+            or not isinstance(claim_protocol, int)
+            or claim_protocol != EXECUTOR_DISPATCH_PROTOCOL_VERSION
+        ):
+            claim_protocol = None
+
+        marker: Any | None = None
+        for event in reversed(events):
+            if event.source == "bridge" and event.kind == EXECUTOR_DISPATCH_STARTED_EVENT:
+                marker = event
+                break
+
+        if marker is not None:
+            payload = marker.payload
+            marker_protocol = (
+                payload.get("protocol_version")
+                if isinstance(payload, Mapping)
+                else None
+            )
+            valid_marker = (
+                isinstance(payload, Mapping)
+                and payload.get("task_id") == task.task_id
+                and payload.get("project_id") == task.project_id
+                and payload.get("executor") == task.executor
+                and isinstance(marker_protocol, int)
+                and not isinstance(marker_protocol, bool)
+                and marker_protocol == EXECUTOR_DISPATCH_PROTOCOL_VERSION
+            )
+            if valid_marker:
+                return {
+                    "status": "reached",
+                    "protocol_version": EXECUTOR_DISPATCH_PROTOCOL_VERSION,
+                    "event_id": marker.event_id,
+                }
+            # A malformed marker is still evidence that the journal is not
+            # trustworthy enough for a negative conclusion.
+            return {
+                "status": "unknown",
+                "protocol_version": claim_protocol,
+                "event_id": marker.event_id,
+            }
+
+        if claim_protocol == EXECUTOR_DISPATCH_PROTOCOL_VERSION:
+            return {
+                "status": "not_reached",
+                "protocol_version": claim_protocol,
+                "event_id": None,
+            }
+        return {
+            "status": "unknown",
+            "protocol_version": claim_protocol,
+            "event_id": None,
+        }
+
+    @classmethod
+    def _reconciliation_payload(cls, task: Task, events: list[Any]) -> dict[str, Any]:
         """Build stable evidence for a reconciliation marker."""
 
+        executor_dispatch = cls._executor_dispatch_state(task, events)
         relevant = []
         for event in events:
             if event.source not in {"bridge", "codex"}:
@@ -655,6 +736,7 @@ class BridgeCore:
                     "task.cancel_requested",
                     "task.cancel_interrupt_sent",
                     "task.cancel_interrupt_failed",
+                    EXECUTOR_DISPATCH_STARTED_EVENT,
                 }
             ):
                 continue
@@ -664,7 +746,18 @@ class BridgeCore:
             if event.kind == "task.execution_claimed":
                 fingerprint_payload = {
                     key: payload.get(key)
-                    for key in ("owner_kind", "owner_id", "claimed_at")
+                    for key in (
+                        "owner_kind",
+                        "owner_id",
+                        "claimed_at",
+                        "executor_dispatch_protocol_version",
+                    )
+                    if key in payload
+                }
+            elif event.kind == EXECUTOR_DISPATCH_STARTED_EVENT:
+                fingerprint_payload = {
+                    key: payload.get(key)
+                    for key in ("task_id", "project_id", "executor", "protocol_version")
                     if key in payload
                 }
             elif event.kind.startswith("turn/"):
@@ -691,6 +784,7 @@ class BridgeCore:
             "task_id": task.task_id,
             "thread_id": task.thread_id,
             "turn_id": task.turn_id,
+            "executor_dispatch": executor_dispatch,
             "events": relevant,
         }
         encoded = json.dumps(
@@ -716,6 +810,7 @@ class BridgeCore:
                 event.source == "bridge" and event.kind == "task.cancel_requested"
                 for event in events
             ),
+            "executor_dispatch": executor_dispatch,
             "evidence_event_ids": [
                 item["event_id"] for item in relevant if item["event_id"] is not None
             ],
@@ -2768,6 +2863,21 @@ class BridgeCore:
                 previous_postflight=previous_postflight,
             )
 
+    def _persist_executor_dispatch_started(self, task: Task, project: Project) -> None:
+        """Persist the worker-to-executor handoff before invoking the executor."""
+
+        self.store.append_task_event(
+            task.task_id,
+            "bridge",
+            EXECUTOR_DISPATCH_STARTED_EVENT,
+            {
+                "task_id": task.task_id,
+                "project_id": project.project_id,
+                "executor": task.executor,
+                "protocol_version": EXECUTOR_DISPATCH_PROTOCOL_VERSION,
+            },
+        )
+
     @staticmethod
     def _preflight_violation_payload(error: PolicyError) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -2873,8 +2983,15 @@ class BridgeCore:
         task: Task,
         project: Project,
         checkpoint: GitCheckpoint | None,
+        *,
+        record_dispatch_marker: bool = False,
     ) -> Task:
-        """Execute one task whose durable owner already set it RUNNING."""
+        """Execute one task whose durable owner already set it RUNNING.
+
+        Only the persistent worker-owned path opts into the dispatch marker.
+        The legacy direct ``run_task`` path deliberately retains its existing
+        event contract and therefore remains unmarked.
+        """
 
         executor = self._require_executor()
         task_id = task.task_id
@@ -2910,6 +3027,8 @@ class BridgeCore:
                 model=task.model,
                 mode=task.mode,
             )
+            if record_dispatch_marker:
+                self._persist_executor_dispatch_started(task, project)
             result = await executor.run(
                 request,
                 on_correlation=on_correlation,
@@ -3095,7 +3214,12 @@ class BridgeCore:
                 {"mode": task.mode.value, **checkpoint_payload(checkpoint)},
             )
 
-        return await self._execute_running_task(task, project, checkpoint)
+        return await self._execute_running_task(
+            task,
+            project,
+            checkpoint,
+            record_dispatch_marker=True,
+        )
 
     def _persist_postflight(
         self, task_id: str, checkpoint: GitCheckpoint

@@ -113,12 +113,39 @@ class H4RecoveryTests(unittest.TestCase):
             ),
             1,
         )
+        required = self.store.get_reconciliation_state(task.task_id)
+        self.assertIsNotNone(required)
+        assert required is not None
+        self.assertEqual(
+            required["required_event"].payload["executor_dispatch"]["status"],
+            "unknown",
+        )
         self.assertEqual(self.core.recover_orphaned_tasks()[0].execution_status, ExecutionStatus.RUNNING)
         self.assertEqual(
             [event.kind for event in self.store.list_task_events(task.task_id)].count(
                 "task.reconciliation_required"
             ),
             1,
+        )
+
+    def test_legacy_claim_without_dispatch_marker_remains_unknown(self) -> None:
+        task = self._running("task-legacy-claim")
+        assert task is not None
+        self.store.append_task_event(
+            task.task_id,
+            "bridge",
+            "task.execution_claimed",
+            {"owner_kind": "persistent_worker", "owner_id": "old", "pid": 1},
+        )
+
+        self.core.recover_orphaned_tasks()
+
+        state = self.store.get_reconciliation_state(task.task_id)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(
+            state["required_event"].payload["executor_dispatch"]["status"],
+            "unknown",
         )
 
     def test_interrupt_with_h3_request_becomes_cancelled(self) -> None:
