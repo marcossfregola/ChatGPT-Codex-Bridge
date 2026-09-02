@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -71,20 +72,30 @@ class PowerShellScriptTests(unittest.TestCase):
         )
         self.assertIn("supported health readiness", start_tunnel)
 
-    def _active_tunnel_probe_context(self) -> tuple[str, Path, Path, Path, Path]:
+    def _isolated_tunnel_probe_context(
+        self, directory: str
+    ) -> tuple[str, Path, Path, Path, Path]:
         pwsh = shutil.which("pwsh")
         if pwsh is None:
             self.skipTest("PowerShell 7 unavailable")
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if not local_app_data:
-            self.skipTest("LOCALAPPDATA unavailable")
 
-        runtime_root = Path(local_app_data) / "ChatGPTCodexBridge"
-        tunnel_client = runtime_root / "tunnel-client" / "tunnel-client.exe"
-        pid_file = runtime_root / "tunnel-state" / "tunnel.pid"
-        health_file = runtime_root / "tunnel-state" / "health.url"
-        if not tunnel_client.is_file() or not pid_file.is_file():
-            self.skipTest("active direct tunnel-client runtime unavailable")
+        runtime_root = Path(directory) / "ChatGPTCodexBridge"
+        tunnel_client_root = runtime_root / "tunnel-client"
+        tunnel_state = runtime_root / "tunnel-state"
+        tunnel_client_root.mkdir(parents=True)
+        tunnel_state.mkdir(parents=True)
+        tunnel_client = tunnel_client_root / "tunnel-client.cmd"
+        tunnel_client.write_text(
+            "@echo off\r\n"
+            "if /I not \"%~1\"==\"health\" exit /b 1\r\n"
+            "if /I not \"%~2\"==\"--port\" exit /b 1\r\n"
+            "if \"%~3\"==\"8877\" exit /b 0\r\n"
+            "exit /b 1\r\n",
+            encoding="ascii",
+        )
+        pid_file = tunnel_state / "tunnel.pid"
+        pid_file.write_text("12345\n", encoding="ascii")
+        health_file = tunnel_state / "health.url"
         return pwsh, tunnel_client, pid_file, health_file, ROOT / "scripts" / "start_mcp_tunnel.ps1"
 
     def _run_tunnel_readiness_probe(
@@ -288,10 +299,8 @@ Start-Sleep -Seconds 30
 """,
                 encoding="utf-8",
             )
-            tunnel_process = subprocess.Popen(
+            child_command = subprocess.list2cmdline(
                 [
-                    str(tunnel_client),
-                    "/c",
                     pwsh,
                     "-NoLogo",
                     "-NoProfile",
@@ -301,11 +310,19 @@ Start-Sleep -Seconds 30
                     "-File",
                     str(child_script),
                     str(child_pid_file),
-                ],
+                ]
+            )
+            tunnel_command = (
+                f"{subprocess.list2cmdline([str(tunnel_client)])} "
+                f"/c \"{child_command}\""
+            )
+            tunnel_process = subprocess.Popen(
+                tunnel_command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            child_pid: int | None = None
             try:
                 for _ in range(100):
                     if child_pid_file.exists():
@@ -323,6 +340,14 @@ Start-Sleep -Seconds 30
                     directory,
                 )
 
+                output = completed.stdout + completed.stderr
+                if completed.returncode != 0 and (
+                    "acceso denegado" in output.lower()
+                    or "access is denied" in output.lower()
+                ):
+                    self.skipTest(
+                        "taskkill.exe cannot terminate test processes in this environment"
+                    )
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertIn("Stopped ChatGPT-Codex direct tunnel PID", completed.stdout)
                 self.assertIsNotNone(tunnel_process.poll())
@@ -344,12 +369,18 @@ Start-Sleep -Seconds 30
                 self.assertFalse((tunnel_state / "tunnel.pid").exists())
                 self.assertFalse((tunnel_state / "health.url").exists())
             finally:
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGTERM)
+                    except (PermissionError, ProcessLookupError):
+                        pass
                 if tunnel_process.poll() is None:
-                    subprocess.run(
-                        ["taskkill.exe", "/PID", str(tunnel_process.pid), "/T", "/F"],
-                        capture_output=True,
-                        check=False,
-                    )
+                    tunnel_process.terminate()
+                    try:
+                        tunnel_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        tunnel_process.kill()
+                        tunnel_process.wait(timeout=5)
 
     def test_stop_does_not_widen_process_termination_scope(self) -> None:
         stop_tunnel = (ROOT / "scripts" / "stop_mcp_tunnel.ps1").read_text(encoding="utf-8")
@@ -377,38 +408,46 @@ Start-Sleep -Seconds 30
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 unavailable")
     def test_startup_approves_ready_runtime_without_health_file(self) -> None:
-        pwsh, tunnel_client, pid_file, health_file, tunnel_script = self._active_tunnel_probe_context()
-        self.assertFalse(health_file.exists())
-        completed = self._run_tunnel_readiness_probe(
-            pwsh=pwsh,
-            tunnel_client=tunnel_client,
-            pid_file=pid_file,
-            health_port=8877,
-            expected_ready=True,
-            readiness_function=self._readiness_function_source(tunnel_script),
-        )
+        with tempfile.TemporaryDirectory(prefix="bridge readiness fixture ") as directory:
+            pwsh, tunnel_client, pid_file, health_file, tunnel_script = (
+                self._isolated_tunnel_probe_context(directory)
+            )
+            self.assertFalse(health_file.exists())
+            completed = self._run_tunnel_readiness_probe(
+                pwsh=pwsh,
+                tunnel_client=tunnel_client,
+                pid_file=pid_file,
+                health_port=8877,
+                expected_ready=True,
+                readiness_function=self._readiness_function_source(tunnel_script),
+            )
 
-        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        self.assertIn("READINESS=True", completed.stdout)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn("READINESS=True", completed.stdout)
+            self.assertFalse(health_file.exists())
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 unavailable")
     def test_startup_rejects_unready_runtime_without_health_file(self) -> None:
-        pwsh, tunnel_client, pid_file, health_file, tunnel_script = self._active_tunnel_probe_context()
-        self.assertFalse(health_file.exists())
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
-            probe_socket.bind(("127.0.0.1", 0))
-            unavailable_port = probe_socket.getsockname()[1]
-        completed = self._run_tunnel_readiness_probe(
-            pwsh=pwsh,
-            tunnel_client=tunnel_client,
-            pid_file=pid_file,
-            health_port=unavailable_port,
-            expected_ready=False,
-            readiness_function=self._readiness_function_source(tunnel_script),
-        )
+        with tempfile.TemporaryDirectory(prefix="bridge readiness fixture ") as directory:
+            pwsh, tunnel_client, pid_file, health_file, tunnel_script = (
+                self._isolated_tunnel_probe_context(directory)
+            )
+            self.assertFalse(health_file.exists())
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+                probe_socket.bind(("127.0.0.1", 0))
+                unavailable_port = probe_socket.getsockname()[1]
+            completed = self._run_tunnel_readiness_probe(
+                pwsh=pwsh,
+                tunnel_client=tunnel_client,
+                pid_file=pid_file,
+                health_port=unavailable_port,
+                expected_ready=False,
+                readiness_function=self._readiness_function_source(tunnel_script),
+            )
 
-        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
-        self.assertIn("READINESS=False", completed.stdout)
+            self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+            self.assertIn("READINESS=False", completed.stdout)
+            self.assertFalse(health_file.exists())
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 unavailable")
     def test_lifecycle_transport_and_wrapper_exit_with_persistent_descendant(self) -> None:

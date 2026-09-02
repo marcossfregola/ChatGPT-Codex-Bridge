@@ -168,7 +168,7 @@ class WorkerScriptLifecycleTests(unittest.TestCase):
         self.assertNotIn("runtimes status", tunnel_stop)
         self.assertNotIn("runtimes stop", tunnel_stop)
         self.assertIn("tunnel.pid", tunnel_stop)
-        self.assertIn("StringComparison.OrdinalIgnoreCase", tunnel_stop)
+        self.assertIn("[System.StringComparison]::OrdinalIgnoreCase", tunnel_stop)
         self.assertIn("taskkill.exe", tunnel_stop)
         self.assertIn("/PID", tunnel_stop)
         self.assertIn("/T", tunnel_stop)
