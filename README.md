@@ -24,23 +24,32 @@ Desde `C:\Codex\ChatGPT-Codex-Bridge`:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\start_runtime.ps1
-(Invoke-WebRequest -Uri http://127.0.0.1:8877/readyz -UseBasicParsing).StatusCode
 & .\scripts\doctor_mcp_tunnel.ps1
 & .\scripts\doctor_execution_worker.ps1
-pwsh -NoProfile -File .\scripts\stop_runtime.ps1 -TunnelRuntimeAlias <managed-alias>
+pwsh -NoProfile -File .\scripts\stop_runtime.ps1
 ```
 
-El arranque sólo se considera listo con `/readyz` HTTP 200 y un worker activo.
-`start_runtime.ps1` inicia primero el worker y después el túnel; es idempotente
-y reporta arranques parciales. `stop_runtime.ps1` solicita primero el cierre
-controlado del worker mediante su stop-file y luego detiene un túnel supervisado
-por `tunnel-client runtimes stop`. El alias gestionado debe pasarse
-explícitamente: un perfil directo no ofrece un mecanismo local de parada
-graceful verificable y el script se niega a terminar procesos. Los wrappers
+El arranque sólo se considera listo cuando el worker está activo y
+`tunnel-client health --port 8877 --pid-file <tunnel.pid> --require-control-plane-poll --json`
+confirma la readiness del túnel. `start_runtime.ps1` inicia primero el worker y
+después el túnel directo mediante `tunnel-client run --profile-file <profile-file>
+--pid.file <tunnel.pid>`; es idempotente y reporta arranques parciales.
+`stop_runtime.ps1` solicita primero el cierre controlado del worker mediante su
+stop-file y después ejecuta el Stop directo del túnel. Ese Stop lee
+`%LOCALAPPDATA%\ChatGPTCodexBridge\tunnel-state\tunnel.pid`, valida el PID y que
+el executable coincida exactamente con el `tunnel-client.exe` instalado, y sólo
+entonces termina ese PID y su árbol con `taskkill.exe /PID <verified_pid> /T /F`.
+No mata procesos por nombre genérico. El mismo Tunnel ID histórico autorizado se
+reutiliza y una sola máquina debe operar ese túnel a la vez. Los wrappers
 requieren PowerShell 7 (`pwsh -NoProfile`). Los `doctor` son flujos manuales de
-sólo lectura que deben ejecutarse bajo la identidad Windows que creó la credencial
-DPAPI. No se debe ejecutar el doctor desde el sandbox de Codex ni mostrar la
-credencial.
+sólo lectura que deben ejecutarse bajo la identidad Windows que creó la
+credencial DPAPI. No se debe ejecutar el doctor desde el sandbox de Codex ni
+mostrar la credencial.
+
+La identidad de cada instalación se configura localmente mediante
+`CHATGPT_CODEX_BRIDGE_INSTANCE_ID`. `get_status` devuelve ese valor sin espacios
+externos, o `UNCONFIGURED` si está ausente o en blanco, y también informa el
+hostname local; no hay valores de máquina hardcodeados.
 
 El runtime operativo de esta etapa es **ChatGPT–Codex Bridge D3-R2-B**. El
 complemento original conserva un schema MCP cacheado anterior a `TaskMode`; no

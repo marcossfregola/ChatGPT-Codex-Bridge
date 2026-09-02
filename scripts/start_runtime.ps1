@@ -29,6 +29,7 @@ $logsRoot = Join-Path $runtimeRoot "logs"
 $dbPath = Join-Path $stateRoot "bridge.sqlite3"
 $tunnelClient = Join-Path $runtimeRoot "tunnel-client\tunnel-client.exe"
 $tunnelPidFile = Join-Path $runtimeRoot "tunnel-state\tunnel.pid"
+$healthPort = 8877
 
 New-Item -ItemType Directory -Force -Path $logsRoot | Out-Null
 
@@ -42,17 +43,57 @@ function Invoke-LifecycleScript {
     $stdoutPath = Join-Path $logsRoot ($LogPrefix + ".stdout.log")
     $stderrPath = Join-Path $logsRoot ($LogPrefix + ".stderr.log")
     Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    # Keep paths and arguments structured in a UTF-8 JSON payload.  The
+    # encoded command is a single space-free transport token, so
+    # Start-Process never has to join raw path arguments.  Its stdout/stderr
+    # redirection is performed by the OS directly into files.
+    $payload = [pscustomobject]@{
+        ScriptPath = $ScriptPath
+        Arguments = @($ArgumentList)
+    } | ConvertTo-Json -Compress
+    $payloadBase64 = [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes($payload)
+    )
+    $relayScript = @"
+`$payload = [Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String('$payloadBase64')
+)
+`$request = `$payload | ConvertFrom-Json
+`$scriptPath = [string]`$request.ScriptPath
+`$arguments = @( `$request.Arguments | ForEach-Object { [string]`$_ } )
+`$namedArguments = @{}
+for (`$index = 0; `$index -lt `$arguments.Count; `$index++) {
+    `$token = [string]`$arguments[`$index]
+    if (`$token -notmatch '^-') {
+        throw "Lifecycle arguments must be named parameters."
+    }
+    `$name = `$token.TrimStart('-')
+    if (
+        `$index + 1 -lt `$arguments.Count -and
+        `$arguments[`$index + 1] -notmatch '^-'
+    ) {
+        `$namedArguments[`$name] = `$arguments[`$index + 1]
+        `$index++
+    }
+    else {
+        `$namedArguments[`$name] = `$true
+    }
+}
+& `$scriptPath @namedArguments
+exit `$LASTEXITCODE
+"@
+    $encodedCommand = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($relayScript)
+    )
     $childArguments = @(
-            "-NoProfile",
-            "-File",
-            $ScriptPath
-        ) + $ArgumentList
-    # Do not use Start-Process -Wait here: on Windows PowerShell 7 it can
-    # wait for the complete descendant tree, which would include the
-    # intentionally persistent execution worker.  Wait only for this wrapper
-    # process while the worker continues independently.
+        "-NoProfile",
+        "-EncodedCommand",
+        $encodedCommand
+    )
     $child = Start-Process -FilePath $pwsh -ArgumentList $childArguments -WorkingDirectory $repoRoot -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden -PassThru
+    $exitCode = 1
     $child.WaitForExit()
+    $exitCode = $child.ExitCode
     $output = @()
     if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
         $output += Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
@@ -61,9 +102,33 @@ function Invoke-LifecycleScript {
         $output += Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue
     }
     return [pscustomobject]@{
-        ExitCode = $child.ExitCode
+        ExitCode = $exitCode
         Output = $output
     }
+}
+
+function Test-TunnelClientReadiness {
+    param(
+        [Parameter(Mandatory)]
+        [string]$TunnelClientPath,
+        [Parameter(Mandatory)]
+        [int]$HealthPort,
+        [Parameter(Mandatory)]
+        [string]$TunnelPidFile
+    )
+
+    $healthArguments = @(
+        "health",
+        "--port",
+        [string]$HealthPort,
+        "--pid-file",
+        $TunnelPidFile,
+        "--require-control-plane-poll",
+        "--json"
+    )
+    & $TunnelClientPath @healthArguments 2>$null | Out-Null
+    $probeExitCode = $LASTEXITCODE
+    return ($probeExitCode -eq 0)
 }
 
 function Test-ExistingTunnel {
@@ -92,6 +157,12 @@ function Test-ExistingTunnel {
     if ([string]::IsNullOrWhiteSpace($actual) -or
         ((Resolve-Path -LiteralPath $actual).Path -ine $expected)) {
         throw "The tunnel PID file points to a live unrelated process; refusing to stop or replace it."
+    }
+    if (-not (Test-TunnelClientReadiness `
+            -TunnelClientPath $expected `
+            -HealthPort $healthPort `
+            -TunnelPidFile $tunnelPidFile)) {
+        throw "The tunnel PID file points to a live but not ready tunnel-client."
     }
     return $true
 }

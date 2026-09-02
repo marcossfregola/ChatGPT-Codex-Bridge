@@ -7,6 +7,7 @@ from collections.abc import Mapping
 import errno
 import json
 import os
+import socket
 from typing import Any
 
 from . import BRIDGE_STAGE, __version__
@@ -644,6 +645,10 @@ class MCPAdapter:
         return "unknown"
 
     def _status(self) -> dict[str, Any]:
+        instance_id = (
+            os.environ.get("CHATGPT_CODEX_BRIDGE_INSTANCE_ID", "").strip()
+            or "UNCONFIGURED"
+        )
         worker_state = read_worker_state(self.store.db_path)
         worker_status = (
             worker_state.get("status")
@@ -773,6 +778,8 @@ class MCPAdapter:
             "bridge_version": self.bridge_version,
             "stage": self.stage,
             "executor": self.executor_name,
+            "instance_id": instance_id,
+            "hostname": socket.gethostname(),
             "active_project": _project_dict(project) if project is not None else None,
             "active_task": (
                 self._task_view(active_task, cancel_requested=cancel_requested)
