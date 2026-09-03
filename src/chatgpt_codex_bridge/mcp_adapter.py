@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import errno
 import json
 import os
@@ -37,6 +37,8 @@ from .policy import PolicyError
 
 DEFAULT_MODEL = "gpt-5.6-luna"
 STAGE = BRIDGE_STAGE
+_INSTANCE_ID_ENVIRONMENT_VARIABLE = "CHATGPT_CODEX_BRIDGE_INSTANCE_ID"
+_UNCONFIGURED_INSTANCE_ID = "UNCONFIGURED"
 MAX_EVENT_LIMIT = 1000
 DEFAULT_EVENT_LIMIT = 100
 MAX_CRITICAL_EVENT_RESULTS = 64
@@ -118,6 +120,39 @@ class MCPToolError(RuntimeError):
 
 class MCPConcurrencyError(MCPToolError):
     """Raised when a second task is requested during an active run."""
+
+
+def _read_user_scope_instance_id() -> str | None:
+    """Read the Bridge instance identity from the current Windows user scope."""
+
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+            value, _ = winreg.QueryValueEx(key, _INSTANCE_ID_ENVIRONMENT_VARIABLE)
+    except (ImportError, OSError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _resolve_instance_id(
+    *, user_scope_reader: Callable[[], str | None] | None = None
+) -> str:
+    """Resolve the local identity, preferring process env over Windows User scope."""
+
+    process_value = os.environ.get(_INSTANCE_ID_ENVIRONMENT_VARIABLE, "").strip()
+    if process_value:
+        return process_value
+
+    reader = user_scope_reader or _read_user_scope_instance_id
+    user_value = reader()
+    if isinstance(user_value, str):
+        user_value = user_value.strip()
+        if user_value:
+            return user_value
+    return _UNCONFIGURED_INSTANCE_ID
 
 
 def _required_text(arguments: Mapping[str, Any], name: str) -> str:
@@ -645,10 +680,7 @@ class MCPAdapter:
         return "unknown"
 
     def _status(self) -> dict[str, Any]:
-        instance_id = (
-            os.environ.get("CHATGPT_CODEX_BRIDGE_INSTANCE_ID", "").strip()
-            or "UNCONFIGURED"
-        )
+        instance_id = _resolve_instance_id()
         worker_state = read_worker_state(self.store.db_path)
         worker_status = (
             worker_state.get("status")

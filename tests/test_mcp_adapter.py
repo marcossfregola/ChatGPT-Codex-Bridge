@@ -36,6 +36,7 @@ from chatgpt_codex_bridge.mcp_adapter import (  # noqa: E402
     MCPAdapter,
     MCPConcurrencyError,
     MCPToolError,
+    _resolve_instance_id,
 )
 from chatgpt_codex_bridge.mcp_server import (  # noqa: E402
     _call_adapter,
@@ -224,8 +225,40 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["instance_id"], "bridge-local-01")
 
+    def test_resolve_instance_id_prefers_process_scope(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CHATGPT_CODEX_BRIDGE_INSTANCE_ID": "  process-id  "},
+            clear=True,
+        ):
+            self.assertEqual(
+                _resolve_instance_id(user_scope_reader=lambda: "user-id"),
+                "process-id",
+            )
+
+    def test_resolve_instance_id_uses_user_scope_when_process_is_missing(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                _resolve_instance_id(user_scope_reader=lambda: "  user-id  "),
+                "user-id",
+            )
+
+    def test_resolve_instance_id_returns_unconfigured_for_missing_or_whitespace(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CHATGPT_CODEX_BRIDGE_INSTANCE_ID": " \t "},
+            clear=True,
+        ):
+            self.assertEqual(
+                _resolve_instance_id(user_scope_reader=lambda: " \n "),
+                "UNCONFIGURED",
+            )
+
     async def test_get_status_reports_unconfigured_instance_id_when_absent(self) -> None:
-        with patch.dict(os.environ, {}, clear=False):
+        with patch(
+            "chatgpt_codex_bridge.mcp_adapter._read_user_scope_instance_id",
+            return_value=None,
+        ), patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CHATGPT_CODEX_BRIDGE_INSTANCE_ID", None)
             result = await self.adapter.call_tool("get_status", {})
 
@@ -235,6 +268,9 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(
             os.environ,
             {"CHATGPT_CODEX_BRIDGE_INSTANCE_ID": " \t "},
+        ), patch(
+            "chatgpt_codex_bridge.mcp_adapter._read_user_scope_instance_id",
+            return_value=None,
         ):
             result = await self.adapter.call_tool("get_status", {})
 

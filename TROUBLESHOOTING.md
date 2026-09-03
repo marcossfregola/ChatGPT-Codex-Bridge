@@ -22,7 +22,7 @@ La evidencia actual del repositorio/runtime prevalece sobre antecedentes histór
 | ChatGPT no muestra una tool/parámetro MCP nuevo aunque el MCP local sí | Schema MCP stale del complemento | RESUELTO OPERACIONALMENTE / VERIFICADO | ChatGPT → Configuración → Complementos → ChatGPT–Codex Bridge D3 → Actualizar |
 | Se duda si el MCP local publica el schema correcto | Diagnóstico de schema | PROCEDIMIENTO VERIFICADO | MCP efímero + DB temporal + `tools/list` |
 | READ_ONLY necesita temporales, SQLite o fixtures | Limitación Codex/Windows | DEFER / LIMITACIÓN EXTERNA ACTUAL | No asumir repo-RO + temp-WRITE; usar un modo apropiado para la auditoría/test |
-| `instance_id = UNCONFIGURED` después de un arranque elevado | Identidad local | PENDIENTE | No confundir con caída de D3; revisar environment heredado antes de investigar otra cosa |
+| `instance_id = UNCONFIGURED` después de un arranque elevado | Identidad local | RESUELTO / VERIFICADO DINÁMICAMENTE | `get_status` resuelve Process > User y usa `UNCONFIGURED` sólo si ambos faltan |
 | `start_runtime.ps1` o `stop_runtime.ps1` falla con Access Denied | Lifecycle Windows | PROCEDIMIENTO OPERATIVO CONOCIDO | Confirmar cero tasks activas y reintentar los scripts normales elevados; no saltar a hard reset |
 | `active_task` muestra una task FINISHED | Estado histórico | NORMAL | Mirar `active_task_source`, `worker_status`, `requested_task_id` y `running_task_id` |
 | Codex intenta `rg` y no existe | Herramienta auxiliar ausente | NO ES FALLO D3 | Permitir fallback como `Select-String`; no instalar software automáticamente |
@@ -271,9 +271,18 @@ Las investigaciones con permission profiles, elevación, workspace-write, `windo
 
 ## 8. `instance_id = UNCONFIGURED` después de arranque elevado
 
-**Estado:** `PENDIENTE`.
+**Estado:** `RESUELTO / VERIFICADO DINÁMICAMENTE`.
 
-`get_status` obtiene la identidad mediante `CHATGPT_CODEX_BRIDGE_INSTANCE_ID` del environment block del proceso y devuelve `UNCONFIGURED` si no está presente o está vacío.
+La causa era que un arranque elevado podía no heredar
+`CHATGPT_CODEX_BRIDGE_INSTANCE_ID` del User scope en el environment block del
+proceso. `get_status` ahora resuelve la identidad con esta prioridad:
+
+1. Process scope;
+2. User scope de Windows (`HKEY_CURRENT_USER\Environment`);
+3. `UNCONFIGURED` si ambos valores faltan o son whitespace.
+
+Los valores se recortan con `strip()`. `PC` no está hardcodeado ni se persiste
+en el repositorio: sigue siendo configuración local de la máquina.
 
 Se observó este caso:
 
@@ -283,7 +292,12 @@ proceso elevado: variable ausente en su environment block
 get_status.instance_id = UNCONFIGURED
 ```
 
-Esto es compatible con herencia incompleta/refresco del environment block al arrancar elevado.
+Esto era compatible con herencia incompleta/refresco del environment block al arrancar elevado.
+
+La solución quedó verificada dinámicamente con el runtime real: bajo
+`MARCOS-CASA\Marcos Casa`, con Process scope ausente y User scope=`PC`,
+ChatGPT ejecutó `get_status` y obtuvo `instance_id=PC`,
+`hostname=MARCOS-CASA`, worker activo/idle y sin task solicitada ni ejecutándose.
 
 ### Qué significa
 
@@ -299,7 +313,9 @@ Evaluar separadamente `worker_active`, `worker_status`, health/readiness y reque
 
 ### Qué hacer hoy
 
-Registrar el incidente y corregirlo en una tarea separada. No documentar todavía una solución como canónica hasta implementarla y verificarla.
+Si el valor vuelve a aparecer, comprobar primero Process/User scope bajo la
+misma identidad Windows y repetir `get_status`; no reemplazar la resolución por
+un valor fijo ni investigar el worker/túnel como si fueran la causa primaria.
 
 ## 9. Stop/start normal y Access Denied
 
