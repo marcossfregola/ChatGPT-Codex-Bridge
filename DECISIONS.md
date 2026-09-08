@@ -274,3 +274,25 @@ Todas las decisiones siguientes tienen estado `ACTIVE` y forman parte del baseli
   y evitando commits adicionales.
 - **Reemplazo:** Ninguno; decisión vigente.
 - **Documento de autoridad:** [SECURITY.md](SECURITY.md)
+
+## D-031 — D3-DID-1: interacción didáctica fuera de `TaskMode`
+
+- **Fecha:** 2026-09-08
+- **Estado:** `ACTIVE`
+- **Origen:** D3-DID-1 — fundación documental del Modo Didáctico
+- **Decisión:** `DIDACTIC_MODE.md` es la autoridad funcional única para
+  `NORMAL`/`DIDACTIC`, marcadores, niveles y señales explícitas de aprendizaje.
+  `InteractionMode` pertenece a la sesión, el perfil pertenece al usuario y
+  la instancia Bridge pertenece a la computadora. El modo didáctico no se
+  representa como `TaskMode` ni altera ejecución, seguridad, auditoría o
+  lifecycle. Puede permanecer exclusivamente en el contexto e instrucciones
+  de ChatGPT; no se exige transporte ni conocimiento del modo por el runtime.
+- **Persistencia:** No se implementa en esta etapa. La autoridad física del
+  perfil queda pendiente de un spike controlado:
+  `GLOBAL_PROFILE_STORAGE=PENDING_CONTROLLED_SPIKE`.
+  El journal didáctico queda diferido:
+  `DIDACTIC_JOURNAL=DEFERRED`.
+- **Motivo:** Permite reutilización entre proyectos y computadoras sin crear
+  perfiles por Project, Task, `instance_id`, hostname o copia local, y evita
+  convertir el Bridge en un LMS o subsistema de sincronización complejo.
+- **Documento de autoridad:** [DIDACTIC_MODE.md](DIDACTIC_MODE.md)

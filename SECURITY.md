@@ -34,9 +34,9 @@ perfiles, MCP, túneles o secretos del ChatGPT–OpenCode Bridge.
 El túnel y MCP son transporte/request boundaries, no execution owners. `run_task`
 persiste una solicitud bounded en SQLite; el worker persistente es el único
 componente que reclama y entrega la Task a Codex. Las respuestas se obtienen
-por polling de `get_task`, `get_task_events` y `get_result`. No existe
-`cancel_task` pública, scheduler ni ejecución automática de Tasks históricas
-`QUEUED` sin una solicitud durable.
+por polling de `get_task`, `get_task_events` y `get_result`; `cancel_task`
+solicita cancelación segura y durable. No hay scheduler ni ejecución automática
+de Tasks históricas `QUEUED` sin una solicitud durable.
 
 ## B. Restricción contractual a Codex
 
@@ -191,10 +191,14 @@ arranque, readiness o doctor, las últimas líneas son `BRIDGE_RESET=FAIL` y
 - `audit_status` permanece `PENDING`; no existe `post_audit`.
 - El Bridge no puede despertar ChatGPT ni iniciar una Task futura.
 - No hay retries complejos, scheduler ni rollback automático.
-- No hay múltiples workers ni una cancelación pública; el stop operativo es
-  sólo el control local del worker.
+- No hay múltiples workers; `cancel_task` es la cancelación pública y el stop
+  operativo sigue siendo sólo el control local del worker.
 - El stop script conserva un race benigno de proceso ya terminado.
 - El complemento original puede conservar un schema MCP cacheado anterior a
   `TaskMode`; el runtime operativo de esta etapa es ChatGPT–Codex Bridge
   D3-R2-B.
 - `WAITING_USER` existe en el modelo, pero no tiene flujo activo.
+
+El Modo Didáctico no cambia las restricciones de seguridad ni la semántica de
+ejecución; su contrato funcional único está en
+[`DIDACTIC_MODE.md`](DIDACTIC_MODE.md).

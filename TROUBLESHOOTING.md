@@ -12,6 +12,9 @@ Ante un incidente, usar este orden:
 
 La evidencia actual del repositorio/runtime prevalece sobre antecedentes históricos. No asumir que una herramienta, schema o limitación sigue igual si el código o una prueba actual demuestra lo contrario.
 
+Las reglas funcionales del Modo Didáctico están centralizadas en
+[`DIDACTIC_MODE.md`](DIDACTIC_MODE.md); este runbook no las redefine.
+
 ## 1. Estado rápido de incidentes conocidos
 
 | Síntoma | Clasificación | Estado | Acción principal |

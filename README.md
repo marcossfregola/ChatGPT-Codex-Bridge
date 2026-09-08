@@ -3,8 +3,9 @@
 Bridge local para uso real controlado: ChatGPT invoca herramientas MCP, el
 Bridge coordina Projects y Tasks, y un execution worker persistente entrega
 las Tasks aceptadas a `CodexExecutor` sobre un repositorio explícito. La
-versión vigente es `0.1.0` y el HEAD técnico base de D3-R2-A es
-`66db63d8d7a2a3737fe6bf3cbf0c98ee94037db0`.
+versión declarada es `0.1.0`. El hash
+`66db63d8d7a2a3737fe6bf3cbf0c98ee94037db0` identifica el cierre histórico de
+D3-R2-A; el HEAD vivo se verifica con Git.
 
 El consumidor previsto del MVP es el desarrollo del Orquestador ComfyUI. El
 ChatGPT–OpenCode Bridge existente es infraestructura independiente y no se
@@ -54,6 +55,10 @@ hostname local; no hay valores de máquina hardcodeados.
 El runtime operativo de esta etapa es **ChatGPT–Codex Bridge D3-R2-B**. El
 complemento original conserva un schema MCP cacheado anterior a `TaskMode`; no
 debe borrarse ni modificarse destructivamente.
+
+El contrato funcional del Modo Didáctico está en
+[`DIDACTIC_MODE.md`](DIDACTIC_MODE.md). Es una convención de interacción por
+sesión y no modifica `TaskMode` ni la ejecución de Codex.
 
 ## EMERGENCY HARD RESET
 
@@ -108,11 +113,11 @@ ChatGPT
   → ChatGPT
 ```
 
-Las tools actuales son:
+Las once tools actuales son:
 
 `get_status`, `create_project`, `create_task`, `run_task`, `get_task`,
-`get_task_events`, `get_result`, `resolve_task_reconciliation` y
-`commit_checkpoint`.
+`cancel_task`, `get_task_events`, `get_result`, `resolve_task_reconciliation`,
+`adopt_reconciled_continuation_baseline` y `commit_checkpoint`.
 
 `create_task` acepta `READ_ONLY` (default) y `AUTONOMOUS_WRITE`. El modo
 `AUTONOMOUS_WRITE` requiere autorización explícita y auditoría postflight; no
@@ -160,8 +165,9 @@ La evidencia E2E D3/D4 se obtuvo externamente y se documenta en
 SQLite. Devuelve la aceptación sin esperar a Codex ni al resultado remoto. Un
 único worker persistente reclama las solicitudes explícitas en orden y escribe
 `task.execution_claimed`, `task.started` y la transición terminal. El cliente
-consulta `get_task`, `get_task_events` y `get_result`; no hay long-polling ni
-una tool pública `cancel_task`.
+consulta `get_task`, `get_task_events` y `get_result`; no hay long-polling.
+`cancel_task` es una tool pública separada para solicitar cancelación segura y
+durable de una Task queued o running.
 
 Una Task histórica que quedó `QUEUED` sin `task.execution_requested` es un
 zombie y no se ejecuta automáticamente. Una Task `RUNNING` sin evidencia

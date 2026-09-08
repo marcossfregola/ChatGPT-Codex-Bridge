@@ -4,8 +4,9 @@
 
 El Bridge es infraestructura local para uso real controlado. Coordina
 Projects y Tasks, conserva evidencia durable y ejecuta Codex local detrás de
-un contrato estable. El estado técnico base es `0.1.0` en
-`389ef55928415470e68309ef01763261439a0cd9`.
+un contrato estable. La versión declarada es `0.1.0`; el hash
+`389ef55928415470e68309ef01763261439a0cd9` es el baseline histórico del
+proyecto, no el HEAD vivo.
 
 El primer proyecto consumidor será el **ComfyUI Orchestrator**, con un
 repositorio independiente previsto aproximadamente como:
@@ -72,11 +73,18 @@ y operaciones sensibles cuando corresponda.
 - Lifecycle `QUEUED`, `RUNNING`, `FINISHED`, `FAILED` y `CANCELLED`.
 - `CodexExecutor` detrás del Executor Contract.
 - Codex app-server local por stdio.
-- MCP oficial v2 con siete tools.
+- MCP oficial v2 con once tools: `get_status`, `create_project`, `create_task`,
+  `run_task`, `cancel_task`, `get_task`, `get_task_events`, `get_result`,
+  `resolve_task_reconciliation`, `adopt_reconciled_continuation_baseline` y
+  `commit_checkpoint`.
 - Event Journal durable y correlación thread/turn.
 - `READ_ONLY` y `AUTONOMOUS_WRITE`.
 - Git checkpoint/postflight y continuación conservadora.
 - Secure MCP Tunnel local independiente.
+
+El Modo Didáctico es una convención de interacción por sesión y no una política
+de ejecución de Task. Su contrato funcional está en
+[`DIDACTIC_MODE.md`](DIDACTIC_MODE.md).
 
 `WAITING_USER` existe en el modelo, pero no tiene flujo activo en este MVP.
 

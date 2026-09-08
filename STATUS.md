@@ -3,11 +3,15 @@
 ```text
 Proyecto: ChatGPT–Codex Bridge
 Versión: 0.1.0
-Estado: D3-R2-B APTO PARA E2E REAL (preparación completada)
+Estado: D3-R2-B APTO PARA E2E REAL (snapshot histórico de cierre)
 Rama: main
-HEAD técnico base R2-A: 66db63d8d7a2a3737fe6bf3cbf0c98ee94037db0
-Suite: 207 tests OK (unittest discover -s tests)
+HEAD técnico base R2-A (histórico): 66db63d8d7a2a3737fe6bf3cbf0c98ee94037db0
+Suite histórica: 207 tests OK (unittest discover -s tests)
 ```
+
+Las líneas anteriores conservan la evidencia del cierre D3-R2-B/R2-A. No son
+un indicador vivo de rama, HEAD, working tree ni suite; esos valores deben
+verificarse con Git y las herramientas actuales del repositorio.
 
 ## Etapas completadas
 
@@ -33,16 +37,19 @@ Suite: 207 tests OK (unittest discover -s tests)
 
 ## MCP vigente
 
-El servidor usa el MCP Python SDK oficial v2 y expone exactamente ocho tools:
+El servidor usa el MCP Python SDK oficial v2 y expone actualmente once tools:
 
 ```text
 get_status
 create_project
 create_task
 run_task
+cancel_task
 get_task
 get_task_events
 get_result
+resolve_task_reconciliation
+adopt_reconciled_continuation_baseline
 commit_checkpoint
 ```
 
@@ -53,8 +60,12 @@ READ_ONLY
 AUTONOMOUS_WRITE
 ```
 
-No existe `post_audit` ni una tool pública de cancelación. `audit_status` queda
-en `PENDING` hasta que exista una auditoría externa o una capacidad futura.
+No existe `post_audit`. `audit_status` queda en `PENDING` hasta que exista una
+auditoría externa o una capacidad futura; `cancel_task` sí es una tool pública
+de cancelación segura y durable.
+
+La interacción `NORMAL`/`DIDACTIC` pertenece a la sesión y no cambia
+`TaskMode`; su autoridad funcional es [`DIDACTIC_MODE.md`](DIDACTIC_MODE.md).
 
 ## Evidencia E2E externa
 
@@ -129,7 +140,8 @@ con los Bridges protegidos.
 
 `run_task` es dispatch rápido: persiste `task.execution_requested` y el
 resultado se observa haciendo polling con `get_task`, `get_task_events` y
-`get_result`. No hay long-polling ni `cancel_task` pública. Un zombie histórico
+`get_result`; `cancel_task` solicita cancelación segura y durable. No hay
+long-polling. Un zombie histórico
 `QUEUED` sin request no se ejecuta; un `RUNNING` sin owner vivo se recupera
 fail-closed como `FAILED` al reiniciar el worker.
 
@@ -165,8 +177,8 @@ productivo.
 - Los protected roots son policy, no un sandbox adversarial.
 - No hay rollback automático, retries complejos, scheduler ni múltiples
   workers.
-- No existe una tool pública `cancel_task`; el stop es un control local del
-  worker con grace period.
+- `cancel_task` es una tool pública; el stop operativo sigue siendo un control
+  local del worker con grace period.
 - El stop script conserva un race benigno cuando el proceso ya terminó.
 - `WAITING_USER` existe en el modelo, pero no tiene flujo activo.
 

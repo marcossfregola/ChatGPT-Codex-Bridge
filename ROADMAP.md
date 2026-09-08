@@ -29,7 +29,9 @@ persistencia de eventos durante la ejecución.
 
 ### 1E-B — MCP oficial
 
-MCP Python SDK v2, MCPAdapter separado y exactamente ocho tools.
+MCP Python SDK v2, MCPAdapter separado y once tools (`cancel_task`,
+`resolve_task_reconciliation` y `adopt_reconciled_continuation_baseline` forman
+parte del estado actual junto con las ocho originales).
 
 ### 1F-B — Secure MCP Tunnel
 
@@ -79,6 +81,14 @@ reproducible de la suite local.
 1G-B actualiza la documentación viva para reflejar el MVP, sus límites, la
 seguridad real y el quickstart operativo. No modifica código, schemas, tools,
 runtime ni dependencias.
+
+### D3-DID-1 — Fundación documental del Modo Didáctico
+
+La autoridad funcional es [`DIDACTIC_MODE.md`](DIDACTIC_MODE.md). Esta etapa
+reconcilia documentación y define `NORMAL`/`DIDACTIC`, marcadores, niveles y
+separación de ownership sin agregar persistencia, tools MCP, runtime ni cambios
+en `TaskMode`. La autoridad física del perfil queda pendiente del spike
+controlado indicado en ese documento.
 
 ## Dogfooding siguiente
 

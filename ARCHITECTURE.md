@@ -34,8 +34,10 @@ Luna o Terra
 `mcp_server.py` construye un `MCPServer` del MCP Python SDK v2. El SDK posee
 initialize, schemas, JSON-RPC, framing, lifecycle, errores y transporte stdio.
 `MCPAdapter` es la frontera de aplicación y no importa el SDK ni el wire de
-Codex. Las ocho tools son `get_status`, `create_project`, `create_task`,
-`run_task`, `get_task`, `get_task_events`, `get_result` y `commit_checkpoint`.
+Codex. Las once tools son `get_status`, `create_project`, `create_task`,
+`run_task`, `cancel_task`, `get_task`, `get_task_events`, `get_result`,
+`resolve_task_reconciliation`, `adopt_reconciled_continuation_baseline` y
+`commit_checkpoint`.
 
 ### Bridge Core
 
@@ -57,7 +59,8 @@ El stop escribe una señal de control acotada; el worker deja de reclamar,
 solicita `cancel_active` al executor, persiste `task.cancelled` cuando la
 cancelación alcanza una Task `RUNNING` y sale dentro del grace period. No hay
 servidor HTTP de control, kill por nombre global, scheduler, múltiples workers
-ni una tool pública `cancel_task`.
+ni una segunda vía de control: `cancel_task` es la tool pública que solicita la
+cancelación segura y durable de una Task queued o running.
 
 ### Projects y Tasks
 
@@ -70,6 +73,10 @@ Los modos son:
 - `READ_ONLY`: inspección sin escritura.
 - `AUTONOMOUS_WRITE`: escritura autorizada en un repositorio controlado, con
   checkpoint y postflight.
+
+La interacción `NORMAL`/`DIDACTIC` pertenece a la sesión y es independiente de
+estos modos de ejecución; su contrato funcional único está en
+[`DIDACTIC_MODE.md`](DIDACTIC_MODE.md).
 
 ### SQLite y Event Journal
 
