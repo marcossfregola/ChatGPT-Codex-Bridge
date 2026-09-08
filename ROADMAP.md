@@ -82,19 +82,24 @@ reproducible de la suite local.
 seguridad real y el quickstart operativo. No modifica código, schemas, tools,
 runtime ni dependencias.
 
-### D3-DID-1 — Fundación documental del Modo Didáctico
+### D3-DID-1 / D3-DID-3 — Fundación y cierre documental del Modo Didáctico
 
 La autoridad funcional es [`DIDACTIC_MODE.md`](DIDACTIC_MODE.md). Esta etapa
-reconcilia documentación y define `NORMAL`/`DIDACTIC`, marcadores, niveles y
-separación de ownership sin agregar persistencia, tools MCP, runtime ni cambios
-en `TaskMode`. La autoridad física del perfil queda pendiente del spike
-controlado indicado en ese documento.
+reconcilia documentación, define `NORMAL`/`DIDACTIC`, marcadores, niveles y
+separación de ownership, y cierra v1 como `DIDACTIC_MODE_V1=CHATGPT_FIRST`, sin
+agregar persistencia, tools MCP, runtime ni cambios en `TaskMode`. El spike
+controlado de D3-DID-2 no justificó almacenamiento estructurado; el estado es
+`GLOBAL_PROFILE_PERSISTENCE=DEFERRED_UNLESS_NEEDED` y el journal sigue
+`DIDACTIC_JOURNAL=DEFERRED`.
 
 ## Dogfooding siguiente
 
 1H está completada. Next: dogfooding mediante el desarrollo controlado del
-**ComfyUI Orchestrator** en un repositorio independiente. No se crea ni se
-incorpora ese repositorio automáticamente.
+**ComfyUI Orchestrator** en un repositorio independiente. Se observarán sólo
+incidentes humanos concretos que indiquen repetición de conceptos, pérdida de
+feedback o necesidad de continuidad estructurada; no se agrega telemetría ni
+almacenamiento por esta observación. No se crea ni se incorpora ese repositorio
+automáticamente.
 
 ## Futuro sólo si existe necesidad real
 

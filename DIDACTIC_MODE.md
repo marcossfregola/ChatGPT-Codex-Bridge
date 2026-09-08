@@ -1,6 +1,8 @@
 # D3 — Modo Didáctico
 
-**Estado:** D3-DID-1 — fundación documental solamente.
+**Estado:** D3-DID-3 — cierre documental de v1 como ChatGPT-first.
+
+**Contrato v1:** `DIDACTIC_MODE_V1=CHATGPT_FIRST`
 
 Este archivo es la autoridad funcional única del Modo Didáctico del
 ChatGPT–Codex Bridge D3. `README.md`, `PROJECT.md`, `ARCHITECTURE.md`,
@@ -20,10 +22,11 @@ El modo pertenece a la sesión/conversación. Por lo tanto, sesiones distintas
 pueden coexistir en `NORMAL` y `DIDACTIC`, incluso cuando usan el mismo Bridge
 local.
 
-Por ahora `NORMAL`/`DIDACTIC` puede permanecer exclusivamente en el contexto y
-las instrucciones de ChatGPT. Sólo se evaluaría transportar el modo al Bridge
-si aparece una necesidad demostrada; D3-DID-1 no declara ese transporte como
-requisito.
+En v1, `NORMAL`/`DIDACTIC` se resuelve exclusivamente en el contexto, las
+instrucciones y la conversación de ChatGPT. No se transporta el modo al Bridge,
+no se persiste allí y no se exige que el runtime lo conozca. Sólo una necesidad
+demostrada, una decisión posterior y evidencia propia podrían revisar este
+límite.
 
 `InteractionMode != TaskMode`. `TaskMode` sigue siendo la política de ejecución
 de una Task del Bridge y conserva únicamente `READ_ONLY` y
@@ -33,7 +36,7 @@ de ejecución de Codex.
 
 Las expresiones de sesión `D3_MODE=NORMAL` y `D3_MODE=DIDACTIC` son ejemplos de
 una convención de interacción para una futura integración; no son una variable
-de runtime implementada por D3-DID-1 ni una configuración por proyecto,
+de runtime implementada por esta etapa ni una configuración por proyecto,
 computadora o instancia.
 
 ## 2. Forma de una respuesta DIDACTIC
@@ -78,30 +81,43 @@ instancia Bridge  -> computadora
 No se crea un perfil por Project, Task, `instance_id`, hostname ni copia local
 de cada PC. Tampoco se crea un perfil duplicado por instancia simultánea.
 
-### Autoridad física pendiente
+### Persistencia v1 y conclusión de D3-DID-2
 
-En D3-DID-1 no se elige ni se implementa un backend para el perfil. El estado
-normativo queda expresado por estos tokens:
+En v1, el perfil es una referencia conceptual que ChatGPT puede aplicar durante
+la conversación usando el contexto disponible, la memoria y las señales
+explícitas del usuario cuando existan. El Bridge no mantiene una base
+estructurada del perfil, no lo sincroniza y no lo usa como dependencia técnica.
+
+El spike controlado de D3-DID-2 evaluó las alternativas consideradas para una
+autoridad compartida y no justificó implementar ninguna en esta versión. Por lo
+tanto, el estado normativo es:
 
 ```text
-GLOBAL_PROFILE_STORAGE = PENDING_CONTROLLED_SPIKE
+GLOBAL_PROFILE_PERSISTENCE=DEFERRED_UNLESS_NEEDED
 ```
 
-Para validaciones textuales de entrega se conserva también el token sin
-espacios: `GLOBAL_PROFILE_STORAGE=PENDING_CONTROLLED_SPIKE`.
+Esto no promete persistencia determinista, acceso programático a una cuenta,
+consistencia transaccional, CAS ni sincronización multi-PC. Tampoco convierte
+una memoria, archivo local, repositorio, servidor o nube en autoridad del
+Bridge. Una etapa futura sólo podrá reabrir esta decisión si el dogfooding
+produce una necesidad concreta y una auditoría propia la aprueba.
 
-No se debe presentar como resuelta una opción basada en memoria de ChatGPT,
-OneDrive, GitHub, SQLite, un archivo local, un servidor o una nube. Tampoco se
-debe afirmar que existe acceso programático a un perfil de cuenta si no hay una
-autoridad y un contrato comprobados.
+### Alcance multi-PC y concurrencia
 
-Para una evaluación posterior, el spike deberá comprobar si es viable una única
-autoridad lógica por usuario desde PC, notebook y múltiples instancias, además
-de identidad, concurrencia, recuperación y trazabilidad. Esto no define cómo se
-sincroniza el perfil, qué backend se usaría ni si haría falta código del Bridge.
-Ninguna caché local sería la autoridad. Si la autoridad no está disponible, la
-conversación continúa sin bloquear el trabajo técnico y sin inventar ni
-sincronizar perfiles alternos. No se acepta un `last-write-wins` silencioso.
+La separación conceptual sigue siendo:
+
+```text
+modo              -> sesión/conversación
+perfil            -> usuario
+instancia Bridge  -> computadora
+```
+
+PC, notebook y futuras instancias pueden usar `NORMAL` o `DIDACTIC` en sus
+respectivas conversaciones porque el modo pertenece a la sesión. En v1 el
+Bridge no guarda ni intercambia perfiles entre ellas, no crea copias locales y
+no requiere CAS. La continuidad del perfil entre conversaciones es una
+capacidad best-effort de ChatGPT y de las señales explícitas del usuario, no un
+contrato de ejecución ni una garantía de sincronización.
 
 ### Actualización explícita
 
@@ -152,10 +168,20 @@ aclarados, decisiones entendidas o preguntas abiertas. No es una transcripción,
 no es un registro obligatorio, no requiere almacenamiento ni runtime y no
 actualiza automáticamente el perfil.
 
-## 6. Journal didáctico
+## 6. Degradación y fallos didácticos
+
+La falta de continuidad o precisión del contexto didáctico no es un fallo del
+Bridge. Si un concepto no puede clasificarse con seguridad, ChatGPT puede
+dejarlo sin clasificar, pedir una señal explícita o repetir una explicación. La
+redundancia, una explicación insuficiente o la pérdida de una preferencia no
+pueden alterar `TaskMode`, Codex, el repositorio, Git, los outputs, la seguridad,
+las aprobaciones ni la auditoría. El trabajo técnico continúa con las reglas
+normales.
+
+## 7. Journal didáctico
 
 El Event Journal actual del Bridge registra eventos de Tasks y no es un perfil
-de aprendizaje ni un journal didáctico. D3-DID-1 no agrega tablas, eventos,
+de aprendizaje ni un journal didáctico. D3-DID-3 no agrega tablas, eventos,
 tools ni persistencia para este fin.
 
 ```text
@@ -167,7 +193,7 @@ Si en el futuro se justifica un journal, deberá ser separado del estado y de
 transcript. Su diseño requerirá una decisión posterior y no puede inferirse de
 la existencia del Event Journal técnico.
 
-## 7. Límites no negociables
+## 8. Límites no negociables
 
 El Modo Didáctico no:
 
@@ -183,4 +209,16 @@ El Modo Didáctico no:
 Esta etapa modifica únicamente documentación. Cualquier persistencia, interfaz
 MCP, lectura/escritura de perfil o integración de sesión sólo se evaluaría en
 una etapa posterior si existe necesidad demostrada, con diseño, pruebas y
-evidencia propios.
+evidencia propios; no forma parte de v1.
+
+## 9. Dogfooding y reapertura controlada
+
+El siguiente paso es observar el uso humano del modo durante el desarrollo
+técnico real, inicialmente en el **ComfyUI Orchestrator**. Se observará, sin
+telemetría ni logs nuevos, si aparecen repetición frecuente de conceptos
+`MASTERED`, pérdida relevante de feedback entre conversaciones, dificultad para
+usar `LEARNING` o una necesidad real de continuidad estructurada entre equipos.
+
+Sólo incidentes concretos y repetibles pueden justificar reabrir la decisión de
+persistencia. Hasta entonces no se crea almacenamiento, sincronización ni un
+journal didáctico.
