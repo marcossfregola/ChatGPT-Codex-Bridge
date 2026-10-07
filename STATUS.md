@@ -13,6 +13,54 @@ Las líneas anteriores conservan la evidencia del cierre D3-R2-B/R2-A. No son
 un indicador vivo de rama, HEAD, working tree ni suite; esos valores deben
 verificarse con Git y las herramientas actuales del repositorio.
 
+
+## Estado operativo actual — 2026-10-07
+
+El Bridge volvió a **uso real normal** después de certificar la arquitectura de
+dos instancias/dos clones para Saniferr.
+
+Resultado vigente:
+
+- Puente Principal `NOTEBOOK` y Puente Secundario `NOTEBOOK-B` operan como
+  runtimes independientes.
+- Saniferr usa dos clones Git permanentes e independientes:
+  - A: `C:\Codex Estadisticas Saniferr\saniferr-analisis-conocimiento`
+  - B: `C:\Codex Estadisticas Saniferr\saniferr-analisis-conocimiento-b`
+- El baseline común de creación/certificación fue
+  `788e0c00e33f910f1d6cc15a37148c05b21a1a82`.
+- La prueba concurrente real finalizó PASS: ambos Codex trabajaron
+  simultáneamente sobre A/B, con routing correcto, HEAD sin cambios, worktrees
+  limpios y `policy_violation=false`.
+- El preflight mínimo de cada workstream es: ruta correcta → `main` → worktree
+  limpio → SHA inicial → `origin/main` conocido → STOP ante estado inesperado.
+- La separación Git está certificada; SQLite, staging, outputs, publishers y
+  otros destinos externos compartidos se revisan sólo cuando un caso real de
+  concurrencia los vaya a usar.
+- No se implementan locks, branches especiales, sincronización permanente ni
+  orquestación Git preventiva.
+
+### READ_ONLY
+
+La corrección experimental `approvalPolicy=never` eliminó el
+`requestApproval`, pero bloqueó también la ejecución de shells de inspección.
+Se hizo rollback completo y el Secundario volvió al comportamiento anterior.
+
+`READ_ONLY` queda como incidencia conocida **pausada y no bloqueante**. El uso
+normal mediante Tasks autorizadas y sus controles postflight continúa
+operativo.
+
+### Uso remoto
+
+El host del Bridge puede seguir siendo la notebook aunque ChatGPT se utilice
+desde otra computadora. Para ello la notebook debe permanecer encendida,
+conectada y con el runtime/túnel correspondiente listo. El acceso remoto sigue
+sujeto a Projects, rutas, modos y políticas del Bridge; no equivale a acceso
+irrestricto al host.
+
+La certificación detallada, task/thread/turn y decisiones de costo-beneficio
+quedan en
+[`DUAL_BRIDGE_CONCURRENCY_MVP_2026-10-07.md`](DUAL_BRIDGE_CONCURRENCY_MVP_2026-10-07.md).
+
 ## Etapas completadas
 
 - 1A — bootstrap.

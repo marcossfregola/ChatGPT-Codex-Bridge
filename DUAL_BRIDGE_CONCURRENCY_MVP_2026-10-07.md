@@ -2,12 +2,202 @@
 
 **Fecha:** 2026-10-07  
 **Proyecto:** ChatGPT–Codex Bridge  
-**Estado:** **GO para Etapa 1 — relevamiento READ_ONLY.**  
-**Todavía NO hay GO para crear clones ni implementar cambios.**
+**Estado actual:** **MVP BASE IMPLEMENTADO Y CERTIFICADO PARA USO REAL CONTROLADO.**  
+**Uso normal restablecido:** Puente Principal como vía por defecto; Puente Secundario disponible para un segundo workstream independiente cuando haga falta.
 
-Este documento concentra el contexto y las decisiones tomadas para habilitar el uso concurrente del **Puente Principal** y el **Puente Secundario** sin convertir el Bridge en una infraestructura compleja ni obligar al usuario a administrar Git cotidianamente.
+Este documento nació como plan de implementación. Los apartados 1–18 se conservan como antecedente y rationale histórico. **Ante cualquier contradicción con ellos, prevalece la sección 0 de cierre verificado y la evidencia viva del repositorio/entorno.**
 
-Debe usarse como handoff para el próximo hilo antes de iniciar cualquier implementación.
+## 0. Cierre verificado — 2026-10-07
+
+### Resultado ejecutivo
+
+Quedó validado el núcleo buscado:
+
+```text
+Puente Principal  → clon A de Saniferr
+Puente Secundario → clon B de Saniferr
+```
+
+Ambas instancias pueden ejecutar Codex simultáneamente sobre checkouts Git independientes del mismo proyecto sin cruzar rutas ni pisarse el worktree.
+
+Esto **no** significa que cualquier par de pipelines pueda escribir a la vez sobre recursos externos compartidos. SQLite, XLSX, staging, publishers, resultados con nombre fijo y otros destinos mutables se revisan sólo cuando un workstream real los vaya a usar.
+
+### Instancias del Bridge
+
+- Principal: `instance_id=NOTEBOOK`.
+- Secundario: `instance_id=NOTEBOOK-B`.
+- Cada instancia mantiene runtime, DB, worker y túnel propios.
+- Ambas usan el mismo checkout de código del Bridge; una modificación de código del Bridge afecta a ambas después de recargar cada runtime.
+- El ChatGPT–OpenCode Bridge existente permanece independiente y protegido.
+
+### Clones permanentes de Saniferr
+
+```text
+A / Principal
+C:\Codex Estadisticas Saniferr\saniferr-analisis-conocimiento
+
+B / Secundario
+C:\Codex Estadisticas Saniferr\saniferr-analisis-conocimiento-b
+```
+
+Baseline común certificado al crear B:
+
+```text
+788e0c00e33f910f1d6cc15a37148c05b21a1a82
+```
+
+Estado validado:
+
+- ambos en `main`;
+- `HEAD = origin/main` en el baseline anterior al momento de creación;
+- ambos worktrees limpios;
+- mismo remote `origin` de GitHub;
+- directorios `.git` distintos;
+- sin `objects/info/alternates`;
+- B fue creado con clon Git local real y `--no-hardlinks`, no por copia manual;
+- el clon B quedó registrado en el Puente Secundario como `project_id=saniferr-b`.
+
+### Preflight mínimo de workstream
+
+Al iniciar un workstream nuevo:
+
+1. confirmar `git rev-parse --show-toplevel` y que corresponde al clon asignado;
+2. confirmar branch `main`;
+3. confirmar `git status --short --untracked-files=all` vacío;
+4. registrar `git rev-parse HEAD` como SHA inicial;
+5. registrar `origin/main` conocido y la relación ahead/behind;
+6. ante ruta, branch, SHA, divergencia o estado inesperados: **STOP**.
+
+No hacer este preflight en cada turno de una tarea ya iniciada. No sincronizar continuamente una tarea en curso.
+
+### Certificación concurrente real
+
+Prueba final aprobada:
+
+```text
+Principal / A
+task   task-f5300df225244eb1a17c1c73bf752ee6
+thread 01a11811-4cbc-7f70-8207-e3f77a2407c5
+turn   01a11811-4d50-7553-940f-99cf364cabac
+
+Secundario / B
+task   task-d4c3d80c2f3e48d39e6ebab78fdd65ac
+thread 01a11811-40bb-7c02-9a53-dd22cf485551
+turn   01a11811-4103-7f22-8bc6-143e6d226c5d
+```
+
+Los turnos se solaparon realmente durante aproximadamente 58 segundos.
+
+Routing comprobado por el `cwd` real de cada thread:
+
+```text
+A → C:\Codex Estadisticas Saniferr\saniferr-analisis-conocimiento
+B → C:\Codex Estadisticas Saniferr\saniferr-analisis-conocimiento-b
+```
+
+Postflight de ambos:
+
+- branch final `main`;
+- HEAD inicial = HEAD final = baseline;
+- `changed_files=[]`;
+- `untracked_files=[]`;
+- `policy_violation=false`;
+- ambos workers terminaron `idle`.
+
+La primera corrida controlada había producido un falso `ROUTING_FAIL` en B por comparar `/\` literalmente. La repetición normalizó separadores y mayúsculas/minúsculas en Windows y pasó correctamente. No se requirió cambio de código.
+
+### READ_ONLY — incidencia diferida
+
+Se investigó el fallo de approvals en `READ_ONLY`.
+
+Estado original/restaurado:
+
+```text
+approvalPolicy = on-request
+approvalsReviewer = user
+sandbox = read-only
+networkAccess = false
+```
+
+Se probó de forma canaria en `NOTEBOOK-B` cambiar a `approvalPolicy=never` y omitir `approvalsReviewer`. El cambio eliminó el error de `requestApproval`, pero el sandbox dejó de permitir incluso iniciar PowerShell/cmd para inspecciones inocuas. El experimento fue revertido y B fue reiniciado correctamente al baseline anterior.
+
+Decisión:
+
+- **READ_ONLY queda pendiente / pausado por costo-beneficio**;
+- no bloquea el uso normal del Bridge;
+- no implementar un subsistema complejo de approvals hasta que exista necesidad real.
+
+### Regla de uso cotidiano
+
+- Si el usuario no indica otra cosa, usar el **Puente Principal**.
+- Para un segundo frente simultáneo, usar el **Puente Secundario** sobre B.
+- Evitar deliberadamente trabajar sobre el mismo tema con ambos a la vez.
+- Antes de dos workstreams con escritura, revisar sólo las colisiones externas que esos trabajos concretos puedan compartir.
+- No construir locks, branches especiales ni orquestación preventiva sin un problema real.
+
+### Recursos externos compartidos
+
+Los clones aíslan Git, no todo el entorno Saniferr.
+
+Por eso deben revisarse cuando correspondan:
+
+- SQLite;
+- staging;
+- temporales;
+- XLSX/CSV con nombre fijo;
+- manifests;
+- publishers;
+- carpetas de resultados;
+- otros destinos mutables fuera del repo.
+
+La política vigente es **aislar sólo colisiones demostradas**. No duplicar preventivamente fuentes, snapshots ni bases pesadas.
+
+### Cierre e integración Git
+
+Una tarea que comenzó desde SHA X puede terminar desde X aunque `main` avance mientras trabaja.
+
+No permitir que una tarea genérica improvise:
+
+- merge;
+- rebase;
+- cherry-pick;
+- reset;
+- stash;
+- clean.
+
+Caso simple → procedimiento simple.  
+Conflicto, divergencia o estado Git ambiguo → **STOP y auditoría**.
+
+### Uso remoto
+
+La arquitectura permite usar ChatGPT desde otra computadora mientras la notebook que hospeda el Bridge permanezca encendida, con Internet y con el runtime/túnel correspondiente levantado.
+
+El acceso sigue pasando por:
+
+```text
+ChatGPT → conector/plugin → Secure MCP Tunnel → notebook → Bridge → Codex local → Project.repo_path
+```
+
+No implica acceso irrestricto a toda la notebook: se mantiene sujeto a Projects, rutas, modos y políticas del Bridge.
+
+No es necesario mantener abierta la interfaz gráfica de Codex para que el Bridge use el app-server local. El usuario ya verificó acceso remoto una vez conectado; el escenario exacto “hilo nuevo desde otra PC, primer mensaje” se considera esperado por el modelo de conexión del plugin/túnel, pero no forma parte de la certificación E2E A/B registrada arriba.
+
+### Estado de las etapas del plan
+
+```text
+Etapa 1 — relevamiento real                         CERRADA
+Etapa 2 — diseño físico                             CERRADA
+Etapa 3 — READ_ONLY / approvals                     PAUSADA / NO BLOQUEANTE
+Etapa 4 — dos clones permanentes                    CERRADA
+Etapa 5 — preflight de workstream                   CERRADA
+Etapa 6 — colisiones externas                       REACTIVA, sólo por caso real
+Etapa 7 — cierre/integración segura                 REGLAS MÍNIMAS VIGENTES; ampliar sólo por necesidad
+Etapa 8 — prueba concurrente base                   CERTIFICADA
+```
+
+Conclusión de producto:
+
+> **La infraestructura dual deja de ser trabajo activo de plataforma y pasa a uso real controlado. Las mejoras futuras deben nacer de incidentes o necesidades concretas.**
 
 ---
 
