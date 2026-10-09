@@ -302,6 +302,21 @@ auditoría → commit → push → verificación → working tree limpio
 
 ---
 
+## 11 bis. Control humano obligatorio de Git — política transversal
+
+**Marcos decide exclusivamente si y cuándo registrar y publicar cambios**. Rige para ChatGPT/Sol, Codex/Luna/Terra, ambos Bridges, otros ejecutores y proyectos consumidores.
+
+- Una orden de implementar, finalizar una Task, aprobar una auditoría, necesitar handoff o dejar un dirty state legítimo NO autoriza commit, commit_checkpoint ni push.
+- Antes de cada commit hay que solicitar autorización humana previa, expresa y específica por repositorio y operación, informando branch, HEAD/base, paths, diff, pruebas y auditoría, mensaje propuesto y si será necesario publicar antes de cambiar de escritor.
+- La autorización de commit NO autoriza push; una autorización de push NO permite commits nuevos. Solicitar autorización de publicación por separado.
+- Si corresponde commit, en repos gestionados por D3 usar commit_checkpoint tras autorización y cumpliendo el contrato vigente. No intentar eludir las restricciones de push del Bridge: usar el procedimiento manual permitido.
+- Antes de transferir un checkout a otro hilo o Bridge, advertir de antemano si hace falta sincronizar Git, y detenerse si depende de una operación Git no autorizada. Preservar worktree y evidencia; no recurrir a reset, clean, stash, merge, rebase ni force push por conveniencia.
+- No producir checkpoints preventivos por cuenta de Sol o Codex. Explicar las consecuencias de posponer el commit/push sin presionar ni silenciar que hay cambios sin publicar.
+- Esta política documental orienta a los agentes; NO prueba que el runtime compruebe técnicamente la identidad de quien autoriza. Cualquier garantía de enforcement requiere auditoría específica.
+
+Esta sección prevalece sobre descripciones operativas de commit o handoff que parezcan automáticas: la decisión final sobre momento y alcance es siempre de Marcos.
+
+---
 ## 12. Operaciones sensibles
 
 Una tarea normal NO autoriza automáticamente:
