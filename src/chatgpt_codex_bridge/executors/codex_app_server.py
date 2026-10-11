@@ -465,8 +465,7 @@ class CodexAppServerClient:
             }
             if selected_mode is TaskMode.AUTONOMOUS_WRITE
             else {
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
+                "approvalPolicy": "never",
                 "sandbox": "read-only",
             }
         )
@@ -502,8 +501,7 @@ class CodexAppServerClient:
             }
             if selected_mode is TaskMode.AUTONOMOUS_WRITE
             else {
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
+                "approvalPolicy": "never",
                 "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
             }
         )

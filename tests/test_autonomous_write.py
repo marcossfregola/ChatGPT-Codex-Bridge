@@ -470,16 +470,14 @@ class AppServerModeTests(unittest.IsolatedAsyncioTestCase):
         readonly_turn = seen[1][1]
         autonomous_thread = seen[2][1]
         autonomous_turn = seen[3][1]
+        self.assertEqual(readonly_thread["approvalPolicy"], "never")
+        self.assertEqual(readonly_thread["sandbox"], "read-only")
+        self.assertNotIn("approvalsReviewer", readonly_thread)
+        self.assertEqual(readonly_turn["approvalPolicy"], "never")
         self.assertEqual(
-            {
-                readonly_thread["approvalPolicy"],
-                readonly_thread["sandbox"],
-                readonly_turn["approvalPolicy"],
-                readonly_turn["sandboxPolicy"]["type"],
-            },
-            {"on-request", "read-only", "readOnly"},
+            readonly_turn["sandboxPolicy"],
+            {"type": "readOnly", "networkAccess": False},
         )
-        self.assertFalse(readonly_turn["sandboxPolicy"]["networkAccess"])
         self.assertEqual(autonomous_thread["approvalPolicy"], "never")
         self.assertEqual(autonomous_thread["sandbox"], "danger-full-access")
         self.assertEqual(autonomous_turn["approvalPolicy"], "never")
