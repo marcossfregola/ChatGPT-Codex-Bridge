@@ -730,6 +730,50 @@ def _git_branch(
         raise GitPreflightError("autonomous-write requires a named Git branch")
 
 
+def git_current_revision(repo_path: str | os.PathLike[str]) -> tuple[str, str, str]:
+    """Read a repository's canonical root, named branch, and current HEAD."""
+
+    repo = ensure_autonomous_workspace(repo_path)
+    _validate_worktree_root(repo)
+    branch = _git_branch(repo)
+    head = _git_with_env(repo, "rev-parse", "HEAD").strip()
+    if not head:
+        raise GitPreflightError("Git HEAD is empty")
+    return str(repo), branch, head
+
+
+def git_is_ancestor(
+    repo_path: str | os.PathLike[str], ancestor: str, descendant: str
+) -> bool:
+    """Return the exact Git ancestry relation, failing closed on probe errors."""
+
+    repo = ensure_autonomous_workspace(repo_path)
+    if any(
+        not isinstance(value, str)
+        or len(value) not in {40, 64}
+        or not value
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in (ancestor, descendant)
+    ):
+        raise ContinuationBaselineError("Git ancestry identity is invalid")
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+            check=False,
+            capture_output=True,
+            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ContinuationBaselineError(
+            "Git ancestry relation could not be verified"
+        ) from exc
+    if probe.returncode == 0:
+        return True
+    if probe.returncode == 1:
+        return False
+    raise ContinuationBaselineError("Git ancestry relation could not be verified")
+
+
 def _parse_status(
     status: str, *, bounded: bool = True
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -1022,8 +1066,15 @@ def _git_state(
     head = _git_with_env(repo, "rev-parse", "HEAD", env=env).strip()
     if not head:
         raise GitPreflightError("Git HEAD is empty")
+    # Emit UTF-8 path names literally so the status parser can fingerprint them.
     status = _git_with_env(
-        repo, "status", "--porcelain", "--untracked-files=all", env=env
+        repo,
+        "-c",
+        "core.quotePath=false",
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        env=env,
     )
     full_staged, full_unstaged, full_untracked = _parse_status(
         status, bounded=False
@@ -1816,6 +1867,8 @@ __all__ = [
     "checkpoint_payload",
     "checkpoint_commit",
     "ensure_autonomous_workspace",
+    "git_current_revision",
+    "git_is_ancestor",
     "git_postflight",
     "git_postflight_complete",
     "git_continuation_preflight",

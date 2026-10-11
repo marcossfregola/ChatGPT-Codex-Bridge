@@ -18,11 +18,19 @@ from ..domain.models import TaskMode
 JsonObject = dict[str, Any]
 NotificationObserver = Callable[[str, JsonObject], None]
 
-# ``asyncio`` defaults StreamReader's line buffer to 64 KiB.  Codex can emit
-# larger JSON-line messages (for example, command output), so the Bridge uses
-# one explicit finite limit for both stdout and stderr.  The value is large
-# enough for normal evidence while retaining a hard memory boundary.
-APP_SERVER_STREAM_LIMIT = 1024 * 1024
+# ``asyncio`` defaults StreamReader's line buffer to 64 KiB.  Codex can emit a
+# single JSON notification containing a large diff or command result.  The
+# Bridge persists only bounded evidence, but it must first accept enough of the
+# wire message to decode and compact it.  Keep a finite transport ceiling well
+# above the old 1 MiB evidence-sized limit; downstream journal and MCP payload
+# bounds remain much smaller and unchanged.
+APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
+
+# stderr is diagnostic only.  It shares the transport limit so the process can
+# drain safely, but retaining up to 200 full 16 MiB lines would defeat the
+# memory boundary after a noisy child process exits.
+APP_SERVER_STDERR_DIAGNOSTIC_LIMIT = 64 * 1024
+_STDERR_TRUNCATION_MARKER = "[TRUNCATED stderr diagnostic]"
 
 
 class AppServerError(RuntimeError):
@@ -150,6 +158,20 @@ def _redact_stderr(line: str) -> str:
     if any(marker in lowered for marker in secret_markers):
         return "[REDACTED stderr line]"
     return line
+
+
+def _bounded_stderr(line: str) -> str:
+    """Keep retained stderr diagnostics bounded independently of transport."""
+
+    redacted = _redact_stderr(line)
+    if redacted == "[REDACTED stderr line]":
+        return redacted
+    encoded = redacted.encode("utf-8", errors="replace")
+    if len(encoded) <= APP_SERVER_STDERR_DIAGNOSTIC_LIMIT:
+        return redacted
+    marker = _STDERR_TRUNCATION_MARKER.encode("utf-8")
+    prefix = encoded[: APP_SERVER_STDERR_DIAGNOSTIC_LIMIT - len(marker)]
+    return prefix.decode("utf-8", errors="ignore") + _STDERR_TRUNCATION_MARKER
 
 
 def resolve_executable(explicit: str | os.PathLike[str] | None = None) -> str:
@@ -287,7 +309,7 @@ class CodexAppServerClient:
                 if not line:
                     return
                 decoded = line.decode("utf-8", errors="replace").rstrip("\r\n")
-                self.stderr_lines.append(_redact_stderr(decoded))
+                self.stderr_lines.append(_bounded_stderr(decoded))
                 if len(self.stderr_lines) > 200:
                     del self.stderr_lines[:-200]
         except (asyncio.LimitOverrunError, ValueError) as exc:
@@ -465,8 +487,7 @@ class CodexAppServerClient:
             }
             if selected_mode is TaskMode.AUTONOMOUS_WRITE
             else {
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
+                "approvalPolicy": "never",
                 "sandbox": "read-only",
             }
         )
@@ -502,8 +523,7 @@ class CodexAppServerClient:
             }
             if selected_mode is TaskMode.AUTONOMOUS_WRITE
             else {
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
+                "approvalPolicy": "never",
                 "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
             }
         )
@@ -682,6 +702,7 @@ class CodexAppServerClient:
 
 __all__ = [
     "AppServerError",
+    "APP_SERVER_STDERR_DIAGNOSTIC_LIMIT",
     "APP_SERVER_STREAM_LIMIT",
     "AppServerMessageLimitError",
     "CodexAppServerClient",

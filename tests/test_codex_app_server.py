@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from chatgpt_codex_bridge.executors.codex_app_server import (  # noqa: E402
+    APP_SERVER_STDERR_DIAGNOSTIC_LIMIT,
     APP_SERVER_STREAM_LIMIT,
     AppServerError,
     AppServerMessageLimitError,
@@ -405,7 +406,31 @@ class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
         self.assertEqual(len(message["data"]), 70000)
 
-    async def test_stderr_line_over_64kib_within_configured_limit_drains(self) -> None:
+    async def test_stdout_line_near_transport_limit_is_read(self) -> None:
+        payload_size = APP_SERVER_STREAM_LIMIT - 4096
+        self.assertGreater(payload_size, 1024 * 1024)
+        code = (
+            "import json,sys; "
+            f"sys.stdout.write(json.dumps({{'data':'x'*{payload_size}}})+'\\n'); "
+            "sys.stdout.flush()"
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=APP_SERVER_STREAM_LIMIT,
+        )
+        client = CodexAppServerClient("codex", ROOT)
+        client.process = process
+        try:
+            message = await client._read_message(timeout=15.0)
+        finally:
+            await client.close()
+        self.assertEqual(len(message["data"]), payload_size)
+
+    async def test_stderr_line_over_diagnostic_limit_is_bounded(self) -> None:
         code = "import sys; sys.stderr.write('x'*70000+'\\n'); sys.stderr.flush()"
         process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -422,7 +447,11 @@ class AsyncLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await client._stderr_task
         self.assertIsNone(client._stderr_error)
         self.assertEqual(len(client.stderr_lines), 1)
-        self.assertEqual(len(client.stderr_lines[0]), 70000)
+        self.assertLessEqual(
+            len(client.stderr_lines[0].encode("utf-8")),
+            APP_SERVER_STDERR_DIAGNOSTIC_LIMIT,
+        )
+        self.assertIn("[TRUNCATED stderr diagnostic]", client.stderr_lines[0])
         await client.close()
 
     async def test_stdout_line_over_configured_limit_is_controlled_error(self) -> None:

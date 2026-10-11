@@ -51,6 +51,8 @@ from .policy import (
     git_checkpoint_head_relation,
     git_checkpoint_prepare,
     _h4_rehydrate_prepared,
+    git_current_revision,
+    git_is_ancestor,
     git_postflight,
     git_postflight_complete,
     git_preflight,
@@ -70,6 +72,14 @@ from .persistence.sqlite_store import (
     EXECUTOR_DISPATCH_STARTED_EVENT,
     RECONCILIATION_BASELINE_ADOPTED_EVENT,
     SQLiteBridgeStore,
+)
+from .repository_access import (
+    RepositoryAccessError,
+    RepositoryLock,
+    RepositoryOwnershipError,
+    repository_lock_identity,
+    require_repository_writer,
+    validate_instance_id,
 )
 
 
@@ -107,6 +117,7 @@ RECONCILIATION_BASELINE_SCHEMA_VERSION = 1
 RECONCILIATION_BASELINE_KIND = "reconciled_continuation"
 ADOPTION_MODE_LEGACY = "legacy"
 ADOPTION_MODE_DIRECT = "direct"
+ADOPTION_MODE_REBASE = "rebase"
 _CRITICAL_EVIDENCE_KEYS = (
     "threadId",
     "turnId",
@@ -262,9 +273,43 @@ def _bounded_error_message(error: Exception) -> str:
 class BridgeCore:
     """Create Bridge entities and run tasks through an injected executor."""
 
-    def __init__(self, store: SQLiteBridgeStore, executor: Executor | None = None) -> None:
+    def __init__(
+        self,
+        store: SQLiteBridgeStore,
+        executor: Executor | None = None,
+        *,
+        instance_id: str | None = None,
+        repository_lock_directory: str | None = None,
+    ) -> None:
         self.store = store
         self.executor = executor
+        self.instance_id = validate_instance_id(instance_id)
+        self.repository_lock_directory = repository_lock_directory
+
+    def _require_repository_writer(self, repo_path: str) -> None:
+        try:
+            require_repository_writer(repo_path, self.instance_id)
+        except RepositoryOwnershipError as error:
+            raise PolicyError(str(error)) from error
+
+    def _repository_lock(self, repo_path: str) -> RepositoryLock:
+        return RepositoryLock(
+            repo_path,
+            lock_directory=self.repository_lock_directory,
+        )
+
+    def _record_repository_guard_failure(
+        self,
+        task_id: str,
+        error: RepositoryAccessError,
+        *,
+        expected_status: ExecutionStatus,
+    ) -> None:
+        self._record_preflight_failure(
+            task_id,
+            PolicyError(str(error)),
+            expected_status=expected_status,
+        )
 
     @staticmethod
     def _normalize_adoption_mode(mode: str | None) -> str:
@@ -275,6 +320,7 @@ class BridgeCore:
         if not isinstance(mode, str) or mode not in {
             ADOPTION_MODE_LEGACY,
             ADOPTION_MODE_DIRECT,
+            ADOPTION_MODE_REBASE,
         }:
             raise ContinuationBaselineError("adoption mode is unsupported")
         return mode
@@ -355,8 +401,11 @@ class BridgeCore:
         if task is None:
             raise KeyError(f"task does not exist: {task_id}")
         if task.execution_status is ExecutionStatus.QUEUED:
-            if self.store.get_project(task.project_id) is None:
+            project = self.store.get_project(task.project_id)
+            if project is None:
                 raise RuntimeError(f"project does not exist: {task.project_id}")
+            if task.mode is TaskMode.AUTONOMOUS_WRITE:
+                self._require_repository_writer(project.repo_path)
             request_id = str(uuid.uuid4())
             requested_at = timestamp_to_text(utc_now())
             try:
@@ -1047,20 +1096,73 @@ class BridgeCore:
 
     @staticmethod
     def _preflight_only_failure(task: Task, events: list[Any]) -> bool:
-        """Return whether an AW failure has only an explicit preflight marker."""
+        """Return whether an AW failure is proven to have stopped at preflight."""
 
         if task.execution_status is not ExecutionStatus.FAILED:
             return False
         if any(
-            event.source == "bridge" and event.kind == "policy.postflight"
+            event.source == "bridge"
+            and event.kind in {"policy.postflight", EXECUTOR_DISPATCH_STARTED_EVENT}
             for event in events
         ):
             return False
-        return any(
+        if any(
+            (
+                event.source == "bridge"
+                and event.kind in {"task.execution_claimed", "task.started"}
+            )
+            or event.source == "codex"
+            for event in events
+        ):
+            return False
+        failures = [
+            event
+            for event in events
+            if event.source == "bridge" and event.kind == "policy.violation"
+        ]
+        if not failures or any(
+            not isinstance(event.payload, Mapping)
+            or event.payload.get("phase") != "preflight"
+            for event in failures
+        ):
+            return False
+        if not any(
+            event.source == "bridge" and event.kind == "task.failed"
+            for event in events
+        ):
+            return False
+        if any(
             event.source == "bridge"
-            and event.kind == "policy.violation"
-            and isinstance(event.payload, Mapping)
-            and event.payload.get("phase") == "preflight"
+            and event.kind
+            in {
+                "task.cancel_requested",
+                "task.cancel_interrupt_sent",
+                "task.cancel_interrupt_failed",
+                "task.finished",
+                "task.cancelled",
+                "task.reconciliation_required",
+                "task.reconciliation_resolved",
+            }
+            for event in events
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _has_execution_start_evidence(events: list[Any]) -> bool:
+        """Return whether durable events show execution passed the queue."""
+
+        return any(
+            (
+                event.source == "bridge"
+                and event.kind
+                in {
+                    "task.execution_claimed",
+                    "task.started",
+                    EXECUTOR_DISPATCH_STARTED_EVENT,
+                }
+            )
+            or event.source == "codex"
             for event in events
         )
 
@@ -1164,9 +1266,9 @@ class BridgeCore:
             not isinstance(inspection_task_id, str) or not inspection_task_id.strip()
         ):
             raise ContinuationBaselineError("inspection_task_id must be non-empty text")
-        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_task_id is not None:
+        if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE} and inspection_task_id is not None:
             raise ContinuationBaselineError(
-                "direct adoption cannot include inspection_task_id"
+                "direct and rebase adoption cannot include inspection_task_id"
             )
 
         project = self.store.get_project(source_task.project_id)
@@ -1241,14 +1343,14 @@ class BridgeCore:
         ):
             raise ContinuationBaselineError("source policy.postflight repo path differs")
 
-        if adoption_mode == ADOPTION_MODE_DIRECT:
+        if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE}:
             fingerprint_present = (
                 "working_tree_fingerprint_version" in source_payload
                 or "working_tree_fingerprint" in source_payload
             )
             if not fingerprint_present:
                 raise ContinuationBaselineError(
-                    "direct adoption requires working-tree fingerprint v1"
+                    "direct or rebase adoption requires working-tree fingerprint v1"
                 )
             normalized_source = validate_continuation_snapshot(
                 source_payload,
@@ -1271,7 +1373,7 @@ class BridgeCore:
                 )
             ):
                 raise ContinuationBaselineError(
-                    "direct adoption requires working-tree fingerprint v1"
+                    "direct or rebase adoption requires working-tree fingerprint v1"
                 )
 
             self._assert_source_is_latest_continuation_candidate(
@@ -1425,6 +1527,7 @@ class BridgeCore:
         inspection_high_water_event_id: int,
         snapshot: Mapping[str, Any],
         adoption_mode: str = ADOPTION_MODE_LEGACY,
+        instance_scope: str | None = None,
     ) -> str:
         """Hash all durable adoption provenance and the complete Git snapshot."""
 
@@ -1443,13 +1546,18 @@ class BridgeCore:
         if not isinstance(adoption_mode, str) or adoption_mode not in {
             ADOPTION_MODE_LEGACY,
             ADOPTION_MODE_DIRECT,
+            ADOPTION_MODE_REBASE,
         }:
             raise ContinuationBaselineError("adoption mode is unsupported")
         # Legacy payloads predate adoption_mode.  Keep their fingerprint
-        # material byte-for-byte compatible while binding the new direct mode
-        # explicitly in every direct adoption fingerprint.
-        if adoption_mode == ADOPTION_MODE_DIRECT:
-            material["adoption_mode"] = ADOPTION_MODE_DIRECT
+        # material byte-for-byte compatible while binding the newer modes
+        # explicitly in every direct or rebase adoption fingerprint.
+        if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE}:
+            material["adoption_mode"] = adoption_mode
+        if adoption_mode == ADOPTION_MODE_REBASE:
+            if not isinstance(instance_scope, str) or not instance_scope:
+                raise ContinuationBaselineError("rebase instance scope is invalid")
+            material["instance_scope"] = instance_scope
         encoded = json.dumps(
             material,
             ensure_ascii=False,
@@ -1480,25 +1588,191 @@ class BridgeCore:
                 "Git state could not be captured for reconciliation adoption"
             ) from error
 
+    def _rebase_instance_scope(self) -> str:
+        """Bind a rebase approval to the Bridge instance's durable journal."""
+
+        return str(self.store.db_path.expanduser().resolve(strict=False)).casefold()
+
+    def _capture_rebase_snapshot_pair(
+        self, context: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Capture a stable, clean-tracked target that fast-forwards its source."""
+
+        project = context["project"]
+        source = context["source_postflight_payload"]
+        source_branch = source["baseline_branch"]
+        source_head = source["baseline_head"]
+        try:
+            repo_path, target_branch, target_head = git_current_revision(
+                project.repo_path
+            )
+            if target_branch != source_branch:
+                raise ContinuationBaselineError(
+                    "rebase target branch differs from the source baseline"
+                )
+            if target_head == source_head or not git_is_ancestor(
+                repo_path, source_head, target_head
+            ):
+                raise ContinuationBaselineError(
+                    "rebase target is not a strict fast-forward of the source baseline"
+                )
+            checkpoint = GitCheckpoint(
+                repo_path=repo_path,
+                baseline_branch=target_branch,
+                baseline_head=target_head,
+                status_porcelain="",
+                staged_paths=(),
+                unstaged_paths=(),
+                untracked_paths=(),
+                baseline_kind=RECONCILIATION_BASELINE_KIND,
+            )
+            first = self._capture_reconciled_snapshot(checkpoint, project)
+            second = self._capture_reconciled_snapshot(checkpoint, project)
+        except ContinuationBaselineError:
+            raise
+        except Exception as error:
+            raise ContinuationBaselineError(
+                "Git rebase target could not be verified"
+            ) from error
+        if first != second:
+            raise ContinuationBaselineError(
+                "Git state changed during reconciliation baseline rebase"
+            )
+        if (
+            first["changed_files"]
+            or first["diff"]
+            or first["cached_diff"]
+            or any(
+                not line.startswith("?? ")
+                for line in first["status_porcelain"].splitlines()
+            )
+        ):
+            raise ContinuationBaselineError(
+                "rebase requires a clean tracked and index state"
+            )
+        untracked_paths = set(first["untracked_files"])
+        fingerprinted_untracked_paths = {
+            item["path"]
+            for item in first["content_fingerprints"]
+            if item["state"] == "untracked"
+        }
+        if untracked_paths != fingerprinted_untracked_paths:
+            raise ContinuationBaselineError(
+                "rebase requires a fingerprint for every untracked file"
+            )
+        if (
+            first.get("working_tree_fingerprint_version")
+            != WORKING_TREE_FINGERPRINT_VERSION
+            or not isinstance(first.get("working_tree_fingerprint"), str)
+        ):
+            raise ContinuationBaselineError(
+                "rebase requires working-tree fingerprint v1"
+            )
+        return first, second
+
     def adopt_reconciled_continuation_baseline(
         self,
         source_task_id: str,
         inspection_task_id: str | None = None,
         *,
         mode: str | None = None,
+        approved_fingerprint: str | None = None,
+        human_approval: bool = False,
+    ) -> dict[str, Any]:
+        """Adopt a baseline only as the configured repository writer.
+
+        The repository lock spans both Git snapshots and the durable adoption
+        event so a writer cannot change the repository between the captures or
+        before the adoption is recorded.
+
+        Rebase mode first returns a proposal; persistence requires the same
+        proposal fingerprint and an explicit human approval on a later call.
+        ``human_approval`` is a client-supplied declaration; this method does
+        not authenticate that the declaration came from a human.
+        """
+
+        adoption_mode = self._normalize_adoption_mode(mode)
+        if not isinstance(human_approval, bool):
+            raise ContinuationBaselineError("human_approval must be boolean")
+        if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE} and inspection_task_id is not None:
+            raise ContinuationBaselineError(
+                "direct and rebase adoption cannot include inspection_task_id"
+            )
+        if adoption_mode == ADOPTION_MODE_REBASE:
+            if approved_fingerprint is not None and not human_approval:
+                raise ContinuationBaselineError(
+                    "rebase adoption requires explicit human approval"
+                )
+            if human_approval and approved_fingerprint is None:
+                raise ContinuationBaselineError(
+                    "rebase human approval requires a proposal fingerprint"
+                )
+        elif approved_fingerprint is not None or human_approval:
+            raise ContinuationBaselineError(
+                "approval fields are supported only by rebase adoption"
+            )
+        source_task = self.store.get_task(source_task_id)
+        if source_task is None:
+            raise KeyError(f"task does not exist: {source_task_id}")
+        # Preserve the existing validation order: invalid source/inspection
+        # provenance is rejected before ownership or lock errors are reported.
+        context = self._validated_baseline_adoption_context(
+            source_task,
+            inspection_task_id,
+            adoption_mode=adoption_mode,
+        )
+        project = context["project"]
+        try:
+            self._require_repository_writer(project.repo_path)
+            with self._repository_lock(project.repo_path):
+                self._require_repository_writer(project.repo_path)
+                return self._adopt_reconciled_continuation_baseline_under_lock(
+                    source_task_id,
+                    inspection_task_id,
+                    mode=adoption_mode,
+                    approved_fingerprint=approved_fingerprint,
+                    human_approval=human_approval,
+                )
+        except RepositoryAccessError as error:
+            raise PolicyError(str(error)) from error
+
+    def _adopt_reconciled_continuation_baseline_under_lock(
+        self,
+        source_task_id: str,
+        inspection_task_id: str | None = None,
+        *,
+        mode: str | None = None,
+        approved_fingerprint: str | None = None,
+        human_approval: bool = False,
     ) -> dict[str, Any]:
         """Adopt two identical, Bridge-captured Git snapshots explicitly.
 
         ``mode`` defaults to the established inspection-backed flow.  The
         direct mode is an explicit administrative invocation over the same
-        durable adoption event; it never infers authorization from a dirty
-        worktree.
+        durable adoption event; rebase mode requires a separate explicit
+        approval over a strict fast-forward target.  Neither mode infers
+        authorization from a dirty worktree.
         """
 
         adoption_mode = self._normalize_adoption_mode(mode)
-        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_task_id is not None:
+        if not isinstance(human_approval, bool):
+            raise ContinuationBaselineError("human_approval must be boolean")
+        if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE} and inspection_task_id is not None:
             raise ContinuationBaselineError(
-                "direct adoption cannot include inspection_task_id"
+                "direct and rebase adoption cannot include inspection_task_id"
+            )
+        if adoption_mode == ADOPTION_MODE_REBASE:
+            if approved_fingerprint is not None and not human_approval:
+                raise ContinuationBaselineError(
+                    "rebase adoption requires explicit human approval"
+                )
+            if human_approval and approved_fingerprint is None:
+                raise ContinuationBaselineError(
+                    "rebase human approval requires a proposal fingerprint"
+                )
+        elif approved_fingerprint is not None or human_approval:
+            raise ContinuationBaselineError(
+                "approval fields are supported only by rebase adoption"
             )
         source_task = self.store.get_task(source_task_id)
         if source_task is None:
@@ -1511,12 +1785,17 @@ class BridgeCore:
         project = context["project"]
         checkpoint = context["checkpoint"]
 
-        first_snapshot = self._capture_reconciled_snapshot(checkpoint, project)
-        second_snapshot = self._capture_reconciled_snapshot(checkpoint, project)
-        if first_snapshot != second_snapshot:
-            raise ContinuationBaselineError(
-                "Git state changed during reconciliation baseline adoption"
+        if adoption_mode == ADOPTION_MODE_REBASE:
+            first_snapshot, _second_snapshot = self._capture_rebase_snapshot_pair(
+                context
             )
+        else:
+            first_snapshot = self._capture_reconciled_snapshot(checkpoint, project)
+            second_snapshot = self._capture_reconciled_snapshot(checkpoint, project)
+            if first_snapshot != second_snapshot:
+                raise ContinuationBaselineError(
+                    "Git state changed during reconciliation baseline adoption"
+                )
         if adoption_mode == ADOPTION_MODE_DIRECT and (
             isinstance(
                 first_snapshot.get("working_tree_fingerprint_version"), bool
@@ -1535,7 +1814,7 @@ class BridgeCore:
         source_postflight_event_id = self._event_id(context["source_postflight"])
         inspection_terminal_event_id = (
             None
-            if adoption_mode == ADOPTION_MODE_DIRECT
+            if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE}
             else self._event_id(context["inspection_terminal"])
         )
         source_high_water = context["source_high_water"]
@@ -1574,7 +1853,62 @@ class BridgeCore:
             inspection_high_water_event_id=inspection_high_water,
             snapshot=first_snapshot,
             adoption_mode=adoption_mode,
+            instance_scope=(
+                self._rebase_instance_scope()
+                if adoption_mode == ADOPTION_MODE_REBASE
+                else None
+            ),
         )
+        if adoption_mode == ADOPTION_MODE_REBASE:
+            if approved_fingerprint is None:
+                return {
+                    "adopted": False,
+                    "proposal": True,
+                    "adoption_mode": adoption_mode,
+                    "source_task_id": source_task.task_id,
+                    "project_id": source_task.project_id,
+                    "source_branch": context["source_postflight_payload"][
+                        "baseline_branch"
+                    ],
+                    "source_head": context["source_postflight_payload"][
+                        "baseline_head"
+                    ],
+                    "target_branch": first_snapshot["baseline_branch"],
+                    "target_head": first_snapshot["baseline_head"],
+                    "untracked_files": first_snapshot["untracked_files"],
+                    "untracked_fingerprints": first_snapshot[
+                        "untracked_fingerprints"
+                    ],
+                    "working_tree_fingerprint_version": first_snapshot[
+                        "working_tree_fingerprint_version"
+                    ],
+                    "working_tree_fingerprint": first_snapshot[
+                        "working_tree_fingerprint"
+                    ],
+                    "proposal_fingerprint": evidence_fingerprint,
+                    "requires_human_approval": True,
+                }
+            if approved_fingerprint != evidence_fingerprint:
+                raise ContinuationBaselineError(
+                    "approved rebase proposal no longer matches current Git state"
+                )
+            final_checkpoint = GitCheckpoint(
+                repo_path=first_snapshot["repo_path"],
+                baseline_branch=first_snapshot["baseline_branch"],
+                baseline_head=first_snapshot["baseline_head"],
+                status_porcelain="",
+                staged_paths=(),
+                unstaged_paths=(),
+                untracked_paths=(),
+                baseline_kind=RECONCILIATION_BASELINE_KIND,
+            )
+            final_snapshot = self._capture_reconciled_snapshot(
+                final_checkpoint, project
+            )
+            if final_snapshot != first_snapshot:
+                raise ContinuationBaselineError(
+                    "Git state changed before reconciliation baseline persistence"
+                )
         adoption_payload: dict[str, Any] = {
             "schema_version": RECONCILIATION_BASELINE_SCHEMA_VERSION,
             "baseline_kind": RECONCILIATION_BASELINE_KIND,
@@ -1595,6 +1929,22 @@ class BridgeCore:
             "fingerprint": evidence_fingerprint,
             "evidence_fingerprint": evidence_fingerprint,
         }
+        if adoption_mode == ADOPTION_MODE_REBASE:
+            adoption_payload.update(
+                {
+                    "source_baseline_branch": context[
+                        "source_postflight_payload"
+                    ]["baseline_branch"],
+                    "source_baseline_head": context["source_postflight_payload"][
+                        "baseline_head"
+                    ],
+                    "target_branch": first_snapshot["baseline_branch"],
+                    "target_head": first_snapshot["baseline_head"],
+                    "instance_scope": self._rebase_instance_scope(),
+                    "approval_fingerprint": approved_fingerprint,
+                    "human_approval": True,
+                }
+            )
         try:
             event, created = self.store.persist_reconciliation_baseline_adoption(
                 source_task.task_id,
@@ -1997,10 +2347,11 @@ class BridgeCore:
         if not isinstance(adoption_mode, str) or adoption_mode not in {
             ADOPTION_MODE_LEGACY,
             ADOPTION_MODE_DIRECT,
+            ADOPTION_MODE_REBASE,
         }:
             raise ContinuationBaselineError("adoption event mode is unsupported")
 
-        if adoption_mode == ADOPTION_MODE_DIRECT:
+        if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE}:
             source_postflight = context["source_postflight"]
             source_postflight_id = self._event_id(source_postflight)
             if (
@@ -2009,7 +2360,9 @@ class BridgeCore:
                 or payload.get("inspection_task_id") is not None
                 or payload.get("inspection_terminal_event_id") is not None
             ):
-                raise ContinuationBaselineError("direct adoption provenance is invalid")
+                raise ContinuationBaselineError(
+                    "direct or rebase adoption provenance is invalid"
+                )
 
             source_ref = payload.get("source_postflight_event_id")
             if (
@@ -2054,11 +2407,44 @@ class BridgeCore:
                 raise ContinuationBaselineError("source task high-water is not exact")
 
             snapshot = payload.get("snapshot")
+            expected_branch = context["source_postflight_payload"]["baseline_branch"]
+            expected_head = context["source_postflight_payload"]["baseline_head"]
+            instance_scope = None
+            if adoption_mode == ADOPTION_MODE_REBASE:
+                target_branch = payload.get("target_branch")
+                target_head = payload.get("target_head")
+                if (
+                    payload.get("source_baseline_branch") != expected_branch
+                    or payload.get("source_baseline_head") != expected_head
+                    or not isinstance(target_branch, str)
+                    or not isinstance(target_head, str)
+                    or target_branch != expected_branch
+                    or target_head == expected_head
+                    or payload.get("human_approval") is not True
+                    or payload.get("approval_fingerprint")
+                    != payload.get("fingerprint")
+                ):
+                    raise ContinuationBaselineError(
+                        "rebase adoption provenance or approval is invalid"
+                    )
+                instance_scope = self._rebase_instance_scope()
+                if payload.get("instance_scope") != instance_scope:
+                    raise ContinuationBaselineError(
+                        "rebase approval belongs to another Bridge instance"
+                    )
+                if not git_is_ancestor(
+                    context["project"].repo_path, expected_head, target_head
+                ):
+                    raise ContinuationBaselineError(
+                        "rebase target is not a fast-forward of the source baseline"
+                    )
+                expected_branch = target_branch
+                expected_head = target_head
             normalized = validate_continuation_snapshot(
                 snapshot,
                 expected_repo=context["project"].repo_path,
-                expected_branch=context["source_postflight_payload"]["baseline_branch"],
-                expected_head=context["source_postflight_payload"]["baseline_head"],
+                expected_branch=expected_branch,
+                expected_head=expected_head,
             )
             if (
                 isinstance(
@@ -2072,7 +2458,7 @@ class BridgeCore:
                 or not isinstance(normalized.get("working_tree_fingerprint"), str)
             ):
                 raise ContinuationBaselineError(
-                    "direct adoption snapshot lacks fingerprint v1"
+                    "direct or rebase adoption snapshot lacks fingerprint v1"
                 )
             expected_fingerprint = self._baseline_adoption_fingerprint(
                 source_task_id=candidate.task_id,
@@ -2083,7 +2469,8 @@ class BridgeCore:
                 source_high_water_event_id=source_high_water,
                 inspection_high_water_event_id=0,
                 snapshot=normalized,
-                adoption_mode=ADOPTION_MODE_DIRECT,
+                adoption_mode=adoption_mode,
+                instance_scope=instance_scope,
             )
             if payload.get("fingerprint") != expected_fingerprint or payload.get(
                 "evidence_fingerprint"
@@ -2206,10 +2593,43 @@ class BridgeCore:
     def _previous_continuation_baseline(
         self, task: Task
     ) -> tuple[str, dict[str, Any]] | None:
-        """Return the latest eligible explicit continuation baseline."""
+        """Return the latest eligible baseline for this SQLite's physical repo."""
 
         latest: tuple[int, str, dict[str, Any]] | None = None
         blocker: tuple[int, str, ContinuationBaselineError | None] | None = None
+
+        current_project = self.store.get_project(task.project_id)
+        if current_project is None:
+            raise ContinuationBaselineError("current project does not exist")
+        try:
+            current_repo_identity = self._canonical_path_key(
+                str(repository_lock_identity(current_project.repo_path))
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ContinuationBaselineError(
+                "current repository identity could not be verified"
+            ) from error
+
+        repository_candidates: list[Task] = []
+        for project in self.store.list_projects():
+            project_tasks = self.store.list_tasks(project.project_id)
+            autonomous_tasks = [
+                candidate
+                for candidate in project_tasks
+                if candidate.mode is TaskMode.AUTONOMOUS_WRITE
+            ]
+            if not autonomous_tasks:
+                continue
+            try:
+                candidate_repo_identity = self._canonical_path_key(
+                    str(repository_lock_identity(project.repo_path))
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ContinuationBaselineError(
+                    "repository identity could not be verified for a project"
+                ) from error
+            if candidate_repo_identity == current_repo_identity:
+                repository_candidates.extend(autonomous_tasks)
 
         def add_blocker(
             event_id: int, reason: str, error: ContinuationBaselineError | None = None
@@ -2220,12 +2640,8 @@ class BridgeCore:
             if blocker is None or event_id > blocker[0]:
                 blocker = (event_id, reason, error)
 
-        for candidate in self.store.list_tasks(task.project_id):
-            if (
-                candidate.task_id == task.task_id
-                or candidate.project_id != task.project_id
-                or candidate.mode is not TaskMode.AUTONOMOUS_WRITE
-            ):
+        for candidate in repository_candidates:
+            if candidate.task_id == task.task_id:
                 continue
             events = self.store.list_task_events(candidate.task_id)
             postflights = [
@@ -2264,6 +2680,7 @@ class BridgeCore:
                         if not isinstance(adoption_mode, str) or adoption_mode not in {
                             ADOPTION_MODE_LEGACY,
                             ADOPTION_MODE_DIRECT,
+                            ADOPTION_MODE_REBASE,
                         }:
                             raise ContinuationBaselineError(
                                 "adoption event mode is unsupported"
@@ -2275,9 +2692,12 @@ class BridgeCore:
                             raise ContinuationBaselineError(
                                 "adoption event provenance is invalid"
                             )
-                        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_id is not None:
+                        if adoption_mode in {
+                            ADOPTION_MODE_DIRECT,
+                            ADOPTION_MODE_REBASE,
+                        } and inspection_id is not None:
                             raise ContinuationBaselineError(
-                                "direct adoption provenance is invalid"
+                                "direct or rebase adoption provenance is invalid"
                             )
                         context = self._validated_baseline_adoption_context(
                             candidate,
@@ -2353,7 +2773,17 @@ class BridgeCore:
             if candidate_baseline is None and not postflights and not adoptions:
                 if self._preflight_only_failure(candidate, events):
                     continue
-                if candidate.execution_status is ExecutionStatus.QUEUED:
+                if (
+                    candidate.execution_status is ExecutionStatus.QUEUED
+                    and not self._has_execution_start_evidence(events)
+                    and not violations
+                    and not any(
+                        event.source == "bridge"
+                        and event.kind
+                        in {"task.failed", "task.finished", "task.cancelled"}
+                        for event in events
+                    )
+                ):
                     continue
                 add_blocker(latest_event_id, "invalid")
 
@@ -2401,7 +2831,28 @@ class BridgeCore:
             raise PolicyError("checkpoint task is not the last applicable task")
 
     def commit_checkpoint(self, task_id: str, message: str) -> dict[str, Any]:
-        """Create or forward-repair one durable local checkpoint attempt."""
+        """Create or repair a checkpoint under the repository writer lock."""
+
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise PolicyError(f"task does not exist: {task_id}")
+        if task.mode is not TaskMode.AUTONOMOUS_WRITE:
+            raise PolicyError("checkpoint commits require AUTONOMOUS_WRITE mode")
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise PolicyError(f"project does not exist: {task.project_id}")
+        self._require_repository_writer(project.repo_path)
+        try:
+            with self._repository_lock(project.repo_path):
+                self._require_repository_writer(project.repo_path)
+                return self._commit_checkpoint_under_repository_lock(task_id, message)
+        except RepositoryAccessError as error:
+            raise PolicyError(str(error)) from error
+
+    def _commit_checkpoint_under_repository_lock(
+        self, task_id: str, message: str
+    ) -> dict[str, Any]:
+        """Checkpoint transaction body; caller owns the repository lock."""
 
         task = self.store.get_task(task_id)
         if task is None:
@@ -3060,6 +3511,9 @@ class BridgeCore:
                     cancellation_payload["final_response"] = _bounded_final_response(
                         result.final_response
                     )
+                if checkpoint is not None:
+                    self._persist_cancelled_postflight(task_id, checkpoint)
+                    postflight_recorded = True
                 return self.store.transition_task_terminal(
                     task_id,
                     execution_status=ExecutionStatus.CANCELLED,
@@ -3106,7 +3560,7 @@ class BridgeCore:
                 pass
             if checkpoint is not None and not postflight_recorded:
                 try:
-                    self._persist_postflight(task_id, checkpoint)
+                    self._persist_cancelled_postflight(task_id, checkpoint)
                 except BaseException:
                     pass
             self.store.transition_task_terminal(
@@ -3134,7 +3588,31 @@ class BridgeCore:
             raise
 
     async def run_task(self, task_id: str) -> Task:
-        """Legacy synchronous execution path retained for direct Core callers."""
+        """Run one task while holding the canonical repository OS lock."""
+
+        self._require_executor()
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        if task.execution_status is not ExecutionStatus.QUEUED:
+            raise TaskStateError(
+                f"task {task_id} cannot run from state "
+                f"{task.execution_status.value}; only QUEUED tasks may run"
+            )
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise RuntimeError(f"project does not exist: {task.project_id}")
+        try:
+            with self._repository_lock(project.repo_path):
+                return await self._run_task_under_repository_lock(task_id)
+        except RepositoryAccessError as error:
+            self._record_repository_guard_failure(
+                task_id, error, expected_status=ExecutionStatus.QUEUED
+            )
+            raise PolicyError(str(error)) from error
+
+    async def _run_task_under_repository_lock(self, task_id: str) -> Task:
+        """Legacy direct execution body; caller owns the repository lock."""
 
         self._require_executor()
         task = self.store.get_task(task_id)
@@ -3165,6 +3643,13 @@ class BridgeCore:
                     task_id, error, expected_status=ExecutionStatus.QUEUED
                 )
                 raise
+            try:
+                self._require_repository_writer(project.repo_path)
+            except PolicyError as error:
+                self._record_preflight_failure(
+                    task_id, error, expected_status=ExecutionStatus.QUEUED
+                )
+                raise
             self.store.append_task_event(
                 task_id,
                 "bridge",
@@ -3176,7 +3661,33 @@ class BridgeCore:
         return await self._execute_running_task(task, project, checkpoint)
 
     async def execute_claimed_task(self, task_id: str) -> Task:
-        """Run one task after a persistent worker atomically claimed it."""
+        """Execute a claimed task under the canonical repository OS lock."""
+
+        self._require_executor()
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        if task.execution_status is not ExecutionStatus.RUNNING:
+            raise TaskStateError(
+                f"task {task_id} cannot execute from state "
+                f"{task.execution_status.value}; expected RUNNING"
+            )
+        if self.store.get_execution_claim(task_id) is None:
+            raise TaskStateError(f"task {task_id} has no persistent worker claim")
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise RuntimeError(f"project does not exist: {task.project_id}")
+        try:
+            with self._repository_lock(project.repo_path):
+                return await self._execute_claimed_task_under_repository_lock(task_id)
+        except RepositoryAccessError as error:
+            self._record_repository_guard_failure(
+                task_id, error, expected_status=ExecutionStatus.RUNNING
+            )
+            raise PolicyError(str(error)) from error
+
+    async def _execute_claimed_task_under_repository_lock(self, task_id: str) -> Task:
+        """Worker execution body; caller owns the repository lock."""
 
         self._require_executor()
         task = self.store.get_task(task_id)
@@ -3202,6 +3713,13 @@ class BridgeCore:
         if task.mode is TaskMode.AUTONOMOUS_WRITE:
             try:
                 checkpoint = self._preflight_checkpoint(task, project)
+            except PolicyError as error:
+                self._record_preflight_failure(
+                    task_id, error, expected_status=ExecutionStatus.RUNNING
+                )
+                raise
+            try:
+                self._require_repository_writer(project.repo_path)
             except PolicyError as error:
                 self._record_preflight_failure(
                     task_id, error, expected_status=ExecutionStatus.RUNNING
@@ -3261,6 +3779,78 @@ class BridgeCore:
                 {"phase": "postflight", **payload},
             )
         return postflight
+
+    def _persist_cancelled_postflight(
+        self, task_id: str, checkpoint: GitCheckpoint
+    ) -> None:
+        """Persist cancellation evidence, keeping failed captures unreconciled."""
+
+        try:
+            self._persist_postflight(task_id, checkpoint)
+        except Exception as error:
+            self._record_cancelled_postflight_failure(task_id, error)
+
+    def _record_cancelled_postflight_failure(
+        self, task_id: str, error: BaseException
+    ) -> None:
+        """Record a failed cancellation postflight and block automatic recovery."""
+
+        complete_postflight = False
+        postflight_violation_recorded = False
+        try:
+            events = self.store.list_task_events(task_id)
+            complete_postflight = any(
+                event.source == "bridge"
+                and event.kind == "policy.postflight"
+                and isinstance(event.payload, Mapping)
+                and event.payload.get("ok") is not False
+                for event in events
+            )
+            postflight_violation_recorded = any(
+                event.source == "bridge"
+                and event.kind == "policy.violation"
+                and isinstance(event.payload, Mapping)
+                and event.payload.get("phase") == "postflight"
+                for event in events
+            )
+        except BaseException:
+            pass
+
+        if complete_postflight:
+            return
+
+        if not postflight_violation_recorded:
+            try:
+                self.store.append_task_event(
+                    task_id,
+                    "bridge",
+                    "policy.violation",
+                    {
+                        "phase": "postflight",
+                        "policy_violation": True,
+                        "postflight_persisted": False,
+                        "error_type": type(error).__name__,
+                        "message": _bounded_error_message(error),
+                    },
+                )
+            except BaseException:
+                pass
+
+        try:
+            task = self.store.get_task(task_id)
+            if task is None or task.execution_status is not ExecutionStatus.RUNNING:
+                return
+            events = self.store.list_task_events(task_id)
+            payload = self._reconciliation_payload(task, events)
+            payload["reason"] = (
+                "postflight evidence could not be persisted after cancellation"
+            )
+            payload.pop("evidence_fingerprint", None)
+            self.store.ensure_reconciliation_required(task_id, payload)
+        except BaseException:
+            # A failing durable store cannot be repaired here; with no valid
+            # postflight the terminal CANCELLED task remains ineligible as a baseline.
+            pass
 
 
 __all__ = [

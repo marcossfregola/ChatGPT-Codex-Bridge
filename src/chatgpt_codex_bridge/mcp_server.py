@@ -13,6 +13,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .core import BridgeCore
+from .repository_access import process_instance_id
 from .mcp_adapter import MCPAdapter, MCPToolError
 from .persistence.sqlite_store import SQLiteBridgeStore
 from .single_instance import (
@@ -187,7 +188,11 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
         name="adopt_reconciled_continuation_baseline",
         description=(
             "Adopt a double-captured Git state for a FINISHED autonomous task "
-            "using either the legacy inspection-backed flow or explicit direct mode."
+            "using legacy/direct mode or an explicitly approved fast-forward rebase. "
+            "Rebase first returns a proposal; adoption requires its exact fingerprint "
+            "and human_approval=true in a separate call. human_approval is a "
+            "client-supplied declaration, not authenticated proof of human identity; "
+            "the client must obtain approval for that exact proposal before calling."
         ),
         structured_output=True,
     )
@@ -195,6 +200,8 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
         source_task_id: str,
         inspection_task_id: str | None = None,
         mode: str | None = None,
+        approved_fingerprint: str | None = None,
+        human_approval: bool = False,
     ) -> dict[str, Any]:
         return await _call_adapter(
             adapter,
@@ -203,6 +210,8 @@ def build_server(adapter: MCPAdapter) -> MCPServer:
                 "source_task_id": source_task_id,
                 "inspection_task_id": inspection_task_id,
                 "mode": mode,
+                "approved_fingerprint": approved_fingerprint,
+                "human_approval": human_approval,
             },
         )
 
@@ -239,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                 # The MCP child owns only the request/dispatch boundary.  A
                 # separate persistent execution worker owns Codex processes
                 # and performs recovery after acquiring its own lock.
-                core = BridgeCore(store)
+                core = BridgeCore(store, instance_id=process_instance_id())
                 adapter = MCPAdapter(core, store)
                 build_server(adapter).run(transport="stdio")
                 return 0

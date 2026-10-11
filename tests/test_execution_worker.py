@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,10 @@ from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
     SQLiteBridgeStore,
 )
 from chatgpt_codex_bridge.policy import DirtyWorkingTreeError  # noqa: E402
+from chatgpt_codex_bridge.repository_access import (  # noqa: E402
+    RepositoryBusyError,
+    RepositoryLock,
+)
 
 
 class FakeExecutor:
@@ -98,6 +103,8 @@ class ControlledCancellationExecutor(FakeExecutor):
             )
         self.started.set()
         await self.release.wait()
+        if self.mutation is not None:
+            self.mutation(Path(request.cwd))
         status = (
             ExecutionStatus.CANCELLED
             if self.cancel_requested
@@ -213,9 +220,17 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.db_path = self.root / "bridge.sqlite3"
         self.store = SQLiteBridgeStore(self.db_path)
         self.executor = FakeExecutor()
-        self.core = BridgeCore(self.store, self.executor)
+        self.core = self._new_core(self.store, self.executor)
         self.core.create_project("Bridge", "C:/workspace/bridge", project_id="project-worker")
         self.adapter = MCPAdapter(self.core, self.store)
+
+    def _new_core(self, store, executor=None) -> BridgeCore:
+        return BridgeCore(
+            store,
+            executor,
+            instance_id="worker-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
 
     def tearDown(self) -> None:
         self.store.close()
@@ -225,6 +240,36 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         return self.core.create_task(
             "project-worker", "execute the worker test", task_id=task_id, mode=mode
         )
+
+    def _configure_autonomous_repo(
+        self,
+        executor,
+        *,
+        repo_name: str,
+        project_id: str,
+    ) -> Path:
+        repo = self.root / repo_name
+        repo.mkdir()
+        self._git(repo, "init")
+        self._git(repo, "config", "user.name", "Worker Test")
+        self._git(repo, "config", "user.email", "worker-test@example.invalid")
+        self._git(
+            repo,
+            "config",
+            "chatgptcodexbridge.writerInstanceId",
+            "worker-test",
+        )
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self._git(repo, "add", "tracked.txt")
+        self._git(repo, "commit", "-m", "initial")
+
+        self.store.close()
+        self.store = SQLiteBridgeStore(self.db_path)
+        self.executor = executor
+        self.core = self._new_core(self.store, self.executor)
+        self.core.create_project("Bridge", str(repo), project_id=project_id)
+        self.adapter = MCPAdapter(self.core, self.store)
+        return repo
 
     async def test_two_requests_are_one_durable_execution_request(self) -> None:
         self.create_task()
@@ -285,6 +330,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self._git(repo, "init")
         self._git(repo, "config", "user.name", "Worker Test")
         self._git(repo, "config", "user.email", "worker-test@example.invalid")
+        self._git(repo, "config", "chatgptcodexbridge.writerInstanceId", "worker-test")
         (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
         self._git(repo, "add", "tracked.txt")
         self._git(repo, "commit", "-m", "initial")
@@ -321,7 +367,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_executor_failure_after_dispatch_retains_marker(self) -> None:
         self.executor = ImmediateFailureExecutor()
-        self.core = BridgeCore(self.store, self.executor)
+        self.core = self._new_core(self.store, self.executor)
         self.core.create_project("Bridge", "C:/workspace/bridge", project_id="project-fail")
         self.adapter = MCPAdapter(self.core, self.store)
         self.core.create_task("project-fail", "fail after dispatch", task_id="task-fail")
@@ -402,7 +448,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         reopened = SQLiteBridgeStore(self.db_path)
         try:
-            restarted_core = BridgeCore(reopened)
+            restarted_core = self._new_core(reopened)
             restarted = MCPAdapter(restarted_core, reopened)
             second = await restarted.call_tool(
                 "run_task", {"task_id": "task-worker"}
@@ -483,6 +529,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self._git(repo, "init")
         self._git(repo, "config", "user.name", "Worker Test")
         self._git(repo, "config", "user.email", "worker-test@example.invalid")
+        self._git(repo, "config", "chatgptcodexbridge.writerInstanceId", "worker-test")
         (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
         self._git(repo, "add", "tracked.txt")
         self._git(repo, "commit", "-m", "initial")
@@ -492,7 +539,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.executor = FakeExecutor(
             mutation=lambda path: (path / "worker.txt").write_text("created\n", encoding="utf-8")
         )
-        self.core = BridgeCore(self.store, self.executor)
+        self.core = self._new_core(self.store, self.executor)
         self.core.create_project("Bridge", str(repo), project_id="project-auto")
         self.adapter = MCPAdapter(self.core, self.store)
         self.core.create_task(
@@ -552,6 +599,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self._git(repo, "init")
         self._git(repo, "config", "user.name", "Worker Test")
         self._git(repo, "config", "user.email", "worker-test@example.invalid")
+        self._git(repo, "config", "chatgptcodexbridge.writerInstanceId", "worker-test")
         (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
         self._git(repo, "add", "tracked.txt")
         self._git(repo, "commit", "-m", "initial")
@@ -561,7 +609,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.executor = FakeExecutor(
             mutation=lambda path: (path / "first.txt").write_text("one\n", encoding="utf-8")
         )
-        self.core = BridgeCore(self.store, self.executor)
+        self.core = self._new_core(self.store, self.executor)
         self.core.create_project("Bridge", str(repo), project_id="project-continuation")
         self.adapter = MCPAdapter(self.core, self.store)
         self.core.create_task(
@@ -599,7 +647,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         executor = BlockingCancelableExecutor()
         self.store.close()
         self.store = SQLiteBridgeStore(self.db_path)
-        self.core = BridgeCore(self.store, executor)
+        self.core = self._new_core(self.store, executor)
         self.core.create_project("Bridge", "C:/workspace/bridge", project_id="project-stop")
         self.adapter = MCPAdapter(self.core, self.store)
         self.core.create_task("project-stop", "stop the worker", task_id="task-stop")
@@ -647,7 +695,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_h3_running_cancel_interrupts_exact_turn_and_confirms_cancelled(self) -> None:
         executor = ControlledCancellationExecutor()
         self.executor = executor
-        self.core = BridgeCore(self.store, executor)
+        self.core = self._new_core(self.store, executor)
         self.adapter = MCPAdapter(self.core, self.store)
         self.create_task("task-h3-running")
         await self.adapter.call_tool("run_task", {"task_id": "task-h3-running"})
@@ -698,10 +746,201 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(durable_result["cancel_confirmed"])
         self.assertFalse(durable_result["policy_violation"])
 
+    async def test_worker_cancelled_postflight_is_durable_under_lock_and_not_a_baseline(
+        self,
+    ) -> None:
+        initial_executor = FakeExecutor(
+            mutation=lambda path: (path / "prior.txt").write_text(
+                "prior\n", encoding="utf-8"
+            )
+        )
+        repo = self._configure_autonomous_repo(
+            initial_executor,
+            repo_name="cancel-postflight",
+            project_id="project-cancel-postflight",
+        )
+        prior = self.core.create_task(
+            "project-cancel-postflight",
+            "create an eligible earlier baseline",
+            task_id="task-cancel-prior",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        await self.adapter.call_tool("run_task", {"task_id": prior.task_id})
+        prior_result = await ExecutionWorker(self.store, self.core).run_once()
+        self.assertIsNotNone(prior_result)
+        assert prior_result is not None
+        self.assertEqual(prior_result.execution_status, ExecutionStatus.FINISHED)
+
+        cancelled_executor = ControlledCancellationExecutor()
+        cancelled_executor.mutation = lambda path: (path / "cancelled.txt").write_text(
+            "changed before cancellation\n", encoding="utf-8"
+        )
+        self.core.executor = cancelled_executor
+        cancelled = self.core.create_task(
+            "project-cancel-postflight",
+            "cancel after the executor changes a file",
+            task_id="task-cancel-postflight",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        await self.adapter.call_tool("run_task", {"task_id": cancelled.task_id})
+        worker = ExecutionWorker(
+            self.store,
+            self.core,
+            worker_id="worker-cancel-postflight",
+            pid=54326,
+        )
+        persist_postflight = self.core._persist_postflight
+
+        def assert_lock_held_and_persist(task_id, checkpoint):
+            probe = RepositoryLock(
+                repo, lock_directory=self.core.repository_lock_directory
+            )
+            try:
+                with self.assertRaises(RepositoryBusyError):
+                    probe.acquire()
+            finally:
+                probe.release()
+            return persist_postflight(task_id, checkpoint)
+
+        with patch.object(
+            self.core,
+            "_persist_postflight",
+            side_effect=assert_lock_held_and_persist,
+        ):
+            running = asyncio.create_task(worker.run_once())
+            await asyncio.wait_for(cancelled_executor.started.wait(), timeout=2)
+            requested = await self.adapter.call_tool(
+                "cancel_task", {"task_id": cancelled.task_id}
+            )
+            result = await asyncio.wait_for(running, timeout=3)
+
+        self.assertTrue(requested["cancel_requested"])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.execution_status, ExecutionStatus.CANCELLED)
+        self.assertEqual((repo / "cancelled.txt").read_text(encoding="utf-8"),
+                         "changed before cancellation\n")
+        events = self.store.list_task_events(cancelled.task_id)
+        kinds = [event.kind for event in events]
+        self.assertLess(kinds.index("policy.postflight"), kinds.index("task.cancelled"))
+        postflight = next(event for event in events if event.kind == "policy.postflight")
+        self.assertIn("cancelled.txt", postflight.payload["untracked_files"])
+
+        # The terminal CANCELLED postflight is evidence only; it blocks fallback
+        # to the valid earlier FINISHED task's baseline.
+        following = self.core.create_task(
+            "project-cancel-postflight",
+            "must not reuse the older baseline",
+            task_id="task-after-cancel-postflight",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        self.assertIsNone(self.core._previous_continuation_baseline(following))
+        with self.assertRaises(DirtyWorkingTreeError):
+            await self.core.run_task(following.task_id)
+        self.assertEqual(len(cancelled_executor.requests), 1)
+        reacquire = RepositoryLock(
+            repo, lock_directory=self.core.repository_lock_directory
+        )
+        reacquire.acquire()
+        reacquire.release()
+
+    async def test_failed_cancelled_postflight_stays_unreconciled_and_not_a_baseline(
+        self,
+    ) -> None:
+        initial_executor = FakeExecutor(
+            mutation=lambda path: (path / "prior.txt").write_text(
+                "prior\n", encoding="utf-8"
+            )
+        )
+        repo = self._configure_autonomous_repo(
+            initial_executor,
+            repo_name="cancel-postflight-failure",
+            project_id="project-cancel-postflight-failure",
+        )
+        prior = self.core.create_task(
+            "project-cancel-postflight-failure",
+            "create an eligible earlier baseline",
+            task_id="task-cancel-failure-prior",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        await self.adapter.call_tool("run_task", {"task_id": prior.task_id})
+        prior_result = await ExecutionWorker(self.store, self.core).run_once()
+        self.assertIsNotNone(prior_result)
+        assert prior_result is not None
+        self.assertEqual(prior_result.execution_status, ExecutionStatus.FINISHED)
+
+        cancelled_executor = ControlledCancellationExecutor()
+        cancelled_executor.mutation = lambda path: (path / "unrecorded.txt").write_text(
+            "changed\n", encoding="utf-8"
+        )
+        self.core.executor = cancelled_executor
+        cancelled = self.core.create_task(
+            "project-cancel-postflight-failure",
+            "cancel with a simulated durable-store failure",
+            task_id="task-cancel-postflight-failure",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        await self.adapter.call_tool("run_task", {"task_id": cancelled.task_id})
+        original_append = self.store.append_task_event
+
+        def fail_cancelled_postflight(*args, **kwargs):
+            if len(args) >= 3 and args[2] == "policy.postflight":
+                raise RuntimeError("simulated postflight persistence failure")
+            return original_append(*args, **kwargs)
+
+        worker = ExecutionWorker(
+            self.store,
+            self.core,
+            worker_id="worker-cancel-postflight-failure",
+            pid=54327,
+        )
+        with patch.object(
+            self.store, "append_task_event", side_effect=fail_cancelled_postflight
+        ):
+            running = asyncio.create_task(worker.run_once())
+            await asyncio.wait_for(cancelled_executor.started.wait(), timeout=2)
+            await self.adapter.call_tool(
+                "cancel_task", {"task_id": cancelled.task_id}
+            )
+            result = await asyncio.wait_for(running, timeout=3)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.execution_status, ExecutionStatus.CANCELLED)
+        events = self.store.list_task_events(cancelled.task_id)
+        kinds = [event.kind for event in events]
+        self.assertNotIn("policy.postflight", kinds)
+        self.assertLess(
+            kinds.index("task.reconciliation_required"), kinds.index("task.cancelled")
+        )
+        failure = next(
+            event
+            for event in events
+            if event.kind == "policy.violation"
+            and event.payload.get("phase") == "postflight"
+        )
+        self.assertFalse(failure.payload["postflight_persisted"])
+        reconciliation = self.store.get_reconciliation_state(cancelled.task_id)
+        self.assertIsNotNone(reconciliation)
+        assert reconciliation is not None
+        self.assertTrue(reconciliation["required"])
+        self.assertFalse(reconciliation["resolved"])
+
+        following = self.core.create_task(
+            "project-cancel-postflight-failure",
+            "must not reuse any earlier baseline",
+            task_id="task-after-postflight-failure",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        self.assertIsNone(self.core._previous_continuation_baseline(following))
+        with self.assertRaises(DirtyWorkingTreeError):
+            await self.core.run_task(following.task_id)
+        self.assertEqual(len(cancelled_executor.requests), 1)
+
     async def test_h3_missing_turn_does_not_issue_an_interrupt(self) -> None:
         executor = ControlledCancellationExecutor(publish_turn=False)
         self.executor = executor
-        self.core = BridgeCore(self.store, executor)
+        self.core = self._new_core(self.store, executor)
         self.adapter = MCPAdapter(self.core, self.store)
         self.create_task("task-h3-missing-turn")
         await self.adapter.call_tool(
@@ -733,7 +972,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_h3_interrupt_failure_does_not_fake_cancelled(self) -> None:
         executor = ControlledCancellationExecutor(accept_interrupt=False)
         self.executor = executor
-        self.core = BridgeCore(self.store, executor)
+        self.core = self._new_core(self.store, executor)
         self.adapter = MCPAdapter(self.core, self.store)
         self.create_task("task-h3-failure")
         await self.adapter.call_tool("run_task", {"task_id": "task-h3-failure"})
@@ -779,7 +1018,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_h3_natural_finish_wins_before_late_interrupt(self) -> None:
         executor = NaturalFinishRaceExecutor()
         self.executor = executor
-        self.core = BridgeCore(self.store, executor)
+        self.core = self._new_core(self.store, executor)
         self.adapter = MCPAdapter(self.core, self.store)
         self.create_task("task-h3-natural-race")
         await self.adapter.call_tool("run_task", {"task_id": "task-h3-natural-race"})
@@ -826,7 +1065,7 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_h3_unconfirmed_cancelled_result_is_not_terminal_cancel(self) -> None:
         executor = UnconfirmedCancellationExecutor()
         self.executor = executor
-        self.core = BridgeCore(self.store, executor)
+        self.core = self._new_core(self.store, executor)
         self.adapter = MCPAdapter(self.core, self.store)
         self.create_task("task-h3-unconfirmed")
         await self.adapter.call_tool("run_task", {"task_id": "task-h3-unconfirmed"})
@@ -855,6 +1094,119 @@ class ExecutionWorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         kinds = [event.kind for event in self.store.list_task_events("task-h3-unconfirmed")]
         self.assertNotIn("task.cancelled", kinds)
         self.assertIn("task.cancel_interrupt_failed", kinds)
+
+    async def test_worker_continues_across_projects_under_lock_and_preserves_bytes(
+        self,
+    ) -> None:
+        def gastos_mutation(path: Path) -> None:
+            (path / "tracked.txt").write_bytes(b"GASTOS tracked\r\n")
+            (path / "scripts" / "socios" / "GASTOS.md").write_bytes(
+                b"GASTOS staged\r\n"
+            )
+            self._git(path, "add", "scripts/socios/GASTOS.md")
+            (path / "binary.bin").write_bytes(b"\x00GASTOS\xff\r\n")
+            (path / "scripts" / "socios" / "auxiliar.bin").write_bytes(
+                b"\x00auxiliar\r\n"
+            )
+
+        repo = self._configure_autonomous_repo(
+            FakeExecutor(),
+            repo_name="worker-cross-project",
+            project_id="project-gastos-worker",
+        )
+        socios = repo / "scripts" / "socios"
+        socios.mkdir(parents=True)
+        (socios / "GASTOS.md").write_bytes(b"GASTOS inicial\r\n")
+        (repo / "binary.bin").write_bytes(b"\x00inicial\xff\r\n")
+        self._git(repo, "add", "scripts/socios/GASTOS.md", "binary.bin")
+        self._git(repo, "commit", "-m", "initial auxiliary files")
+
+        self.core.executor = FakeExecutor(gastos_mutation)
+        gastos = self.core.create_task(
+            "project-gastos-worker",
+            "finish the Gastos task",
+            task_id="task-gastos-worker",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        await self.adapter.call_tool("run_task", {"task_id": gastos.task_id})
+        first_result = await ExecutionWorker(
+            self.store, self.core, worker_id="worker-gastos", pid=54327
+        ).run_once()
+        self.assertIsNotNone(first_result)
+        assert first_result is not None
+        self.assertEqual(first_result.execution_status, ExecutionStatus.FINISHED)
+
+        status = self._git(
+            repo, "status", "--porcelain", "--untracked-files=all"
+        ).splitlines()
+        self.assertIn(" M tracked.txt", status)
+        self.assertIn("M  scripts/socios/GASTOS.md", status)
+        self.assertIn("M binary.bin", status)
+        self.assertIn("?? scripts/socios/auxiliar.bin", status)
+        before_g2 = {
+            path.relative_to(repo).as_posix(): path.read_bytes()
+            for path in repo.rglob("*")
+            if path.is_file() and ".git" not in path.relative_to(repo).parts
+        }
+
+        project_g2 = "project-g2-worker"
+        self.core.create_project("G2", str(repo / "."), project_id=project_g2)
+        g2_executor = FakeExecutor()
+        self.core.executor = g2_executor
+        self.adapter = MCPAdapter(self.core, self.store)
+        g2 = self.core.create_task(
+            project_g2,
+            "continue the same repository from G2",
+            task_id="task-g2-worker",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        await self.adapter.call_tool("run_task", {"task_id": g2.task_id})
+        original_selector = self.core._previous_continuation_baseline
+
+        def assert_selection_holds_repository_lock(task):
+            probe = RepositoryLock(
+                repo, lock_directory=self.core.repository_lock_directory
+            )
+            try:
+                with self.assertRaises(RepositoryBusyError):
+                    probe.acquire()
+            finally:
+                probe.release()
+            return original_selector(task)
+
+        with patch.object(
+            self.core,
+            "_previous_continuation_baseline",
+            side_effect=assert_selection_holds_repository_lock,
+        ):
+            second_result = await ExecutionWorker(
+                self.store, self.core, worker_id="worker-g2", pid=54328
+            ).run_once()
+
+        self.assertIsNotNone(second_result)
+        assert second_result is not None
+        self.assertEqual(second_result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(g2_executor.requests), 1)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(g2.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
+        self.assertEqual(checkpoint.payload["previous_task_id"], gastos.task_id)
+        self.assertEqual(
+            {
+                path.relative_to(repo).as_posix(): path.read_bytes()
+                for path in repo.rglob("*")
+                if path.is_file() and ".git" not in path.relative_to(repo).parts
+            },
+            before_g2,
+        )
+        reacquire = RepositoryLock(
+            repo, lock_directory=self.core.repository_lock_directory
+        )
+        reacquire.acquire()
+        reacquire.release()
 
     @staticmethod
     def _git(repo: Path, *args: str) -> str:

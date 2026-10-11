@@ -275,6 +275,7 @@ RECONCILIATION_RESOLVED_EVENT = "task.reconciliation_resolved"
 RECONCILIATION_BASELINE_ADOPTED_EVENT = "reconciliation.baseline_adopted"
 ADOPTION_MODE_LEGACY = "legacy"
 ADOPTION_MODE_DIRECT = "direct"
+ADOPTION_MODE_REBASE = "rebase"
 
 CHECKPOINT_STARTED_EVENT = "checkpoint.commit.started"
 CHECKPOINT_REF_UPDATED_EVENT = "checkpoint.commit.ref_updated"
@@ -1821,6 +1822,7 @@ class SQLiteBridgeStore:
         if not isinstance(adoption_mode, str) or adoption_mode not in {
             ADOPTION_MODE_LEGACY,
             ADOPTION_MODE_DIRECT,
+            ADOPTION_MODE_REBASE,
         }:
             raise ValueError("adoption mode is unsupported")
         if payload_mode != adoption_mode:
@@ -1829,7 +1831,7 @@ class SQLiteBridgeStore:
             if not isinstance(inspection_task_id, str) or not inspection_task_id.strip():
                 raise ValueError("inspection_task_id must be non-empty text")
         elif inspection_task_id is not None:
-            raise ValueError("direct adoption cannot include inspection_task_id")
+            raise ValueError("direct or rebase adoption cannot include inspection_task_id")
         if (
             isinstance(source_high_water, bool)
             or not isinstance(source_high_water, int)
@@ -1839,8 +1841,8 @@ class SQLiteBridgeStore:
             or inspection_high_water < 0
         ):
             raise ValueError("event high-water marks must be non-negative integers")
-        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_high_water != 0:
-            raise ValueError("direct adoption inspection high-water must be zero")
+        if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE} and inspection_high_water != 0:
+            raise ValueError("direct or rebase inspection high-water must be zero")
 
         connection = self._require_connection()
         try:
@@ -1932,10 +1934,10 @@ class SQLiteBridgeStore:
                 "inspection_task_id"
             ) != inspection_task_id:
                 raise TaskStateError("adoption inspection_task_id differs")
-            if adoption_mode == ADOPTION_MODE_DIRECT and payload.get(
+            if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE} and payload.get(
                 "inspection_task_id"
             ) is not None:
-                raise TaskStateError("direct adoption inspection_task_id must be null")
+                raise TaskStateError("direct or rebase inspection_task_id must be null")
             if payload.get("project_id") != source_task.project_id:
                 raise TaskStateError("adoption project_id differs")
 
@@ -2009,12 +2011,12 @@ class SQLiteBridgeStore:
                     raise TaskStateError(
                         "inspection terminal evidence has a policy violation"
                     )
-            if adoption_mode == ADOPTION_MODE_DIRECT and any(
+            if adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE} and any(
                 payload.get(key) is not None
                 for key in ("inspection_terminal_event_id",)
             ):
                 raise TaskStateError(
-                    "direct adoption inspection evidence must be absent"
+                    "direct or rebase inspection evidence must be absent"
                 )
             source_high_water_payload = payload.get("source_high_water_event_id")
             inspection_high_water_payload = payload.get("inspection_high_water_event_id")
@@ -2033,12 +2035,50 @@ class SQLiteBridgeStore:
                     or inspection_high_water_payload < (inspection_terminal.event_id or 0)
                 ):
                     raise TaskStateError("adoption high-water provenance is invalid")
-            elif (
+            elif adoption_mode in {ADOPTION_MODE_DIRECT, ADOPTION_MODE_REBASE} and (
                 isinstance(inspection_high_water_payload, bool)
                 or not isinstance(inspection_high_water_payload, int)
                 or inspection_high_water_payload != 0
             ):
-                raise TaskStateError("direct adoption inspection high-water must be zero")
+                raise TaskStateError("direct or rebase inspection high-water must be zero")
+            if adoption_mode == ADOPTION_MODE_REBASE:
+                source_payload = source_postflight.payload
+                snapshot = payload.get("snapshot")
+                if (
+                    not isinstance(source_payload, Mapping)
+                    or source_payload.get("policy_violation") is not False
+                    or payload.get("source_baseline_branch")
+                    != source_payload.get("baseline_branch")
+                    or payload.get("source_baseline_head")
+                    != source_payload.get("baseline_head")
+                    or not isinstance(snapshot, Mapping)
+                    or payload.get("target_branch")
+                    != snapshot.get("baseline_branch")
+                    or payload.get("target_head") != snapshot.get("baseline_head")
+                    or snapshot.get("policy_violation") is not False
+                    or snapshot.get("final_branch") != payload.get("target_branch")
+                    or snapshot.get("final_head") != payload.get("target_head")
+                    or snapshot.get("working_tree_fingerprint_version") != 1
+                    or not isinstance(snapshot.get("working_tree_fingerprint"), str)
+                    or payload.get("target_branch")
+                    != source_payload.get("baseline_branch")
+                    or payload.get("target_head") == source_payload.get("baseline_head")
+                    or payload.get("human_approval") is not True
+                    or payload.get("approval_fingerprint")
+                    != payload.get("fingerprint")
+                    or not isinstance(payload.get("instance_scope"), str)
+                    or not payload.get("instance_scope")
+                ):
+                    raise TaskStateError("rebase adoption evidence is invalid")
+                for key in (
+                    "repo_path",
+                    "baseline_branch",
+                    "baseline_head",
+                    "final_branch",
+                    "final_head",
+                ):
+                    if payload.get(key) != snapshot.get(key):
+                        raise TaskStateError("rebase adoption summary differs from snapshot")
             if any(
                 event.source == "bridge" and event.kind == "policy.violation"
                 for event in source_events
@@ -2412,6 +2452,7 @@ __all__ = [
     "D3_R2_CONTRACT",
     "EXECUTION_CLAIM_EVENT",
     "EXECUTION_REQUEST_EVENT",
+    "ADOPTION_MODE_REBASE",
     "RECONCILIATION_BASELINE_ADOPTED_EVENT",
     "RECONCILIATION_REQUIRED_EVENT",
     "RECONCILIATION_RESOLVED_EVENT",

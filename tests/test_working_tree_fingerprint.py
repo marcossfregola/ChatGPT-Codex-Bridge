@@ -44,6 +44,7 @@ def make_repo(parent: Path, name: str = "workspace") -> Path:
     git(repo, "init")
     git(repo, "config", "user.name", "Bridge Fingerprint Test")
     git(repo, "config", "user.email", "fingerprint-test@example.invalid")
+    git(repo, "config", "chatgptcodexbridge.writerInstanceId", "fingerprint-test")
     git(repo, "branch", "-M", "main")
     (repo / "app.txt").write_text("ORIGINAL\n", encoding="utf-8")
     (repo / "binary.bin").write_bytes(b"BASE\x00LINE\n")
@@ -100,6 +101,22 @@ class WorkingTreeFingerprintTests(unittest.TestCase):
         self.assertNotEqual(
             first["working_tree_fingerprint"], second["working_tree_fingerprint"]
         )
+
+    def test_unicode_untracked_path_is_fingerprinted_without_c_quoting(self) -> None:
+        repo = make_repo(self.root)
+        checkpoint = git_preflight(repo)
+        path = "Metodología-fuente.txt"
+        content = "EVIDENCIA UTF-8\n".encode("utf-8")
+        (repo / path).write_bytes(content)
+
+        payload = postflight_payload(git_postflight(checkpoint))
+
+        self.assertIn(path, payload["untracked_files"])
+        fingerprint = next(
+            item for item in payload["content_fingerprints"] if item["path"] == path
+        )
+        self.assertEqual(fingerprint["state"], "untracked")
+        self.assertRegex(fingerprint["sha256"], r"^[0-9a-f]{64}$")
 
     def test_binary_content_difference_changes_fingerprint(self) -> None:
         repo = make_repo(self.root)
@@ -240,7 +257,12 @@ class FingerprintedContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.tempdir.cleanup()
 
     def create_core(self, repo: Path, executor) -> BridgeCore:
-        core = BridgeCore(self.store, executor)
+        core = BridgeCore(
+            self.store,
+            executor,
+            instance_id="fingerprint-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         core.create_project("Fingerprint", str(repo), project_id="project-fingerprint")
         return core
 
