@@ -607,3 +607,14 @@ Cuando se cierre un incidente nuevo, actualizar este runbook con:
 - acciones que no deben repetirse.
 
 El objetivo es que el próximo incidente empiece por evidencia y procedimiento conocido, no por volver a descubrir la historia del Bridge.
+
+## 18. Recuperación `rebase` y runtime NOTEBOOK-B (2026-10-11)
+
+**Dos clases de incidente distintas:**
+
+- `ContinuationBaselineError` por avance externo de Git: comprobar instancia, Project, Task fuente `FINISHED`, postflight válido, rama, avance fast-forward, estado completo de tracked/untracked y ausencia de tareas en curso. No reiniciar ni resetear SQLite como remedio. Con schema MCP actualizado, solicitar primero `adopt_reconciled_continuation_baseline(source_task_id="<TASK_VALIDADA>", mode="rebase")` **sin aprobación**, revisar la propuesta y su `proposal_fingerprint` con el propietario. Sólo después de autorización humana específica enviar otra llamada con el mismo origen, `approved_fingerprint="<FINGERPRINT_DEVUELTO>"` y `human_approval=true`. Comprobar adopción/evento durable y autorizar por separado una Task mínima de comprobación. Si cambia Git o la propuesta es incompleta, detenerse. Procedimiento y evidencia originales: [INCIDENT_NOTEBOOK_CONTINUATION_BASELINE_2026-10-10.md](INCIDENT_NOTEBOOK_CONTINUATION_BASELINE_2026-10-10.md).
+- Worker/túnel de B caído o parcialmente iniciado: utilizar exclusivamente los accesos directos **Bridge Secundario - STATUS/START/STOP** y verificar `INSTANCE=NOTEBOOK-B`. STATUS es de sólo lectura. STOP solicita cierre ordenado del worker B y requiere verificar visualmente PID, ejecutable y línea de comandos del túnel B en Administrador de tareas antes de finalizar **únicamente** ese proceso; no utilizar cierre por nombre, CIM ni `taskkill /T /F` indiscriminado. Confirmar con STATUS `NO_RUNNING` o `NO_RUNNING_STALE_PID`, luego START y STATUS con salud/readiness satisfactorias. El PID sidecar obsoleto tras la salida normal no implica un worker vivo. Si la identidad es ambigua, detenerse, no tocar Principal.
+
+Si ChatGPT ve la firma MCP antigua, utilizar **Configuración → Complementos → Puente Secundario → Actualizar herramientas** y comprobar en un chat nuevo que aparecen `approved_fingerprint` y `human_approval`; no reimplementar ni reiniciar indefinidamente por metadata stale. El perfil efectivo del candidato debe tener extensión `.yaml`, no `.yaml.proposed`.
+
+Detalle de despliegue, evidencia y límites: [NOTEBOOK_B_HOTFIX_2026-10-11.md](NOTEBOOK_B_HOTFIX_2026-10-11.md). El runbook del Principal sigue siendo histórico; no asumir que su STOP es igual al de B.

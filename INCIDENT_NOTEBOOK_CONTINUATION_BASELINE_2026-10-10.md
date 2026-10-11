@@ -52,3 +52,9 @@ El launcher A `%LOCALAPPDATA%\ChatGPTCodexBridge\scripts\desktop_a_lifecycle.ps1
 - Prueba posterior real: `2634171` checkpoint aceptado; `2634172` dispatch; `2634174` thread; `2634180` turn; `2634294` comandos Git exit 0; `2634428` postflight PASS sin archivos cambiados, fingerprints de 17 untracked y `reconciliation_required=false`; cierre `2634429` FINISHED. No commit, push, modificaciones a fuentes de Saniferr ni intervención en NOTEBOOK-B.
 
 **Alcance de la evidencia:** confirma la recuperación efectiva de ese proyecto/instancia/estado, no certifica todos los escenarios futuros ni implica que el hotfix ya esté incorporado al `main` del repositorio.
+
+## Despliegue posterior — NOTEBOOK-B (2026-10-11)
+
+El cierre anterior sigue describiendo exclusivamente la recuperación real en NOTEBOOK. Con posterioridad se desplegó en el Puente Secundario una copia aislada de la release aprobada y se homologaron la firma MCP nueva, conectividad y ciclo operativo STOP → START. Consultar [NOTEBOOK_B_HOTFIX_2026-10-11.md](NOTEBOOK_B_HOTFIX_2026-10-11.md) para evidencia y restricciones específicas de B.
+
+No se realizó una adopción `rebase` real en B. Este despliegue local no implica integración del código del hotfix en `main` del repositorio.
