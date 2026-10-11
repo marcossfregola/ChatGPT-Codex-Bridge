@@ -20,7 +20,10 @@ from chatgpt_codex_bridge.domain.models import (  # noqa: E402
     TaskStateError,
 )
 from chatgpt_codex_bridge.executors.base import ExecutionResult  # noqa: E402
-from chatgpt_codex_bridge.persistence.sqlite_store import SQLiteBridgeStore  # noqa: E402
+from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
+    EXECUTOR_DISPATCH_STARTED_EVENT,
+    SQLiteBridgeStore,
+)
 from chatgpt_codex_bridge.policy import (  # noqa: E402
     ContinuationBaselineError,
     DirtyWorkingTreeError,
@@ -44,6 +47,7 @@ def make_repo(parent: Path, name: str = "workspace") -> Path:
     git(repo, "init")
     git(repo, "config", "user.name", "Bridge Continuation Test")
     git(repo, "config", "user.email", "continuation-test@example.invalid")
+    git(repo, "config", "chatgptcodexbridge.writerInstanceId", "continuation-test")
     git(repo, "branch", "-M", "main")
     (repo / "app.txt").write_text("ORIGINAL\n", encoding="utf-8")
     (repo / "keep.txt").write_text("KEEP\n", encoding="utf-8")
@@ -82,7 +86,12 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         self.tempdir.cleanup()
 
     def new_core(self, repo: Path, executor) -> BridgeCore:
-        core = BridgeCore(self.store, executor)
+        core = BridgeCore(
+            self.store,
+            executor,
+            instance_id="continuation-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         core.create_project("Continuation", str(repo), project_id="project-cont")
         return core
 
@@ -103,6 +112,46 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
         current = self.create_task(core, "task-current")
         return repo, executor, core, previous, current
+
+    async def seed_cross_project_baseline(self, *, name: str = "gastos-g2"):
+        def gastos_mutation(path: Path) -> None:
+            (path / "app.txt").write_bytes(b"GASTOS app\r\n")
+            (path / "keep.txt").write_bytes(b"GASTOS staged\r\n")
+            git(path, "add", "keep.txt")
+            (path / "binary.bin").write_bytes(b"\x00GASTOS\xff\r\n")
+            auxiliary = path / "scripts" / "socios" / "auxiliar.md"
+            auxiliary.parent.mkdir(parents=True)
+            auxiliary.write_bytes(b"Auxiliar GASTOS\r\n")
+
+        repo = make_repo(self.root, name)
+        executor = SequenceExecutor(gastos_mutation, None, None, None)
+        core = BridgeCore(
+            self.store,
+            executor,
+            instance_id="continuation-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
+        core.create_project("Gastos", str(repo), project_id=f"project-gastos-{name}")
+        previous = core.create_task(
+            f"project-gastos-{name}",
+            "produce the Gastos working-tree result",
+            task_id=f"task-gastos-{name}",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        result = await core.run_task(previous.task_id)
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        core.create_project(
+            "G2", str(repo / "."), project_id=f"project-g2-{name}"
+        )
+        return repo, executor, core, previous, f"project-g2-{name}"
+
+    @staticmethod
+    def workspace_bytes(repo: Path) -> dict[str, bytes]:
+        return {
+            path.relative_to(repo).as_posix(): path.read_bytes()
+            for path in repo.rglob("*")
+            if path.is_file() and ".git" not in path.relative_to(repo).parts
+        }
 
     def assert_preflight_terminal(self, task_id: str) -> None:
         task = self.store.get_task(task_id)
@@ -209,7 +258,12 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(git(repo, "status", "--porcelain"), "")
 
         current_executor = SequenceExecutor()
-        current_core = BridgeCore(self.store, current_executor)
+        current_core = BridgeCore(
+            self.store,
+            current_executor,
+            instance_id="continuation-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         current = self.create_task(current_core, "task-current")
         result = await current_core.run_task(current.task_id)
 
@@ -567,17 +621,21 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(executor.requests), 1)
         self.assert_preflight_terminal(current.task_id)
 
-    async def test_different_project_postflight_is_not_a_baseline(self) -> None:
+    async def test_same_remote_on_different_physical_repositories_shares_no_baseline(
+        self,
+    ) -> None:
         def mutate(path: Path) -> None:
             (path / "untracked.txt").write_text("PROJECT_A\n", encoding="utf-8")
 
         repo = make_repo(self.root, "workspace-a")
+        git(repo, "remote", "add", "origin", "https://example.invalid/same.git")
         executor = SequenceExecutor(mutate)
         core = self.new_core(repo, executor)
         previous = self.create_task(core, "task-project-a")
         await core.run_task(previous.task_id)
 
         other_repo = make_repo(self.root, "workspace-b")
+        git(other_repo, "remote", "add", "origin", "https://example.invalid/same.git")
         core.create_project("Other", str(other_repo), project_id="project-other")
         (other_repo / "app.txt").write_text("EXTERNAL\n", encoding="utf-8")
         current = core.create_task(
@@ -591,6 +649,245 @@ class ContinuationBaselineTests(unittest.IsolatedAsyncioTestCase):
             await core.run_task(current.task_id)
         self.assertEqual(len(executor.requests), 1)
         self.assert_preflight_terminal(current.task_id)
+
+    async def test_gastos_to_g2_same_checkout_and_sqlite_preserves_exact_bytes(
+        self,
+    ) -> None:
+        repo, executor, core, previous, project_g2 = (
+            await self.seed_cross_project_baseline()
+        )
+        status = git(
+            repo, "status", "--porcelain", "--untracked-files=all"
+        ).splitlines()
+        # git() strips leading whitespace from stdout, so the first porcelain
+        # row loses its unstaged-column prefix; the staged row retains both.
+        self.assertIn("M app.txt", status)
+        self.assertIn("M  keep.txt", status)
+        self.assertIn(
+            "?? scripts/socios/auxiliar.md",
+            status,
+        )
+        before_g2 = self.workspace_bytes(repo)
+
+        queued = core.create_task(
+            project_g2,
+            "remain queued without execution",
+            task_id="task-g2-queued",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        current = core.create_task(
+            project_g2,
+            "continue Gastos work in G2",
+            task_id="task-g2-current",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        result = await core.run_task(current.task_id)
+
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(core.store.get_task(queued.task_id).execution_status,
+                         ExecutionStatus.QUEUED)
+        self.assertIs(core.store, self.store)
+        self.assertEqual(len(executor.requests), 2)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["baseline_kind"], "continuation")
+        self.assertEqual(checkpoint.payload["previous_task_id"], previous.task_id)
+        self.assertEqual(self.workspace_bytes(repo), before_g2)
+
+    async def test_cross_project_single_byte_change_rejects_before_executor(self) -> None:
+        repo, executor, core, _, project_g2 = (
+            await self.seed_cross_project_baseline(name="gastos-g2-one-byte")
+        )
+        auxiliary = repo / "scripts" / "socios" / "auxiliar.md"
+        original = auxiliary.read_bytes()
+        auxiliary.write_bytes(original[:-2] + b"X\r\n")
+        current = core.create_task(
+            project_g2,
+            "must reject a one-byte external change",
+            task_id="task-g2-one-byte",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+
+        with self.assertRaises(ContinuationBaselineError):
+            await core.run_task(current.task_id)
+
+        self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(current.task_id)
+
+    async def test_cross_project_failed_or_cancelled_later_task_blocks_baseline(
+        self,
+    ) -> None:
+        for suffix, terminal_status, terminal_kind, include_postflight in (
+            ("failed-started", ExecutionStatus.FAILED, "task.failed", False),
+            ("cancelled-with-postflight", ExecutionStatus.CANCELLED, "task.cancelled", True),
+        ):
+            with self.subTest(suffix=suffix):
+                repo, executor, core, previous, project_g2 = (
+                    await self.seed_cross_project_baseline(name=f"gastos-g2-{suffix}")
+                )
+                later = core.create_task(
+                    project_g2,
+                    "later execution must block the prior baseline",
+                    task_id=f"task-g2-{suffix}",
+                    mode=TaskMode.AUTONOMOUS_WRITE,
+                )
+                self.store.transition_task_running(
+                    later.task_id, project_id=project_g2
+                )
+                if suffix == "failed-started":
+                    # A preflight marker cannot erase later evidence that the
+                    # task crossed the executor dispatch boundary.
+                    self.store.append_task_event(
+                        later.task_id,
+                        "bridge",
+                        "policy.violation",
+                        {"phase": "preflight", "policy_violation": True},
+                    )
+                    self.store.append_task_event(
+                        later.task_id,
+                        "bridge",
+                        EXECUTOR_DISPATCH_STARTED_EVENT,
+                        {"task_id": later.task_id, "executor": "test"},
+                    )
+                if include_postflight:
+                    prior_postflight = next(
+                        event
+                        for event in self.store.list_task_events(previous.task_id)
+                        if event.kind == "policy.postflight"
+                    )
+                    self.store.append_task_event(
+                        later.task_id,
+                        "bridge",
+                        "policy.postflight",
+                        dict(prior_postflight.payload),
+                    )
+                self.store.transition_task_terminal(
+                    later.task_id,
+                    execution_status=terminal_status,
+                    event_kind=terminal_kind,
+                    payload={"error_type": "TestFailure", "message": suffix},
+                )
+                current = core.create_task(
+                    f"project-gastos-gastos-g2-{suffix}",
+                    "must not fall back to an older baseline",
+                    task_id=f"task-gastos-after-{suffix}",
+                    mode=TaskMode.AUTONOMOUS_WRITE,
+                )
+
+                with self.assertRaises(DirtyWorkingTreeError):
+                    await core.run_task(current.task_id)
+                self.assertEqual(len(executor.requests), 1)
+                self.assert_preflight_terminal(current.task_id)
+
+    async def test_cross_project_invalid_and_incomplete_postflight_block_baseline(
+        self,
+    ) -> None:
+        for suffix, expected_error in (
+            ("invalid", ContinuationBaselineError),
+            ("incomplete", ContinuationBaselineError),
+            ("violation", DirtyWorkingTreeError),
+        ):
+            with self.subTest(suffix=suffix):
+                repo, executor, core, previous, project_g2 = (
+                    await self.seed_cross_project_baseline(
+                        name=f"gastos-g2-postflight-{suffix}"
+                    )
+                )
+                later = core.create_task(
+                    project_g2,
+                    "later postflight must block the prior baseline",
+                    task_id=f"task-g2-postflight-{suffix}",
+                    mode=TaskMode.AUTONOMOUS_WRITE,
+                )
+                self.store.transition_task_running(
+                    later.task_id, project_id=project_g2
+                )
+                prior_postflight = next(
+                    event
+                    for event in self.store.list_task_events(previous.task_id)
+                    if event.kind == "policy.postflight"
+                )
+                payload = dict(prior_postflight.payload)
+                if suffix == "invalid":
+                    payload["content_fingerprints"] = [
+                        {"path": "app.txt", "sha256": "not-a-sha256"}
+                    ]
+                elif suffix == "violation":
+                    payload["policy_violation"] = True
+                    self.store.append_task_event(
+                        later.task_id,
+                        "bridge",
+                        "policy.violation",
+                        {"phase": "postflight", "policy_violation": True},
+                    )
+                else:
+                    payload.pop("content_fingerprints", None)
+                self.store.append_task_event(
+                    later.task_id, "bridge", "policy.postflight", payload
+                )
+                self.store.transition_task_terminal(
+                    later.task_id,
+                    execution_status=ExecutionStatus.FINISHED,
+                    event_kind="task.finished",
+                    payload={"final_response": "test"},
+                )
+                current = core.create_task(
+                    f"project-gastos-gastos-g2-postflight-{suffix}",
+                    "must not use an earlier valid baseline",
+                    task_id=f"task-gastos-after-postflight-{suffix}",
+                    mode=TaskMode.AUTONOMOUS_WRITE,
+                )
+
+                with self.assertRaises(expected_error):
+                    await core.run_task(current.task_id)
+                self.assertEqual(len(executor.requests), 1)
+                self.assert_preflight_terminal(current.task_id)
+
+    async def test_cross_project_strict_preflight_failure_does_not_block_baseline(
+        self,
+    ) -> None:
+        repo, executor, core, previous, project_g2 = (
+            await self.seed_cross_project_baseline(name="gastos-g2-preflight")
+        )
+        auxiliary = repo / "scripts" / "socios" / "auxiliar.md"
+        original = auxiliary.read_bytes()
+        auxiliary.write_bytes(original[:-2] + b"X\r\n")
+        failed = core.create_task(
+            project_g2,
+            "fail strictly during preflight",
+            task_id="task-g2-preflight-failed",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        with self.assertRaises(ContinuationBaselineError):
+            await core.run_task(failed.task_id)
+        self.assertEqual(len(executor.requests), 1)
+        self.assert_preflight_terminal(failed.task_id)
+        failed_events = self.store.list_task_events(failed.task_id)
+        self.assertFalse(
+            any(event.kind in {"task.started", "task.execution_claimed"}
+                for event in failed_events)
+        )
+        auxiliary.write_bytes(original)
+
+        current = core.create_task(
+            project_g2,
+            "continue the repaired exact prior baseline",
+            task_id="task-g2-after-preflight-failure",
+            mode=TaskMode.AUTONOMOUS_WRITE,
+        )
+        result = await core.run_task(current.task_id)
+
+        self.assertEqual(result.execution_status, ExecutionStatus.FINISHED)
+        self.assertEqual(len(executor.requests), 2)
+        checkpoint = next(
+            event
+            for event in self.store.list_task_events(current.task_id)
+            if event.kind == "policy.git_checkpoint"
+        )
+        self.assertEqual(checkpoint.payload["previous_task_id"], previous.task_id)
 
     async def test_policy_violation_postflight_is_not_a_baseline(self) -> None:
         def mutate(path: Path) -> None:

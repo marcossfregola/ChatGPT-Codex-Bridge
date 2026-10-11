@@ -25,11 +25,13 @@ from chatgpt_codex_bridge.persistence.sqlite_store import (  # noqa: E402
 )
 from chatgpt_codex_bridge.policy import (  # noqa: E402
     ContinuationBaselineError,
+    PolicyError,
     checkpoint_payload,
     git_postflight,
     git_preflight,
     postflight_payload,
 )
+from chatgpt_codex_bridge.repository_access import RepositoryLock  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> str:
@@ -49,6 +51,7 @@ def make_repo(parent: Path, name: str = "workspace") -> Path:
     git(repo, "init")
     git(repo, "config", "user.name", "Bridge Adoption Test")
     git(repo, "config", "user.email", "adoption-test@example.invalid")
+    git(repo, "config", "chatgptcodexbridge.writerInstanceId", "adoption-test")
     git(repo, "branch", "-M", "main")
     (repo / "app.txt").write_text("ORIGINAL\n", encoding="utf-8")
     git(repo, "add", "app.txt")
@@ -75,11 +78,19 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
         self.store = SQLiteBridgeStore(self.root / "bridge.sqlite3")
-        self.core = BridgeCore(self.store)
+        self.core = self._new_core()
 
     def tearDown(self) -> None:
         self.store.close()
         self.tempdir.cleanup()
+
+    def _new_core(self, executor=None) -> BridgeCore:
+        return BridgeCore(
+            self.store,
+            executor,
+            instance_id="adoption-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
 
     def _create_project(self, repo: Path, project_id: str = "project-adoption") -> None:
         self.core.create_project("Adoption", str(repo), project_id=project_id)
@@ -218,6 +229,44 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(event.payload["fingerprint"], event.payload["evidence_fingerprint"])
 
+    def test_adoption_from_non_owner_is_rejected_without_effects(self) -> None:
+        repo, source, inspection, _, _ = self._seed_source(truncated=False)
+        original_head = git(repo, "rev-parse", "HEAD")
+        original_status = git(repo, "status", "--porcelain")
+        original_bytes = (repo / "app.txt").read_bytes()
+        secondary = BridgeCore(
+            self.store,
+            instance_id="secondary-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
+
+        with self.assertRaises(PolicyError):
+            secondary.adopt_reconciled_continuation_baseline(
+                source.task_id, inspection.task_id
+            )
+
+        self.assertEqual(self._adoption_events(source.task_id), [])
+        self.assertEqual(git(repo, "rev-parse", "HEAD"), original_head)
+        self.assertEqual(git(repo, "status", "--porcelain"), original_status)
+        self.assertEqual((repo / "app.txt").read_bytes(), original_bytes)
+
+    def test_adoption_is_rejected_while_repository_writer_lock_is_held(self) -> None:
+        repo, source, inspection, _, _ = self._seed_source(truncated=False)
+        original_head = git(repo, "rev-parse", "HEAD")
+        original_status = git(repo, "status", "--porcelain")
+        original_bytes = (repo / "app.txt").read_bytes()
+
+        with RepositoryLock(repo, lock_directory=str(self.root / "locks")):
+            with self.assertRaises(PolicyError):
+                self.core.adopt_reconciled_continuation_baseline(
+                    source.task_id, inspection.task_id
+                )
+
+        self.assertEqual(self._adoption_events(source.task_id), [])
+        self.assertEqual(git(repo, "rev-parse", "HEAD"), original_head)
+        self.assertEqual(git(repo, "status", "--porcelain"), original_status)
+        self.assertEqual((repo / "app.txt").read_bytes(), original_bytes)
+
     def test_direct_adoption_round_trips_all_provenance(self) -> None:
         _, source, _, _, _ = self._seed_source(
             truncated=False, create_inspection=False
@@ -264,7 +313,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         executor = FinishedExecutor()
-        continuation_core = BridgeCore(self.store, executor)
+        continuation_core = self._new_core(executor)
         current = continuation_core.create_task(
             "project-adoption",
             "continue after direct adoption",
@@ -299,7 +348,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         self.store.connection.commit()
 
         executor = FinishedExecutor()
-        continuation_core = BridgeCore(self.store, executor)
+        continuation_core = self._new_core(executor)
         current = continuation_core.create_task(
             "project-adoption",
             "continue from a legacy persisted adoption",
@@ -501,7 +550,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.payload["snapshot"]["final_branch"], "main")
 
         executor = FinishedExecutor()
-        continuation_core = BridgeCore(self.store, executor)
+        continuation_core = self._new_core(executor)
         current = continuation_core.create_task(
             "project-adoption",
             "continue after explicit adoption",
@@ -530,7 +579,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         executor = FinishedExecutor()
-        continuation_core = BridgeCore(self.store, executor)
+        continuation_core = self._new_core(executor)
         current = continuation_core.create_task(
             "project-adoption",
             "continue through the persistent worker",
@@ -589,7 +638,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         executor = FinishedExecutor()
-        continuation_core = BridgeCore(self.store, executor)
+        continuation_core = self._new_core(executor)
         adapter = MCPAdapter(continuation_core, self.store)
         worker = ExecutionWorker(
             self.store,
@@ -657,7 +706,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.payload["snapshot"]["diff"].endswith("[TRUNCATED]"))
 
         executor = FinishedExecutor()
-        continuation_core = BridgeCore(self.store, executor)
+        continuation_core = self._new_core(executor)
         current = continuation_core.create_task(
             "project-adoption",
             "continue with a large adopted worktree",
@@ -731,7 +780,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.store.connection.commit()
         executor = FinishedExecutor()
-        current_core = BridgeCore(self.store, executor)
+        current_core = self._new_core(executor)
         current = current_core.create_task(
             "project-adoption",
             "must not silently fall back",
@@ -833,7 +882,7 @@ class ReconciliationAdoptionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         executor = FinishedExecutor()
-        current_core = BridgeCore(self.store, executor)
+        current_core = self._new_core(executor)
         current = current_core.create_task(
             "project-adoption",
             "must not use older baseline",

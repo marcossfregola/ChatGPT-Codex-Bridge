@@ -13,6 +13,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .core import BridgeCore
+from .repository_access import process_instance_id
 from .mcp_adapter import MCPAdapter, MCPToolError
 from .persistence.sqlite_store import SQLiteBridgeStore
 from .single_instance import (
@@ -239,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
                 # The MCP child owns only the request/dispatch boundary.  A
                 # separate persistent execution worker owns Codex processes
                 # and performs recovery after acquiring its own lock.
-                core = BridgeCore(store)
+                core = BridgeCore(store, instance_id=process_instance_id())
                 adapter = MCPAdapter(core, store)
                 build_server(adapter).run(transport="stdio")
                 return 0

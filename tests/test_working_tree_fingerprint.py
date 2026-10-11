@@ -44,6 +44,7 @@ def make_repo(parent: Path, name: str = "workspace") -> Path:
     git(repo, "init")
     git(repo, "config", "user.name", "Bridge Fingerprint Test")
     git(repo, "config", "user.email", "fingerprint-test@example.invalid")
+    git(repo, "config", "chatgptcodexbridge.writerInstanceId", "fingerprint-test")
     git(repo, "branch", "-M", "main")
     (repo / "app.txt").write_text("ORIGINAL\n", encoding="utf-8")
     (repo / "binary.bin").write_bytes(b"BASE\x00LINE\n")
@@ -240,7 +241,12 @@ class FingerprintedContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.tempdir.cleanup()
 
     def create_core(self, repo: Path, executor) -> BridgeCore:
-        core = BridgeCore(self.store, executor)
+        core = BridgeCore(
+            self.store,
+            executor,
+            instance_id="fingerprint-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         core.create_project("Fingerprint", str(repo), project_id="project-fingerprint")
         return core
 

@@ -52,6 +52,7 @@ def make_git_repo(parent: Path, name: str = "workspace") -> Path:
     git(repo, "init")
     git(repo, "config", "user.name", "Bridge Test")
     git(repo, "config", "user.email", "bridge-test@example.invalid")
+    git(repo, "config", "chatgptcodexbridge.writerInstanceId", "checkpoint-test")
     git(repo, "branch", "-M", "main")
     (repo / "tracked.txt").write_text("initial\n", encoding="utf-8", newline="")
     git(repo, "add", "tracked.txt")
@@ -98,7 +99,12 @@ class CheckpointCommitTests(unittest.TestCase):
     ):
         repo = make_git_repo(self.root, repo_name)
         executor = FinishedExecutor(mutation)
-        core = BridgeCore(self.store, executor)
+        core = BridgeCore(
+            self.store,
+            executor,
+            instance_id="checkpoint-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         core.create_project("Project", str(repo), project_id=project_id)
         task = core.create_task(
             project_id,
@@ -474,7 +480,12 @@ class CheckpointCommitTests(unittest.TestCase):
 
     def test_34_d2_cont_correction_then_checkpoint(self) -> None:
         repo = make_git_repo(self.root)
-        core = BridgeCore(self.store, FinishedExecutor(lambda path: (path / "tracked.txt").write_text("A\n", encoding="utf-8", newline="")))
+        core = BridgeCore(
+            self.store,
+            FinishedExecutor(lambda path: (path / "tracked.txt").write_text("A\n", encoding="utf-8", newline="")),
+            instance_id="checkpoint-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         core.create_project("Project", str(repo), project_id="project-checkpoint")
         first = core.create_task("project-checkpoint", "A", task_id="task-a", mode=TaskMode.AUTONOMOUS_WRITE)
         asyncio.run(core.run_task(first.task_id))
@@ -488,7 +499,12 @@ class CheckpointCommitTests(unittest.TestCase):
 
     def test_35_a_b_c_checkpoint_chain(self) -> None:
         repo = make_git_repo(self.root)
-        core = BridgeCore(self.store, FinishedExecutor(lambda path: (path / "tracked.txt").write_text("A\n", encoding="utf-8", newline="")))
+        core = BridgeCore(
+            self.store,
+            FinishedExecutor(lambda path: (path / "tracked.txt").write_text("A\n", encoding="utf-8", newline="")),
+            instance_id="checkpoint-test",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         core.create_project("Project", str(repo), project_id="project-checkpoint")
         heads = []
         for name, content in (("a", "A\n"), ("b", "B\n"), ("c", "C\n")):

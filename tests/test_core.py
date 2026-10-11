@@ -109,7 +109,11 @@ class BridgeCoreTests(unittest.IsolatedAsyncioTestCase):
         self.tempdir.cleanup()
 
     def _core(self, executor=None) -> BridgeCore:
-        return BridgeCore(self.store, executor or FakeExecutor(store=self.store))
+        return BridgeCore(
+            self.store,
+            executor or FakeExecutor(store=self.store),
+            repository_lock_directory=str(Path(self.tempdir.name) / "locks"),
+        )
 
     def test_notification_text_truncation_is_explicit_and_bounded(self) -> None:
         short = "short notification"

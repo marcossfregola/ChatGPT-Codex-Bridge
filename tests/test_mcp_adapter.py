@@ -110,8 +110,15 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.db_path = Path(self.tempdir.name) / "bridge.sqlite3"
         self.store = SQLiteBridgeStore(self.db_path)
         self.executor = ImmediateExecutor()
-        self.core = BridgeCore(self.store, self.executor)
+        self.core = self._new_core(self.store, self.executor)
         self.adapter = MCPAdapter(self.core, self.store)
+
+    def _new_core(self, store, executor=None) -> BridgeCore:
+        return BridgeCore(
+            store,
+            executor,
+            repository_lock_directory=str(self.db_path.parent / "locks"),
+        )
 
     def tearDown(self) -> None:
         self.store.close()
@@ -231,17 +238,11 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
             {"CHATGPT_CODEX_BRIDGE_INSTANCE_ID": "  process-id  "},
             clear=True,
         ):
-            self.assertEqual(
-                _resolve_instance_id(user_scope_reader=lambda: "user-id"),
-                "process-id",
-            )
+            self.assertEqual(_resolve_instance_id(), "process-id")
 
-    def test_resolve_instance_id_uses_user_scope_when_process_is_missing(self) -> None:
+    def test_resolve_instance_id_does_not_fall_back_to_user_scope(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(
-                _resolve_instance_id(user_scope_reader=lambda: "  user-id  "),
-                "user-id",
-            )
+            self.assertEqual(_resolve_instance_id(), "UNCONFIGURED")
 
     def test_resolve_instance_id_returns_unconfigured_for_missing_or_whitespace(self) -> None:
         with patch.dict(
@@ -249,16 +250,10 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
             {"CHATGPT_CODEX_BRIDGE_INSTANCE_ID": " \t "},
             clear=True,
         ):
-            self.assertEqual(
-                _resolve_instance_id(user_scope_reader=lambda: " \n "),
-                "UNCONFIGURED",
-            )
+            self.assertEqual(_resolve_instance_id(), "UNCONFIGURED")
 
     async def test_get_status_reports_unconfigured_instance_id_when_absent(self) -> None:
-        with patch(
-            "chatgpt_codex_bridge.mcp_adapter._read_user_scope_instance_id",
-            return_value=None,
-        ), patch.dict(os.environ, {}, clear=False):
+        with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CHATGPT_CODEX_BRIDGE_INSTANCE_ID", None)
             result = await self.adapter.call_tool("get_status", {})
 
@@ -268,9 +263,6 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(
             os.environ,
             {"CHATGPT_CODEX_BRIDGE_INSTANCE_ID": " \t "},
-        ), patch(
-            "chatgpt_codex_bridge.mcp_adapter._read_user_scope_instance_id",
-            return_value=None,
         ):
             result = await self.adapter.call_tool("get_status", {})
 
@@ -933,7 +925,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         reopened = SQLiteBridgeStore(self.db_path)
         self.store = reopened
-        restarted = MCPAdapter(BridgeCore(reopened), reopened)
+        restarted = MCPAdapter(self._new_core(reopened), reopened)
         task = await restarted.call_tool("get_task", {"task_id": "task-mcp"})
         result = await restarted.call_tool("get_result", {"task_id": "task-mcp"})
 
@@ -1321,7 +1313,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         executor = BlockingExecutor()
         self.store.close()
         self.store = SQLiteBridgeStore(self.db_path)
-        self.core = BridgeCore(self.store, executor)
+        self.core = self._new_core(self.store, executor)
         self.adapter = MCPAdapter(self.core, self.store)
         self._create_task("task-cancelled")
 
@@ -1443,7 +1435,9 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         reopened = SQLiteBridgeStore(self.db_path)
         try:
-            restarted = MCPAdapter(BridgeCore(reopened, ImmediateExecutor()), reopened)
+            restarted = MCPAdapter(
+                self._new_core(reopened, ImmediateExecutor()), reopened
+            )
 
             async def exercise(session):
                 await session.initialize()
@@ -1492,7 +1486,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         executor = BlockingExecutor()
         self.store.close()
         self.store = SQLiteBridgeStore(self.db_path)
-        self.core = BridgeCore(self.store, executor)
+        self.core = self._new_core(self.store, executor)
         self.adapter = MCPAdapter(self.core, self.store)
         self._create_task("task-fast-return")
 
@@ -1552,7 +1546,9 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         reopened = SQLiteBridgeStore(self.db_path)
         try:
-            restarted = MCPAdapter(BridgeCore(reopened, ImmediateExecutor()), reopened)
+            restarted = MCPAdapter(
+                self._new_core(reopened, ImmediateExecutor()), reopened
+            )
             task = await restarted.call_tool("get_task", {"task_id": "task-mcp"})
             events = await restarted.call_tool(
                 "get_task_events", {"task_id": "task-mcp"}
@@ -1580,7 +1576,7 @@ class MCPAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         reopened = SQLiteBridgeStore(self.db_path)
         try:
-            restarted = MCPAdapter(BridgeCore(reopened), reopened)
+            restarted = MCPAdapter(self._new_core(reopened), reopened)
             task = await restarted.call_tool(
                 "get_task", {"task_id": "task-running-mcp-restart"}
             )

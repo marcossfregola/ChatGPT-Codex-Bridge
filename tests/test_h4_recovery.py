@@ -35,6 +35,7 @@ def make_git_repo(root: Path) -> Path:
     git(repo, "init")
     git(repo, "config", "user.name", "Bridge Test")
     git(repo, "config", "user.email", "bridge-test@example.invalid")
+    git(repo, "config", "chatgptcodexbridge.writerInstanceId", "h4-test")
     git(repo, "branch", "-M", "main")
     (repo / "tracked.txt").write_text("initial\n", encoding="utf-8", newline="")
     git(repo, "add", "tracked.txt")
@@ -78,6 +79,14 @@ class H4RecoveryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
         self.tempdir.cleanup()
+
+    def _git_core(self) -> BridgeCore:
+        return BridgeCore(
+            self.store,
+            FinishedExecutor(),
+            instance_id="h4-test",
+            repository_lock_directory=str(Path(self.tempdir.name) / "locks"),
+        )
 
     def _running(self, task_id: str = "task-1"):
         task = self.core.create_task("project-1", "run", task_id=task_id)
@@ -374,7 +383,7 @@ class H4RecoveryTests(unittest.TestCase):
 
     def test_checkpoint_persists_phases_and_cleans_repo(self) -> None:
         repo = make_git_repo(Path(self.tempdir.name))
-        core = BridgeCore(self.store, FinishedExecutor())
+        core = self._git_core()
         core.create_project("Repo", str(repo), project_id="project-git")
         task = core.create_task(
             "project-git", "change", task_id="task-git", mode="AUTONOMOUS_WRITE"
@@ -392,7 +401,7 @@ class H4RecoveryTests(unittest.TestCase):
 
     def test_checkpoint_created_event_retry_returns_same_commit(self) -> None:
         repo = make_git_repo(Path(self.tempdir.name))
-        core = BridgeCore(self.store, FinishedExecutor())
+        core = self._git_core()
         core.create_project("Repo", str(repo), project_id="project-git")
         task = core.create_task(
             "project-git", "change", task_id="task-git", mode="AUTONOMOUS_WRITE"
@@ -424,7 +433,7 @@ class H4RecoveryTests(unittest.TestCase):
 
     def test_post_cas_worktree_change_is_external_conflict_without_rollback(self) -> None:
         repo = make_git_repo(Path(self.tempdir.name))
-        core = BridgeCore(self.store, FinishedExecutor())
+        core = self._git_core()
         core.create_project("Repo", str(repo), project_id="project-git")
         task = core.create_task(
             "project-git", "change", task_id="task-git", mode="AUTONOMOUS_WRITE"
@@ -446,7 +455,7 @@ class H4RecoveryTests(unittest.TestCase):
 
     def test_foreign_index_lock_is_never_removed_or_overwritten(self) -> None:
         repo = make_git_repo(Path(self.tempdir.name))
-        core = BridgeCore(self.store, FinishedExecutor())
+        core = self._git_core()
         core.create_project("Repo", str(repo), project_id="project-git")
         task = core.create_task(
             "project-git", "change", task_id="task-git", mode="AUTONOMOUS_WRITE"
@@ -465,7 +474,7 @@ class H4RecoveryTests(unittest.TestCase):
 
     def test_external_descendant_after_cas_is_forward_only(self) -> None:
         repo = make_git_repo(Path(self.tempdir.name))
-        core = BridgeCore(self.store, FinishedExecutor())
+        core = self._git_core()
         core.create_project("Repo", str(repo), project_id="project-git")
         task = core.create_task(
             "project-git", "change", task_id="task-git", mode="AUTONOMOUS_WRITE"

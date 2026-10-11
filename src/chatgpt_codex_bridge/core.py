@@ -71,6 +71,14 @@ from .persistence.sqlite_store import (
     RECONCILIATION_BASELINE_ADOPTED_EVENT,
     SQLiteBridgeStore,
 )
+from .repository_access import (
+    RepositoryAccessError,
+    RepositoryLock,
+    RepositoryOwnershipError,
+    repository_lock_identity,
+    require_repository_writer,
+    validate_instance_id,
+)
 
 
 @dataclass(frozen=True)
@@ -262,9 +270,43 @@ def _bounded_error_message(error: Exception) -> str:
 class BridgeCore:
     """Create Bridge entities and run tasks through an injected executor."""
 
-    def __init__(self, store: SQLiteBridgeStore, executor: Executor | None = None) -> None:
+    def __init__(
+        self,
+        store: SQLiteBridgeStore,
+        executor: Executor | None = None,
+        *,
+        instance_id: str | None = None,
+        repository_lock_directory: str | None = None,
+    ) -> None:
         self.store = store
         self.executor = executor
+        self.instance_id = validate_instance_id(instance_id)
+        self.repository_lock_directory = repository_lock_directory
+
+    def _require_repository_writer(self, repo_path: str) -> None:
+        try:
+            require_repository_writer(repo_path, self.instance_id)
+        except RepositoryOwnershipError as error:
+            raise PolicyError(str(error)) from error
+
+    def _repository_lock(self, repo_path: str) -> RepositoryLock:
+        return RepositoryLock(
+            repo_path,
+            lock_directory=self.repository_lock_directory,
+        )
+
+    def _record_repository_guard_failure(
+        self,
+        task_id: str,
+        error: RepositoryAccessError,
+        *,
+        expected_status: ExecutionStatus,
+    ) -> None:
+        self._record_preflight_failure(
+            task_id,
+            PolicyError(str(error)),
+            expected_status=expected_status,
+        )
 
     @staticmethod
     def _normalize_adoption_mode(mode: str | None) -> str:
@@ -355,8 +397,11 @@ class BridgeCore:
         if task is None:
             raise KeyError(f"task does not exist: {task_id}")
         if task.execution_status is ExecutionStatus.QUEUED:
-            if self.store.get_project(task.project_id) is None:
+            project = self.store.get_project(task.project_id)
+            if project is None:
                 raise RuntimeError(f"project does not exist: {task.project_id}")
+            if task.mode is TaskMode.AUTONOMOUS_WRITE:
+                self._require_repository_writer(project.repo_path)
             request_id = str(uuid.uuid4())
             requested_at = timestamp_to_text(utc_now())
             try:
@@ -1047,20 +1092,73 @@ class BridgeCore:
 
     @staticmethod
     def _preflight_only_failure(task: Task, events: list[Any]) -> bool:
-        """Return whether an AW failure has only an explicit preflight marker."""
+        """Return whether an AW failure is proven to have stopped at preflight."""
 
         if task.execution_status is not ExecutionStatus.FAILED:
             return False
         if any(
-            event.source == "bridge" and event.kind == "policy.postflight"
+            event.source == "bridge"
+            and event.kind in {"policy.postflight", EXECUTOR_DISPATCH_STARTED_EVENT}
             for event in events
         ):
             return False
-        return any(
+        if any(
+            (
+                event.source == "bridge"
+                and event.kind in {"task.execution_claimed", "task.started"}
+            )
+            or event.source == "codex"
+            for event in events
+        ):
+            return False
+        failures = [
+            event
+            for event in events
+            if event.source == "bridge" and event.kind == "policy.violation"
+        ]
+        if not failures or any(
+            not isinstance(event.payload, Mapping)
+            or event.payload.get("phase") != "preflight"
+            for event in failures
+        ):
+            return False
+        if not any(
+            event.source == "bridge" and event.kind == "task.failed"
+            for event in events
+        ):
+            return False
+        if any(
             event.source == "bridge"
-            and event.kind == "policy.violation"
-            and isinstance(event.payload, Mapping)
-            and event.payload.get("phase") == "preflight"
+            and event.kind
+            in {
+                "task.cancel_requested",
+                "task.cancel_interrupt_sent",
+                "task.cancel_interrupt_failed",
+                "task.finished",
+                "task.cancelled",
+                "task.reconciliation_required",
+                "task.reconciliation_resolved",
+            }
+            for event in events
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _has_execution_start_evidence(events: list[Any]) -> bool:
+        """Return whether durable events show execution passed the queue."""
+
+        return any(
+            (
+                event.source == "bridge"
+                and event.kind
+                in {
+                    "task.execution_claimed",
+                    "task.started",
+                    EXECUTOR_DISPATCH_STARTED_EVENT,
+                }
+            )
+            or event.source == "codex"
             for event in events
         )
 
@@ -1481,6 +1579,48 @@ class BridgeCore:
             ) from error
 
     def adopt_reconciled_continuation_baseline(
+        self,
+        source_task_id: str,
+        inspection_task_id: str | None = None,
+        *,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Adopt a baseline only as the configured repository writer.
+
+        The repository lock spans both Git snapshots and the durable adoption
+        event so a writer cannot change the repository between the captures or
+        before the adoption is recorded.
+        """
+
+        adoption_mode = self._normalize_adoption_mode(mode)
+        if adoption_mode == ADOPTION_MODE_DIRECT and inspection_task_id is not None:
+            raise ContinuationBaselineError(
+                "direct adoption cannot include inspection_task_id"
+            )
+        source_task = self.store.get_task(source_task_id)
+        if source_task is None:
+            raise KeyError(f"task does not exist: {source_task_id}")
+        # Preserve the existing validation order: invalid source/inspection
+        # provenance is rejected before ownership or lock errors are reported.
+        context = self._validated_baseline_adoption_context(
+            source_task,
+            inspection_task_id,
+            adoption_mode=adoption_mode,
+        )
+        project = context["project"]
+        try:
+            self._require_repository_writer(project.repo_path)
+            with self._repository_lock(project.repo_path):
+                self._require_repository_writer(project.repo_path)
+                return self._adopt_reconciled_continuation_baseline_under_lock(
+                    source_task_id,
+                    inspection_task_id,
+                    mode=adoption_mode,
+                )
+        except RepositoryAccessError as error:
+            raise PolicyError(str(error)) from error
+
+    def _adopt_reconciled_continuation_baseline_under_lock(
         self,
         source_task_id: str,
         inspection_task_id: str | None = None,
@@ -2206,10 +2346,43 @@ class BridgeCore:
     def _previous_continuation_baseline(
         self, task: Task
     ) -> tuple[str, dict[str, Any]] | None:
-        """Return the latest eligible explicit continuation baseline."""
+        """Return the latest eligible baseline for this SQLite's physical repo."""
 
         latest: tuple[int, str, dict[str, Any]] | None = None
         blocker: tuple[int, str, ContinuationBaselineError | None] | None = None
+
+        current_project = self.store.get_project(task.project_id)
+        if current_project is None:
+            raise ContinuationBaselineError("current project does not exist")
+        try:
+            current_repo_identity = self._canonical_path_key(
+                str(repository_lock_identity(current_project.repo_path))
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ContinuationBaselineError(
+                "current repository identity could not be verified"
+            ) from error
+
+        repository_candidates: list[Task] = []
+        for project in self.store.list_projects():
+            project_tasks = self.store.list_tasks(project.project_id)
+            autonomous_tasks = [
+                candidate
+                for candidate in project_tasks
+                if candidate.mode is TaskMode.AUTONOMOUS_WRITE
+            ]
+            if not autonomous_tasks:
+                continue
+            try:
+                candidate_repo_identity = self._canonical_path_key(
+                    str(repository_lock_identity(project.repo_path))
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ContinuationBaselineError(
+                    "repository identity could not be verified for a project"
+                ) from error
+            if candidate_repo_identity == current_repo_identity:
+                repository_candidates.extend(autonomous_tasks)
 
         def add_blocker(
             event_id: int, reason: str, error: ContinuationBaselineError | None = None
@@ -2220,12 +2393,8 @@ class BridgeCore:
             if blocker is None or event_id > blocker[0]:
                 blocker = (event_id, reason, error)
 
-        for candidate in self.store.list_tasks(task.project_id):
-            if (
-                candidate.task_id == task.task_id
-                or candidate.project_id != task.project_id
-                or candidate.mode is not TaskMode.AUTONOMOUS_WRITE
-            ):
+        for candidate in repository_candidates:
+            if candidate.task_id == task.task_id:
                 continue
             events = self.store.list_task_events(candidate.task_id)
             postflights = [
@@ -2353,7 +2522,17 @@ class BridgeCore:
             if candidate_baseline is None and not postflights and not adoptions:
                 if self._preflight_only_failure(candidate, events):
                     continue
-                if candidate.execution_status is ExecutionStatus.QUEUED:
+                if (
+                    candidate.execution_status is ExecutionStatus.QUEUED
+                    and not self._has_execution_start_evidence(events)
+                    and not violations
+                    and not any(
+                        event.source == "bridge"
+                        and event.kind
+                        in {"task.failed", "task.finished", "task.cancelled"}
+                        for event in events
+                    )
+                ):
                     continue
                 add_blocker(latest_event_id, "invalid")
 
@@ -2401,7 +2580,28 @@ class BridgeCore:
             raise PolicyError("checkpoint task is not the last applicable task")
 
     def commit_checkpoint(self, task_id: str, message: str) -> dict[str, Any]:
-        """Create or forward-repair one durable local checkpoint attempt."""
+        """Create or repair a checkpoint under the repository writer lock."""
+
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise PolicyError(f"task does not exist: {task_id}")
+        if task.mode is not TaskMode.AUTONOMOUS_WRITE:
+            raise PolicyError("checkpoint commits require AUTONOMOUS_WRITE mode")
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise PolicyError(f"project does not exist: {task.project_id}")
+        self._require_repository_writer(project.repo_path)
+        try:
+            with self._repository_lock(project.repo_path):
+                self._require_repository_writer(project.repo_path)
+                return self._commit_checkpoint_under_repository_lock(task_id, message)
+        except RepositoryAccessError as error:
+            raise PolicyError(str(error)) from error
+
+    def _commit_checkpoint_under_repository_lock(
+        self, task_id: str, message: str
+    ) -> dict[str, Any]:
+        """Checkpoint transaction body; caller owns the repository lock."""
 
         task = self.store.get_task(task_id)
         if task is None:
@@ -3060,6 +3260,9 @@ class BridgeCore:
                     cancellation_payload["final_response"] = _bounded_final_response(
                         result.final_response
                     )
+                if checkpoint is not None:
+                    self._persist_cancelled_postflight(task_id, checkpoint)
+                    postflight_recorded = True
                 return self.store.transition_task_terminal(
                     task_id,
                     execution_status=ExecutionStatus.CANCELLED,
@@ -3106,7 +3309,7 @@ class BridgeCore:
                 pass
             if checkpoint is not None and not postflight_recorded:
                 try:
-                    self._persist_postflight(task_id, checkpoint)
+                    self._persist_cancelled_postflight(task_id, checkpoint)
                 except BaseException:
                     pass
             self.store.transition_task_terminal(
@@ -3134,7 +3337,31 @@ class BridgeCore:
             raise
 
     async def run_task(self, task_id: str) -> Task:
-        """Legacy synchronous execution path retained for direct Core callers."""
+        """Run one task while holding the canonical repository OS lock."""
+
+        self._require_executor()
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        if task.execution_status is not ExecutionStatus.QUEUED:
+            raise TaskStateError(
+                f"task {task_id} cannot run from state "
+                f"{task.execution_status.value}; only QUEUED tasks may run"
+            )
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise RuntimeError(f"project does not exist: {task.project_id}")
+        try:
+            with self._repository_lock(project.repo_path):
+                return await self._run_task_under_repository_lock(task_id)
+        except RepositoryAccessError as error:
+            self._record_repository_guard_failure(
+                task_id, error, expected_status=ExecutionStatus.QUEUED
+            )
+            raise PolicyError(str(error)) from error
+
+    async def _run_task_under_repository_lock(self, task_id: str) -> Task:
+        """Legacy direct execution body; caller owns the repository lock."""
 
         self._require_executor()
         task = self.store.get_task(task_id)
@@ -3165,6 +3392,13 @@ class BridgeCore:
                     task_id, error, expected_status=ExecutionStatus.QUEUED
                 )
                 raise
+            try:
+                self._require_repository_writer(project.repo_path)
+            except PolicyError as error:
+                self._record_preflight_failure(
+                    task_id, error, expected_status=ExecutionStatus.QUEUED
+                )
+                raise
             self.store.append_task_event(
                 task_id,
                 "bridge",
@@ -3176,7 +3410,33 @@ class BridgeCore:
         return await self._execute_running_task(task, project, checkpoint)
 
     async def execute_claimed_task(self, task_id: str) -> Task:
-        """Run one task after a persistent worker atomically claimed it."""
+        """Execute a claimed task under the canonical repository OS lock."""
+
+        self._require_executor()
+        task = self.store.get_task(task_id)
+        if task is None:
+            raise KeyError(f"task does not exist: {task_id}")
+        if task.execution_status is not ExecutionStatus.RUNNING:
+            raise TaskStateError(
+                f"task {task_id} cannot execute from state "
+                f"{task.execution_status.value}; expected RUNNING"
+            )
+        if self.store.get_execution_claim(task_id) is None:
+            raise TaskStateError(f"task {task_id} has no persistent worker claim")
+        project = self.store.get_project(task.project_id)
+        if project is None:
+            raise RuntimeError(f"project does not exist: {task.project_id}")
+        try:
+            with self._repository_lock(project.repo_path):
+                return await self._execute_claimed_task_under_repository_lock(task_id)
+        except RepositoryAccessError as error:
+            self._record_repository_guard_failure(
+                task_id, error, expected_status=ExecutionStatus.RUNNING
+            )
+            raise PolicyError(str(error)) from error
+
+    async def _execute_claimed_task_under_repository_lock(self, task_id: str) -> Task:
+        """Worker execution body; caller owns the repository lock."""
 
         self._require_executor()
         task = self.store.get_task(task_id)
@@ -3202,6 +3462,13 @@ class BridgeCore:
         if task.mode is TaskMode.AUTONOMOUS_WRITE:
             try:
                 checkpoint = self._preflight_checkpoint(task, project)
+            except PolicyError as error:
+                self._record_preflight_failure(
+                    task_id, error, expected_status=ExecutionStatus.RUNNING
+                )
+                raise
+            try:
+                self._require_repository_writer(project.repo_path)
             except PolicyError as error:
                 self._record_preflight_failure(
                     task_id, error, expected_status=ExecutionStatus.RUNNING
@@ -3261,6 +3528,78 @@ class BridgeCore:
                 {"phase": "postflight", **payload},
             )
         return postflight
+
+    def _persist_cancelled_postflight(
+        self, task_id: str, checkpoint: GitCheckpoint
+    ) -> None:
+        """Persist cancellation evidence, keeping failed captures unreconciled."""
+
+        try:
+            self._persist_postflight(task_id, checkpoint)
+        except Exception as error:
+            self._record_cancelled_postflight_failure(task_id, error)
+
+    def _record_cancelled_postflight_failure(
+        self, task_id: str, error: BaseException
+    ) -> None:
+        """Record a failed cancellation postflight and block automatic recovery."""
+
+        complete_postflight = False
+        postflight_violation_recorded = False
+        try:
+            events = self.store.list_task_events(task_id)
+            complete_postflight = any(
+                event.source == "bridge"
+                and event.kind == "policy.postflight"
+                and isinstance(event.payload, Mapping)
+                and event.payload.get("ok") is not False
+                for event in events
+            )
+            postflight_violation_recorded = any(
+                event.source == "bridge"
+                and event.kind == "policy.violation"
+                and isinstance(event.payload, Mapping)
+                and event.payload.get("phase") == "postflight"
+                for event in events
+            )
+        except BaseException:
+            pass
+
+        if complete_postflight:
+            return
+
+        if not postflight_violation_recorded:
+            try:
+                self.store.append_task_event(
+                    task_id,
+                    "bridge",
+                    "policy.violation",
+                    {
+                        "phase": "postflight",
+                        "policy_violation": True,
+                        "postflight_persisted": False,
+                        "error_type": type(error).__name__,
+                        "message": _bounded_error_message(error),
+                    },
+                )
+            except BaseException:
+                pass
+
+        try:
+            task = self.store.get_task(task_id)
+            if task is None or task.execution_status is not ExecutionStatus.RUNNING:
+                return
+            events = self.store.list_task_events(task_id)
+            payload = self._reconciliation_payload(task, events)
+            payload["reason"] = (
+                "postflight evidence could not be persisted after cancellation"
+            )
+            payload.pop("evidence_fingerprint", None)
+            self.store.ensure_reconciliation_required(task_id, payload)
+        except BaseException:
+            # A failing durable store cannot be repaired here; with no valid
+            # postflight the terminal CANCELLED task remains ineligible as a baseline.
+            pass
 
 
 __all__ = [

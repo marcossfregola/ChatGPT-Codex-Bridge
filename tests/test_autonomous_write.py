@@ -51,6 +51,7 @@ def make_git_repo(parent: Path) -> Path:
     git(repo, "init")
     git(repo, "config", "user.name", "Bridge Test")
     git(repo, "config", "user.email", "bridge-test@example.invalid")
+    git(repo, "config", "chatgptcodexbridge.writerInstanceId", "test-bridge")
     git(repo, "branch", "-M", "main")
     (repo / "tracked.txt").write_text("initial\n", encoding="utf-8")
     git(repo, "add", "tracked.txt")
@@ -86,7 +87,12 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
         self.tempdir.cleanup()
 
     def _task(self, executor, repo: Path, *, mode=TaskMode.AUTONOMOUS_WRITE):
-        core = BridgeCore(self.store, executor)
+        core = BridgeCore(
+            self.store,
+            executor,
+            instance_id="test-bridge",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         core.create_project("Project", str(repo), project_id="project-policy")
         return core, core.create_task(
             "project-policy",
@@ -213,7 +219,12 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
             executor = ControlledExecutor()
             project_id = f"project-protected-{index}"
             task_id = f"task-protected-{index}"
-            core = BridgeCore(self.store, executor)
+            core = BridgeCore(
+                self.store,
+                executor,
+                instance_id="test-bridge",
+                repository_lock_directory=str(self.root / "locks"),
+            )
             core.create_project("Project", str(protected), project_id=project_id)
             core.create_task(
                 project_id, "write", task_id=task_id, mode=TaskMode.AUTONOMOUS_WRITE
@@ -233,7 +244,12 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
             executor = ControlledExecutor()
             descendant_project_id = f"project-descendant-{index}"
             descendant_task_id = f"task-descendant-{index}"
-            descendant_core = BridgeCore(self.store, executor)
+            descendant_core = BridgeCore(
+                self.store,
+                executor,
+                instance_id="test-bridge",
+                repository_lock_directory=str(self.root / "locks"),
+            )
             descendant_core.create_project(
                 "Project", str(descendant), project_id=descendant_project_id
             )
@@ -404,7 +420,12 @@ class AutonomousWriteCoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mode_is_persisted_and_adapter_accepts_optional_mode(self) -> None:
         repo = make_git_repo(self.root)
-        core = BridgeCore(self.store, ControlledExecutor())
+        core = BridgeCore(
+            self.store,
+            ControlledExecutor(),
+            instance_id="test-bridge",
+            repository_lock_directory=str(self.root / "locks"),
+        )
         core.create_project("Project", str(repo), project_id="project-mode")
         adapter = MCPAdapter(core, self.store)
 

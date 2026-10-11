@@ -318,7 +318,11 @@ class ReadOnlyGitIndexCoreTests(ReadOnlyGitIndexWindowsTests):
         store = SQLiteBridgeStore(self.root / "bridge.sqlite3")
         executor = RecordingExecutor()
         try:
-            core = BridgeCore(store, executor)
+            core = BridgeCore(
+                store,
+                executor,
+                repository_lock_directory=str(self.root / "locks"),
+            )
             core.create_project("Project", str(repo), project_id="project-readonly-acl")
             task = core.create_task(
                 "project-readonly-acl",
@@ -357,7 +361,11 @@ class ReadOnlyGitIndexCoreTests(ReadOnlyGitIndexWindowsTests):
         store = SQLiteBridgeStore(self.root / "bridge-deny.sqlite3")
         executor = RecordingExecutor()
         try:
-            core = BridgeCore(store, executor)
+            core = BridgeCore(
+                store,
+                executor,
+                repository_lock_directory=str(self.root / "locks"),
+            )
             core.create_project("Project", str(repo), project_id="project-readonly-deny")
             task = core.create_task(
                 "project-readonly-deny",

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .core import BridgeCore
+from .repository_access import process_instance_id
 from .executors.codex_executor import CodexExecutor
 from .domain.models import (
     ExecutionStatus,
@@ -537,7 +538,11 @@ def main(argv: list[str] | None = None) -> int:
             store = SQLiteBridgeStore(db_path)
             try:
                 executor = CodexExecutor(executable=args.executable)
-                core = BridgeCore(store, executor)
+                core = BridgeCore(
+                    store,
+                    executor,
+                    instance_id=process_instance_id(),
+                )
                 worker = ExecutionWorker(store, core, runtime_paths=paths)
                 recovered = core.recover_orphaned_tasks()
                 print(
